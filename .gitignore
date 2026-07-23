@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+models/          # fine-tuned encoder weights (tracked via HF, not git)
+.idea/
+graphify-out/
