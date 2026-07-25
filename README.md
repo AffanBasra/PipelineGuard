@@ -25,8 +25,8 @@ a Postgres audit trail from which a governance report is generated.
 
 - [x] Docker Compose stack (Kafka 3.8 KRaft, Postgres 16)
 - [x] Synthetic Pakistani bank-transaction stream + producer
-- [ ] Tier 1: regex/checksum rules (CNIC, PK IBAN, PK phone, email) — in progress
-- [ ] Processor: consume → detect → redact → route → audit — in progress
+- [x] Tier 1: regex/checksum rules (CNIC, PK IBAN, PK phone, email)
+- [x] Processor: consume → detect → redact → route → audit
 - [ ] Tier 2: fine-tuned encoder NER (Urdu/Roman-Urdu names)
 - [ ] Tier 3: pluggable LLM escalation (Gemini, Ollama)
 - [ ] Benchmarks: throughput + p50/p99 latency per tier
@@ -49,7 +49,13 @@ Inspect results:
 ```sql
 SELECT action, count(*) FROM messages_processed GROUP BY action;
 SELECT entity_type, tier, count(*) FROM findings GROUP BY 1, 2 ORDER BY 3 DESC;
+-- why were records quarantined without findings?
+SELECT failure_class, count(*) FROM messages_processed
+ WHERE failure_class IS NOT NULL GROUP BY failure_class;
 ```
+
+> Postgres is published on host port **5433** (5432 is commonly taken by a
+> native install). The container still listens on 5432 internally.
 
 ## Design decisions
 
@@ -68,13 +74,54 @@ audit are durable, and the audit writer upserts on `message_id` — so
 redelivery is harmless. Enabling transactions on the Kafka→Kafka leg is a
 documented stretch item.
 
+Offsets are committed asynchronously on purpose: safety comes from idempotent
+audit upserts, not from commit synchrony, and a synchronous commit would add a
+group-coordinator round trip (~ms) to a per-message budget measured in
+microseconds. A commit is issued only after `flush()` has drained *and* the
+per-message delivery callback reported no error — both checks are required,
+since a message can leave the producer queue by failing.
+
+**Two failure classes, handled oppositely.** Conflating them yields either an
+infinite crash loop or silent loss:
+
+| failure | nature | response |
+|---|---|---|
+| unparseable bytes, wrong payload shape, detector raised | deterministic — fails identically on replay | **fail closed**: quarantine with the reason recorded, commit, continue |
+| broker unreachable, Postgres down, delivery unconfirmed | transient — likely succeeds on replay | **crash and replay**: don't commit, let the process die, restart replays |
+
+The dividing line is literal: message-level work sits inside
+`process_message()`'s try block; everything after it in the loop is
+infrastructure and is allowed to propagate.
+
+**Audit before emit.** The audit row is written *before* the message is
+produced downstream, so no record is ever emitted that has not already been
+recorded. A Postgres outage halts the pipeline rather than letting unlogged
+data through — the correct posture for a governance tool.
+
+**Audit trail stores no PII, but does store why.** `findings` records entity
+type, field, span, tier and confidence — never the matched value.
+`messages_processed.failure_class` / `failure_detail` explain fail-closed
+quarantines, so "why was this quarantined" is answerable from SQL alone.
+
 **Quarantine policy.** Confident detections are redacted in place and
 forwarded; only *uncertain* records (sub-threshold confidence, malformed
 messages) are quarantined — mirroring how production DLP systems avoid
 blocking the happy path.
 
-**Audit trail stores no PII.** `findings` records entity type, field, span,
-tier, confidence — never the matched value.
+## Observability
+
+The producer shows a progress bar (bounded work). The processor consumes an
+unbounded stream, so it emits a periodic stats line instead — which doubles as
+the source of the benchmark numbers below:
+
+```
+12:04:31 INFO    pipelineguard.processor  processed=12,480 clean=0 redacted=11,982
+                 quarantined=495 failed=3 | rate=842/s p50=1.10ms p95=2.40ms p99=6.80ms
+```
+
+Per-message logging is DEBUG-only by design: at the rates this pipeline
+reaches, logging every message makes stdout the bottleneck and the benchmark
+measures the terminal rather than the pipeline.
 
 ## Benchmarks
 
@@ -95,4 +142,5 @@ src/pipelineguard/
   detectors/tier1_rules.py       Tier 1 rules engine
   processor.py                   the stream processor (consume→detect→route→audit)
   audit.py                       idempotent Postgres audit writer
+  observability.py               console logging + rolling throughput/latency stats
 ```

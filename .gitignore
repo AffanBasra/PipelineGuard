@@ -8,3 +8,4 @@ venv/
 models/          # fine-tuned encoder weights (tracked via HF, not git)
 .idea/
 graphify-out/
+CLAUDE.md
