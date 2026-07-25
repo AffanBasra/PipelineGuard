@@ -29,7 +29,7 @@ services:
     image: postgres:16-alpine
     container_name: pg-postgres
     ports:
-      - "5432:5432"
+      - "5433:5432"   # host 5432 is taken by a pre-existing native Postgres install
     environment:
       POSTGRES_USER: pipelineguard
       POSTGRES_PASSWORD: pipelineguard

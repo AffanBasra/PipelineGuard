@@ -15,12 +15,15 @@ from pipelineguard.models import Envelope, Finding
 
 _UPSERT_MESSAGE = """
 INSERT INTO messages_processed
-    (message_id, source_topic, event_ts, max_tier, action, latency_ms, schema_version)
-VALUES (%s, %s, %s, %s, %s, %s, %s)
+    (message_id, source_topic, event_ts, max_tier, action, latency_ms, schema_version,
+     failure_class, failure_detail)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
 ON CONFLICT (message_id) DO UPDATE SET
     max_tier = EXCLUDED.max_tier,
     action = EXCLUDED.action,
     latency_ms = EXCLUDED.latency_ms,
+    failure_class = EXCLUDED.failure_class,
+    failure_detail = EXCLUDED.failure_detail,
     processed_ts = now();
 """
 
@@ -42,10 +45,12 @@ class AuditWriter:
         envelope: Envelope,
         source_topic: str,
         findings: list[Finding],
-        action: str,           # 'clean' | 'redacted' | 'quarantined'
+        action: str,                                  # 'clean' | 'redacted' | 'quarantined'
         latency_ms: float,
+        failure: tuple[str, str] | None = None,       # (exception class, detail)
     ) -> None:
         max_tier = max((f.tier for f in findings), default=0)
+        failure_class, failure_detail = failure if failure else (None, None)
         with self._conn.cursor() as cur:
             cur.execute(
                 _UPSERT_MESSAGE,
@@ -57,6 +62,8 @@ class AuditWriter:
                     action,
                     latency_ms,
                     envelope.schema_version,
+                    failure_class,
+                    failure_detail,
                 ),
             )
             cur.execute(_DELETE_FINDINGS, (envelope.message_id,))

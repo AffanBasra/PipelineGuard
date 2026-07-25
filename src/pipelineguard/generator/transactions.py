@@ -57,9 +57,33 @@ def make_phone() -> str:
     return f"{prefix}{random.randint(0, 4)}{random.randint(0, 9)}{'' if prefix.startswith('0') else ' '}{random.randint(1000000, 9999999)}"
 
 
+# Share of IBANs emitted with deliberately wrong check digits. These are
+# structurally valid but fail mod-97, so Tier 1 flags them at reduced
+# confidence and the processor routes them to quarantine — that's how the
+# quarantine path gets exercised on a synthetic stream.
+CORRUPT_IBAN_RATE = 0.02
+
+
+def _iban_check_digits(bban: str, country: str = "PK") -> str:
+    """ISO 7064 mod-97-10: rearrange as BBAN + country + '00', map letters to
+    digits (A=10 ... Z=35), then check = 98 - (n mod 97)."""
+    rearranged = f"{bban}{country}00"
+    numeric = "".join(str(int(ch, 36)) if ch.isalpha() else ch for ch in rearranged)
+    return f"{98 - int(numeric) % 97:02d}"
+
+
 def make_iban() -> str:
-    """PK IBAN: PK + 2 check digits + 4-char bank code + 16-digit account."""
-    return f"PK{random.randint(10, 99)}{random.choice(BANK_CODES)}{random.randint(10**15, 10**16 - 1)}"
+    """PK IBAN: PK + 2 check digits + 4-char bank code + 16-digit account.
+
+    Check digits are computed, not random, so a correct mod-97 validator
+    accepts them — except for CORRUPT_IBAN_RATE of them, on purpose.
+    """
+    bban = f"{random.choice(BANK_CODES)}{random.randint(10**15, 10**16 - 1)}"
+    check = _iban_check_digits(bban)
+    if random.random() < CORRUPT_IBAN_RATE:
+        # Shift the check digits so the value stays 2-digit but fails mod-97.
+        check = f"{(int(check) + 1) % 100:02d}"
+    return f"PK{check}{bban}"
 
 
 def make_name() -> str:

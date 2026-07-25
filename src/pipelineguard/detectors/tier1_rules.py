@@ -42,8 +42,6 @@ from __future__ import annotations
 from pipelineguard.models import Finding, Tier
 import re
 
-from email_validator import EmailNotValidError, validate_email
-
 
 class RulesDetector:
     name = "tier1_rules"
@@ -54,10 +52,20 @@ class RulesDetector:
     _LEADING_PUNCT = "([{'\""
     _TRAILING_PUNCT = ".,;:!?)]}'\""
 
+    # Assigned to structurally-valid hits that fail their checksum (currently
+    # only IBAN). Any value below 1.0 makes the processor treat the record as
+    # uncertain and quarantine it; the exact figure is not load-bearing yet.
+    _UNVALIDATED_CONFIDENCE = 0.5
+
     def __init__(self) -> None:
-        # Loose candidate finder: email_validator does the real rejection,
-        # this regex's only job is locating "@"-containing tokens and their spans.
+        # Loose candidate finder locates "@"-containing tokens and their spans;
+        # _email_shape_re then decides. Deliberately NOT using the
+        # email-validator library: it costs ~94us per call (220x this regex) on
+        # a field present in every message, and it raises precision by rejecting
+        # unusual-but-real addresses. For a redaction firewall a false positive
+        # is one over-redacted string, a false negative is a leak — recall wins.
         self._email_candidate_re = re.compile(r"\S+@\S+")
+        self._email_shape_re = re.compile(r"^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$")
         self._cnic_canonical_re = re.compile(r"\b\d{5}-\d{7}-\d\b")
         self._cnic_bare_re = re.compile(r"\b\d{13}\b")
         self._iban_re = re.compile(r"\bPK\d{2}[A-Z0-9]{4}\d{16}\b")
@@ -106,9 +114,7 @@ class RulesDetector:
             end = start + len(trimmed)
             candidate = trimmed
 
-            try:
-                validate_email(candidate, check_deliverability=False)
-            except EmailNotValidError:
+            if not self._email_shape_re.match(candidate):
                 continue
 
             results.append(
@@ -122,6 +128,7 @@ class RulesDetector:
                 )
             )
         return results
+
     def _detect_cnic(self, text: str, field: str) -> list[Finding]:
         results: list[Finding] = []
         for pattern in (self._cnic_canonical_re, self._cnic_bare_re):
@@ -144,7 +151,11 @@ class RulesDetector:
     def _detect_iban(self, text: str, field: str) -> list[Finding]:
         results: list[Finding] = []
         for match in self._iban_re.finditer(text):
-            confidence = 1.0 if self._iban_checksum_ok(match.group()) else 0.5
+            confidence = (
+                1.0
+                if self._iban_checksum_ok(match.group())
+                else self._UNVALIDATED_CONFIDENCE
+            )
             results.append(
                 Finding(
                     entity_type="IBAN_PK",
@@ -190,7 +201,8 @@ class RulesDetector:
             )
         return results
 
-    # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # Acceptance checks — make these pass, then we wire the processor to it.
 # Run:  python -m pipelineguard.detectors.tier1_rules
 # ---------------------------------------------------------------------------

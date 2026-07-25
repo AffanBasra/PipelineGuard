@@ -13,8 +13,14 @@ CREATE TABLE IF NOT EXISTS messages_processed (
     processed_ts    TIMESTAMPTZ NOT NULL DEFAULT now(),
     max_tier        SMALLINT    NOT NULL DEFAULT 0, -- highest tier that ran (0 = no findings)
     action          TEXT        NOT NULL CHECK (action IN ('clean', 'redacted', 'quarantined')),
-    latency_ms      DOUBLE PRECISION NOT NULL,      -- end-to-end detection latency for this message
-    schema_version  SMALLINT    NOT NULL DEFAULT 1
+    latency_ms      DOUBLE PRECISION NOT NULL,      -- detection latency for this message
+    schema_version  SMALLINT    NOT NULL DEFAULT 1,
+    -- Populated only for fail-closed quarantines (unparseable bytes, wrong
+    -- payload shape, detector raised). Without these a failure quarantine is
+    -- indistinguishable from a clean message, and "why was this quarantined"
+    -- is the first question a compliance reviewer asks.
+    failure_class   TEXT,                           -- exception class name
+    failure_detail  TEXT                            -- truncated message, never payload content
 );
 
 CREATE TABLE IF NOT EXISTS findings (
@@ -37,3 +43,6 @@ CREATE INDEX IF NOT EXISTS idx_findings_message   ON findings (message_id);
 CREATE INDEX IF NOT EXISTS idx_findings_type      ON findings (entity_type);
 CREATE INDEX IF NOT EXISTS idx_processed_ts       ON messages_processed (processed_ts);
 CREATE INDEX IF NOT EXISTS idx_processed_action   ON messages_processed (action);
+-- Partial index: failures are rare, so keep the index small.
+CREATE INDEX IF NOT EXISTS idx_processed_failure  ON messages_processed (failure_class)
+    WHERE failure_class IS NOT NULL;
