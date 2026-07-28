@@ -48,9 +48,12 @@ class RulesDetector:
 
     # Punctuation that free-text memos tack onto an embedded email
     # ("notify at affan@example.com.", "(affan@example.com)") but that
-    # isn't actually part of the address.
-    _LEADING_PUNCT = "([{'\""
-    _TRAILING_PUNCT = ".,;:!?)]}'\""
+    # isn't actually part of the address. Angle brackets matter specifically
+    # because RFC 5322 angle-addr ("Ayesha Malik <ayesha@example.com>") is how
+    # addresses appear in mail headers and most support-ticket exports —
+    # without them the whole address is a false negative, i.e. a leak.
+    _LEADING_PUNCT = "([{<'\""
+    _TRAILING_PUNCT = ".,;:!?)]}>'\""
 
     # Assigned to structurally-valid hits that fail their checksum (currently
     # only IBAN). Any value below 1.0 makes the processor treat the record as
@@ -201,23 +204,5 @@ class RulesDetector:
             )
         return results
 
-
-# ---------------------------------------------------------------------------
-# Acceptance checks — make these pass, then we wire the processor to it.
-# Run:  python -m pipelineguard.detectors.tier1_rules
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    d = RulesDetector()
-
-    def types(text: str) -> list[str]:
-        return sorted(f.entity_type for f in d.detect(text, "memo"))
-
-    assert types("CNIC 35202-1234567-1 on file") == ["CNIC"]
-    assert types("id 3520212345671 bare") == ["CNIC"]
-    assert types("id 9520212345671 bad province") == []          # validation, not just regex
-    assert types("send to PK36MEZN0001234567891234") == ["IBAN_PK"]
-    assert types("call 03001234567 or +92 300 1234567") == ["PHONE_PK", "PHONE_PK"]
-    assert types("mail affan@example.com") == ["EMAIL"]
-    spans = d.detect("x 35202-1234567-1 y", "memo")
-    assert spans[0].span_start == 2 and spans[0].span_end == 17   # spans index original text
-    print("tier1 acceptance checks: all passed")
+# Acceptance checks that used to live here now live in tests/test_tier1_rules.py,
+# where they run under pytest with the rest of the suite.
