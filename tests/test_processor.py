@@ -11,6 +11,7 @@ routes to quarantine, never to the clean topic.
 from __future__ import annotations
 
 import json
+import uuid
 
 import pytest
 
@@ -113,9 +114,16 @@ def test_unredacted_text_is_returned_unchanged():
         ("empty value", b"", "JSONDecodeError"),
         ("missing payload key", b'{"message_id":"x"}', "KeyError"),
         ("non-utf8 bytes", b"\xff\xfe\x00binary", "UnicodeDecodeError"),
-        ("payload is a string", json.dumps({"message_id": "x", "event_ts": "t", "payload": "oops"}).encode(), "TypeError"),
-        ("payload is a list", json.dumps({"message_id": "x", "event_ts": "t", "payload": [1, 2]}).encode(), "TypeError"),
-        ("payload is null", json.dumps({"message_id": "x", "event_ts": "t", "payload": None}).encode(), "TypeError"),
+        ("payload is a string", json.dumps({"message_id": str(uuid.uuid4()), "event_ts": "2024-01-01T00:00:00+00:00", "payload": "oops"}).encode(), "TypeError"),
+        ("payload is a list", json.dumps({"message_id": str(uuid.uuid4()), "event_ts": "2024-01-01T00:00:00+00:00", "payload": [1, 2]}).encode(), "TypeError"),
+        ("payload is null", json.dumps({"message_id": str(uuid.uuid4()), "event_ts": "2024-01-01T00:00:00+00:00", "payload": None}).encode(), "TypeError"),
+        ("message_id is not a uuid", json.dumps({"message_id": "not-a-uuid", "event_ts": "2024-01-01T00:00:00+00:00", "schema_version": 1, "payload": {}}).encode(), "ValueError"),
+        ("message_id is an int", json.dumps({"message_id": 123, "event_ts": "2024-01-01T00:00:00+00:00", "schema_version": 1, "payload": {}}).encode(), "TypeError"),
+        ("message_id is null", json.dumps({"message_id": None, "event_ts": "2024-01-01T00:00:00+00:00", "schema_version": 1, "payload": {}}).encode(), "TypeError"),
+        ("event_ts is not iso8601", json.dumps({"message_id": str(uuid.uuid4()), "event_ts": "not-a-timestamp", "schema_version": 1, "payload": {}}).encode(), "ValueError"),
+        ("event_ts is an int", json.dumps({"message_id": str(uuid.uuid4()), "event_ts": 12345, "schema_version": 1, "payload": {}}).encode(), "TypeError"),
+        ("schema_version is not an int", json.dumps({"message_id": str(uuid.uuid4()), "event_ts": "2024-01-01T00:00:00+00:00", "schema_version": "abc", "payload": {}}).encode(), "TypeError"),
+        ("schema_version is a bool", json.dumps({"message_id": str(uuid.uuid4()), "event_ts": "2024-01-01T00:00:00+00:00", "schema_version": True, "payload": {}}).encode(), "TypeError"),
     ],
 )
 def test_malformed_messages_quarantine_with_a_recorded_reason(
@@ -125,6 +133,23 @@ def test_malformed_messages_quarantine_with_a_recorded_reason(
     assert outcome.action == "quarantined", label
     assert outcome.failure is not None, label
     assert outcome.failure[0] == expected_failure, label
+
+
+@pytest.mark.parametrize(
+    "label, body",
+    [
+        ("message_id is not a uuid", {"message_id": "not-a-uuid", "event_ts": "2024-01-01T00:00:00+00:00", "schema_version": 1, "payload": {}}),
+        ("event_ts is not iso8601", {"message_id": str(uuid.uuid4()), "event_ts": "not-a-timestamp", "schema_version": 1, "payload": {}}),
+        ("schema_version is not an int", {"message_id": str(uuid.uuid4()), "event_ts": "2024-01-01T00:00:00+00:00", "schema_version": "abc", "payload": {}}),
+    ],
+)
+def test_untrustworthy_envelope_fields_fall_back_to_poison_id(detector, label, body):
+    """message_id is the very field that failed validation, so the audit key
+    must fall back to the (topic, partition, offset)-derived poison id rather
+    than trusting it."""
+    msg = StubMessage(json.dumps(body).encode())
+    outcome = P.process_message(msg, detector)
+    assert outcome.envelope.message_id == P.poison_id(msg), label
 
 
 def test_failure_detail_is_bounded(detector):
@@ -161,6 +186,45 @@ def test_message_id_is_preserved_across_the_pipeline(detector, pii_payload):
     outcome = P.process_message(StubMessage(envelope.to_bytes()), detector)
     assert outcome.envelope.message_id == envelope.message_id
     assert json.loads(outcome.out_bytes)["message_id"] == envelope.message_id
+
+
+@pytest.mark.parametrize(
+    "label, wire_form",
+    [
+        ("urn prefix", "urn:uuid:550e8400-e29b-41d4-a716-446655440000"),
+        ("braces", "{550e8400-e29b-41d4-a716-446655440000}"),
+        ("no hyphens", "550e8400e29b41d4a716446655440000"),
+    ],
+)
+def test_message_id_is_canonicalized_to_the_hyphenated_form(detector, label, wire_form):
+    """uuid.UUID() accepts forms Postgres's uuid column does not (urn: prefix,
+    braces, no hyphens). The canonical hyphenated form must be what's used
+    everywhere downstream — audit key, emitted bytes, producer key — not the
+    as-received string."""
+    canonical = "550e8400-e29b-41d4-a716-446655440000"
+    body = {"message_id": wire_form, "event_ts": "2024-01-01T00:00:00+00:00", "payload": {}}
+    outcome = P.process_message(raw_message(body), detector)
+    assert outcome.envelope.message_id == canonical, label
+    assert json.loads(outcome.out_bytes)["message_id"] == canonical, label
+
+
+@pytest.mark.parametrize(
+    "label, wire_form, normalized",
+    [
+        ("Z suffix", "2024-01-01T00:00:00Z", "2024-01-01T00:00:00+00:00"),
+        ("Z suffix with microseconds", "2024-01-01T00:00:00.123456Z", "2024-01-01T00:00:00.123456+00:00"),
+    ],
+)
+def test_event_ts_z_suffix_is_normalized_and_accepted(detector, label, wire_form, normalized):
+    """datetime.fromisoformat() only learned trailing "Z" in Python 3.11; this
+    project's floor is 3.10, where a Z-suffixed timestamp (the JS/Go default)
+    must not quarantine a message that is actually valid."""
+    body = {"message_id": str(uuid.uuid4()), "event_ts": wire_form, "payload": {}}
+    outcome = P.process_message(raw_message(body), detector)
+    assert outcome.action == "clean", label
+    assert outcome.failure is None, label
+    assert outcome.envelope.event_ts == normalized, label
+    assert json.loads(outcome.out_bytes)["event_ts"] == normalized, label
 
 
 def test_poison_id_is_stable_for_the_same_coordinates():

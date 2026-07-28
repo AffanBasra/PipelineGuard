@@ -48,6 +48,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 
 from confluent_kafka import Consumer, Producer
 
@@ -136,6 +137,35 @@ def process_message(msg, detector: RulesDetector) -> Outcome:
     raw = msg.value()
     try:
         envelope = Envelope.from_bytes(raw)
+        if not isinstance(envelope.message_id, str):
+            raise TypeError(
+                f"message_id is {type(envelope.message_id).__name__}, expected str"
+            )
+        # Canonicalize rather than just validate: uuid.UUID() accepts forms
+        # (urn:uuid: prefix, braces, no hyphens) that Postgres's uuid input
+        # does not. message_id is the join key across every topic and table,
+        # so it must be uniform everywhere it's used downstream, not just at
+        # this check.
+        envelope.message_id = str(uuid.UUID(envelope.message_id))
+        if not isinstance(envelope.event_ts, str):
+            raise TypeError(
+                f"event_ts is {type(envelope.event_ts).__name__}, expected str"
+            )
+        # Normalize the trailing "Z" some producers (JS, Go) emit by default:
+        # datetime.fromisoformat() only learned "Z" in Python 3.11, and this
+        # project's floor is 3.10, so on the floor a valid Z-suffixed
+        # timestamp would otherwise quarantine as a parsing failure.
+        if envelope.event_ts.endswith("Z"):
+            envelope.event_ts = envelope.event_ts[:-1] + "+00:00"
+        datetime.fromisoformat(envelope.event_ts)
+        # bool is a subclass of int, so isinstance(True, int) alone would pass
+        # a boolean through; psycopg then adapts it to a Postgres boolean,
+        # which SMALLINT won't implicitly cast — an insert-time failure below
+        # the fail-closed boundary.
+        if not isinstance(envelope.schema_version, int) or isinstance(envelope.schema_version, bool):
+            raise TypeError(
+                f"schema_version is {type(envelope.schema_version).__name__}, expected int"
+            )
         if not isinstance(envelope.payload, dict):
             raise TypeError(
                 f"payload is {type(envelope.payload).__name__}, expected object"

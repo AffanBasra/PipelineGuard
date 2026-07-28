@@ -9,6 +9,11 @@ Every message on every topic uses the same envelope so downstream consumers
       "schema_version": 1,
       "payload": { ... domain fields ... }
     }
+
+message_id is canonicalized to hyphenated-lowercase form (str(uuid.UUID(...)))
+by the processor on ingest, since uuid.UUID() accepts urn:/braces/no-hyphen
+forms that Postgres's uuid column rejects. Everything downstream — audit rows,
+the clean/quarantine topics, the producer key — sees only the canonical form.
 """
 from __future__ import annotations
 
