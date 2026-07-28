@@ -27,6 +27,7 @@ a Postgres audit trail from which a governance report is generated.
 - [x] Synthetic Pakistani bank-transaction stream + producer
 - [x] Tier 1: regex/checksum rules (CNIC, PK IBAN, PK phone, email)
 - [x] Processor: consume → detect → redact → route → audit
+- [x] Test suite (106 tests, no broker or database required)
 - [ ] Tier 2: fine-tuned encoder NER (Urdu/Roman-Urdu names)
 - [ ] Tier 3: pluggable LLM escalation (Gemini, Ollama)
 - [ ] Benchmarks: throughput + p50/p99 latency per tier
@@ -38,9 +39,9 @@ a Postgres audit trail from which a governance report is generated.
 
 ```bash
 docker compose up -d
-pip install -r requirements.txt
+pip install -e .                                           # src layout: editable install puts pipelineguard on the path
 python scripts/create_topics.py
-python -m pipelineguard.producer --rate 50 --count 1000   # feed txn.raw
+python -m pipelineguard.producer --rate 50 --count 1000    # feed txn.raw
 python -m pipelineguard.processor                          # run the firewall
 ```
 
@@ -107,6 +108,24 @@ quarantines, so "why was this quarantined" is answerable from SQL alone.
 forwarded; only *uncertain* records (sub-threshold confidence, malformed
 messages) are quarantined — mirroring how production DLP systems avoid
 blocking the happy path.
+
+## Tests
+
+```bash
+pip install -e ".[dev]"
+pytest                      # ~1s, no Kafka or Postgres needed
+pytest --cov=pipelineguard  # coverage report
+```
+
+The detection and routing logic is written as pure functions — `RulesDetector.detect`,
+`processor.process_message`, `processor.redact` — specifically so it can be tested
+without infrastructure. Kafka messages are stubbed; Postgres is replaced by a fake
+connection that records the SQL it was handed, which is how the audit tests assert
+that **no payload value ever reaches the database**.
+
+Coverage is 100% on the detection, routing, audit and generator modules. The
+uncovered remainder is the two `main()` loops, which are broker-bound and belong
+in integration tests rather than unit tests — that gap is real and not yet filled.
 
 ## Observability
 

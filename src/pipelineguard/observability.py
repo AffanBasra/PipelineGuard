@@ -27,8 +27,12 @@ def setup_logging(level: str = "INFO") -> None:
 
 
 def percentile(values: list[float], p: float) -> float:
-    """Nearest-rank percentile. Small dependency-free helper: statistics.quantiles
-    needs >= 2 points and interpolates, which is noise at these sample sizes."""
+    """Index-based percentile, no interpolation: idx = round(p/100 * (n-1)).
+
+    Dependency-free on purpose: statistics.quantiles needs >= 2 points and
+    interpolates between them, which invents latency values that were never
+    measured — not what you want in a number you intend to publish.
+    """
     if not values:
         return 0.0
     ordered = sorted(values)
