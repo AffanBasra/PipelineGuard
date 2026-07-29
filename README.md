@@ -7,12 +7,14 @@ uncertain records are quarantined for review, and every decision is written to
 a Postgres audit trail from which a governance report is generated.
 
 ```
-                        ┌──────────────────┐
- txn.raw ──────────────►│  processor        │──► txn.clean       (redacted)
- (synthetic bank txns)  │  T1 rules (µs)    │──► txn.quarantine  (uncertain)
-                        │  T2 encoder (ms)  │
-                        │  T3 LLM (escalate)│──► Postgres audit ──► governance report
-                        └──────────────────┘
+                        ┌────────────────────────────┐
+ txn.raw ──────────────►│  processor                 │──► txn.clean       (redacted)
+ (synthetic bank txns)  │  T1 rules (µs)      built  │──► txn.quarantine  (uncertain)
+                        │  T2 encoder (ms)    planned│
+                        │  T3 LLM (escalate)  planned│──► Postgres audit
+                        └────────────────────────────┘         │
+                                                               ▼
+                                                     governance report (planned)
 ```
 
 > **Honest scope:** the input streams are synthetic (Faker + hand-built
@@ -27,12 +29,14 @@ a Postgres audit trail from which a governance report is generated.
 - [x] Synthetic Pakistani bank-transaction stream + producer
 - [x] Tier 1: regex/checksum rules (CNIC, PK IBAN, PK phone, email)
 - [x] Processor: consume → detect → redact → route → audit
-- [x] Test suite (106 tests, no broker or database required)
-- [ ] Tier 2: fine-tuned encoder NER (Urdu/Roman-Urdu names)
-- [ ] Tier 3: pluggable LLM escalation (Gemini, Ollama)
-- [ ] Benchmarks: throughput + p50/p99 latency per tier
-- [ ] Support-chat free-text topic
+- [x] Test suite (no broker or database required)
+- [x] Micro-batched processing + batch-size benchmark
+- [ ] Dockerfile + processor service, so `docker compose up` runs the pipeline
 - [ ] Governance report generator
+- [ ] Tier 2: encoder NER — off-the-shelf first, locale fine-tune after
+- [ ] End-to-end latency measurement (current figures are detection-only)
+- [ ] Tier 3: pluggable LLM escalation (Gemini, Ollama)
+- [ ] Support-chat free-text topic
 - [ ] Airflow batch-scan mode
 
 ## Quick start
@@ -58,6 +62,17 @@ SELECT failure_class, count(*) FROM messages_processed
 > Postgres is published on host port **5433** (5432 is commonly taken by a
 > native install). The container still listens on 5432 internally.
 
+### Processor flags
+
+| flag | default | purpose |
+|---|---|---|
+| `--batch-size` | 500 | max messages per `consume()` call — see [Benchmarks](#benchmarks) for why |
+| `--batch-timeout-ms` | 1000 | how long to wait for a batch to fill before processing what arrived |
+| `--flush-timeout` | 10 | seconds to wait for a batch's produces to be confirmed durable |
+| `--stats-every` | 5 | seconds between throughput/latency stats lines |
+| `--exit-after` | 0 | stop after N messages (0 = run until interrupted); makes benchmark runs reproducible |
+| `--log-level` | INFO | `DEBUG` logs every message — never use it while benchmarking |
+
 ## Design decisions
 
 **Tiered detection under a latency budget.** Tier 1 (compiled regex +
@@ -65,7 +80,8 @@ checksum validation, µs) handles structured PII; Tier 2 (fine-tuned encoder,
 ms) handles names and contextual PII in free text; Tier 3 (LLM) is invoked
 only for spans where Tier 2 confidence falls in an uncertainty band. The
 tiering is a throughput/cost tradeoff, not just an accuracy ladder — the
-benchmark tables (below, TBD) quantify it.
+benchmark table [below](#benchmarks) quantifies it — and shows detection is
+currently only ~15% of per-record cost, so the plumbing dominates the rules.
 
 **At-least-once, not exactly-once.** Kafka transactions can make the
 consume→produce→commit leg exactly-once, but this pipeline's outputs cross a
@@ -82,17 +98,41 @@ microseconds. A commit is issued only after `flush()` has drained *and* the
 per-message delivery callback reported no error — both checks are required,
 since a message can leave the producer queue by failing.
 
-**Two failure classes, handled oppositely.** Conflating them yields either an
-infinite crash loop or silent loss:
+**Three failure classes, handled differently.** Conflating message-level and
+infrastructure failures yields either an infinite crash loop or silent loss;
+conflating either with routine coordination events does the same in a
+narrower way:
 
 | failure | nature | response |
 |---|---|---|
 | unparseable bytes, wrong payload shape, detector raised | deterministic — fails identically on replay | **fail closed**: quarantine with the reason recorded, commit, continue |
 | broker unreachable, Postgres down, delivery unconfirmed | transient — likely succeeds on replay | **crash and replay**: don't commit, let the process die, restart replays |
+| commit rejected because the consumer group rebalanced under it (`ILLEGAL_GENERATION`, `UNKNOWN_MEMBER_ID`, `REBALANCE_IN_PROGRESS`) | routine — not a sign the coordinator is unreachable | **tolerated**: log and move on, uncommitted; the new partition owner reprocesses the batch, harmlessly, via the same idempotent audit upsert |
 
-The dividing line is literal: message-level work sits inside
-`process_message()`'s try block; everything after it in the loop is
-infrastructure and is allowed to propagate.
+The dividing line for the first two is literal: message-level work sits
+inside `process_message()`'s try block; everything after it in the loop is
+infrastructure and is allowed to propagate. The third is narrower still — it
+wraps only the `consumer.commit()` call, and only that exact, enumerated set
+of codes. Deliberately **not** tolerated: `_MAX_POLL_EXCEEDED` means *we* were
+too slow and should be loud, not silenced; `UNKNOWN_TOPIC_OR_PART` is a
+deployment error; auth and coordinator failures are genuine infrastructure. A
+blanket `except KafkaException` would convert all of those into silent loss —
+exactly the failure mode this taxonomy exists to prevent.
+
+**Batching widens the replay window from 1 message to N.** Offsets are now
+committed once per batch (up to `--batch-size` messages, or whenever
+`--batch-timeout-ms` expires) instead of once per message. A crash between
+processing a batch and committing it therefore replays the whole batch on
+restart — still at-least-once, still safe because the audit upserts, but the
+amount of repeated work on failure now scales with batch size. This is the
+honest price of the throughput win.
+
+Error entries from `consume()` (broker notices — rebalance, EOF) are filtered
+out before offsets are ever computed from a batch: they carry a topic,
+partition and offset but no payload, and letting one through would silently
+advance the commit position past a record that was never processed — the one
+failure mode in the whole pipeline that loses data permanently rather than
+just repeating work.
 
 **Audit before emit.** The audit row is written *before* the message is
 produced downstream, so no record is ever emitted that has not already been
@@ -109,6 +149,11 @@ forwarded; only *uncertain* records (sub-threshold confidence, malformed
 messages) are quarantined — mirroring how production DLP systems avoid
 blocking the happy path.
 
+The decisions above are the highlights; for the reasoning behind every
+non-obvious choice in the project — including provisional values still
+pending measurement and open questions not yet decided — see
+[docs/decisions.md](docs/decisions.md).
+
 ## Tests
 
 ```bash
@@ -123,9 +168,14 @@ without infrastructure. Kafka messages are stubbed; Postgres is replaced by a fa
 connection that records the SQL it was handed, which is how the audit tests assert
 that **no payload value ever reaches the database**.
 
-Coverage is 100% on the detection, routing, audit and generator modules. The
-uncovered remainder is the two `main()` loops, which are broker-bound and belong
-in integration tests rather than unit tests — that gap is real and not yet filled.
+Coverage is 100% on the detection, routing, audit and generator modules, and
+99% on `processor.py` — including its `main()` loop, tested by patching
+`Consumer`/`Producer`/`AuditWriter` on the module with in-memory fakes rather
+than running against a real broker. That proves the wiring (batching, error
+filtering, commit ordering, rebalance tolerance); it is not a substitute for
+integration testing against a live stack, which this suite doesn't attempt.
+`producer.py`'s loop is untested for the same broker-bound reason — that gap
+is real and not yet filled.
 
 ## Observability
 
@@ -144,8 +194,84 @@ measures the terminal rather than the pipeline.
 
 ## Benchmarks
 
-TBD. Methodology will state hardware, message-size distribution, and measure
-Tier 3 separately (API-bound latency is not comparable to local tiers).
+Batch size sweep, 20,000 synthetic transactions per run. Every run reprocesses
+the same messages from offset 0 under a fresh consumer group.
+
+| `--batch-size` | throughput | per-record | detection p50 / p95 / p99 |
+|---:|---:|---:|---:|
+| 1 | 8 /s | 125 ms | 0.28 / 0.50 / 0.64 ms |
+| 8 | 57 /s | 17.5 ms | 0.14 / 0.35 / 0.50 ms |
+| 32 | 291 /s | 3.44 ms | 0.10 / 0.19 / 0.26 ms |
+| 64 | 368 /s | 2.72 ms | 0.10 / 0.18 / 0.26 ms |
+| 128 | 892 /s | 1.12 ms | 0.10 / 0.15 / 0.22 ms |
+| 256 | 898 /s | 1.11 ms | 0.11 / 0.18 / 0.23 ms |
+| **512** | **1,267 /s** | **0.79 ms** | 0.10 / 0.16 / 0.21 ms |
+| 1024 | 1,361 /s | 0.735 ms | 0.10 / 0.13 / 0.19 ms |
+| 2048 | 1,450 /s | 0.69 ms | 0.11 / 0.15 / 0.20 ms |
+
+**Batching is worth ~180× on this workload** — 8 msg/s committing per message,
+1,450 msg/s at a 2048-message batch. That is the entire justification for the
+added complexity, and it comes from amortising three fixed costs (a Postgres
+WAL fsync, a producer flush waiting on broker acknowledgement, and an offset
+commit round trip) across N records instead of paying them per record.
+
+**512 is the default because the curve flattens there.** It reaches 87% of the
+best observed throughput; 1024 buys 7 more points for double the replay window
+and 2048 another 6 for quadruple. Since a failed batch replays in full, batch
+size is bought with replay cost, and the marginal return collapses past 512.
+
+**Detection is not the bottleneck, and that is the interesting result.** p50
+detection latency sat at 0.10–0.11 ms in every configuration across both
+sweeps — nine runs, two orderings — while per-record cost at the best batch
+size is 0.69 ms. **Roughly 85% of per-record time is spent somewhere other
+than detection**: producing, auditing, and moving bytes across the broker and
+database boundaries. Tier 1's rules are effectively free relative to the
+plumbing around them, which is worth knowing before Tier 2 adds ~20 ms of
+model inference to that budget.
+
+### Methodology and caveats
+
+Hardware: Intel i7-11800H (8 cores / 16 threads), 31.7 GB RAM, Windows +
+Docker Desktop (WSL2 backend, 16 CPUs / 15.5 GB allocated). **Kafka, Postgres
+and the processor all ran on the same laptop**, so these are relative
+comparisons between configurations, not absolute capacity claims — a
+dedicated broker over a real network would look different in both directions.
+
+Message shape: 9-field synthetic bank transaction, ~500 bytes, averaging 5.4
+detected entities each (2 IBAN, 1.2 phone, 1.1 email, 1.1 CNIC). The producer
+ran unthrottled (`--rate 0`) so that batch size, not arrival rate, was the
+binding constraint — throttling below `batch_size / batch_timeout` would close
+batches on the clock and flatten the curve for the wrong reason.
+
+Runs used `--exit-after 20000` for a deterministic stopping point; timing a
+long-running consumer by hand biases the rate downward by however long it
+idles after draining. The audit tables were truncated between runs.
+
+**The latency columns measure detection only.** The timer starts immediately
+before `process_message` and stops after it, so consume, batch linger, audit,
+produce and flush are all excluded. End-to-end latency is not yet measured.
+
+**Low-batch-size numbers are not stable on this hardware.** The sweep was run
+twice, forward and in reverse. Results at 256 and above agreed within 4%, but
+`--batch-size 128` measured 307 /s in the forward sweep and 892 /s in reverse —
+2.9× apart. In the forward run its throughput degraded monotonically within
+the run (586 → 431 → 327 → … → 174 /s); in reverse it held steady at ~1,050 /s.
+The forward sweep had spent ~47 minutes under sustained load before reaching
+that point, the reverse sweep 70 seconds.
+
+Two hypotheses were tested by re-running the sweep in reverse order. Index
+growth in `findings` was ruled out — the table grows identically within every
+run, including the reverse one that showed no degradation. The remaining
+explanation is the measurement environment: a laptop running all three
+components, where sustained load degrades over tens of minutes. The reverse
+sweep is reported above because it completed in 3.6 minutes with flat interval
+rates throughout. The anomaly is documented rather than smoothed away, and it
+does not affect the design conclusion.
+
+Correctness held across every run: 19,227 redacted and 773 quarantined of
+20,000 (3.87% quarantine rate, against 3.96% predicted from the generator's
+2%-per-IBAN corruption and two IBANs per message), zero fail-closed failures,
+and exactly 40,000 IBAN detections — precisely two per message.
 
 ## Project layout
 
