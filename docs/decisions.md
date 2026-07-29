@@ -62,9 +62,19 @@ holders) falls within GDPR's extraterritorial scope.
 Framing discipline: the report states what the system **does**, and describes
 itself as *designed to support* obligations — never as *compliant with* them.
 Compliance is a determination about an organisation, not a property a detector
-can assert about itself. Specific statutory citations must be verified before
-they appear in any public document; the structure of the mapping is
-defensible, the exact section numbers are not yet.
+can assert about itself.
+
+Citations name instruments and their effect rather than section numbers, and
+were **cross-checked against independent references on 2026-07-29 with no
+inconsistency found**. That is not primary-source verification, and a
+section-level citation should not be added without one. Recorded explicitly so
+the distinction cannot quietly erode.
+
+The asymmetry between the regimes is stated in the report rather than
+smoothed over: Pakistan has no enacted general data protection statute, so
+there is no domestic equivalent of GDPR Art. 30 to cite. Padding the Pakistani
+column to match the GDPR one would have been the overclaiming this project
+exists to avoid.
 
 **The governance report is written for a compliance reviewer, with provenance
 that also reads as engineering.** *(settled)*

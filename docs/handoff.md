@@ -334,11 +334,13 @@ repo goes public):
    `service_completed_successfully`, and `restart: unless-stopped` is what
    makes crash-and-replay real. `docker compose up --scale processor=3` then
    gives the multi-consumer demo in one command.
-2. ~~**Governance report.**~~ **Built** — `report.py` + `compliance.py`, 45
-   new tests, sample at `docs/sample-report.md`. Remaining: it is not yet
-   reachable from `docker compose`, and the Pakistani statutory references in
-   `compliance.py` are deliberately general and need verifying against primary
-   sources before the repo goes public.
+2. ~~**Governance report.**~~ **Built** — `report.py` + `compliance.py`, 50
+   new tests, sample at `docs/sample-report.md`. Citations name instruments
+   and their effect rather than section numbers, and were cross-checked
+   against independent references on 2026-07-29 with no inconsistency found —
+   which is not primary-source verification, and a section-level citation
+   should not be added without one. Remaining: the report is not yet reachable
+   from `docker compose`.
 3. **Tier 2, off-the-shelf encoder**, honestly labelled as not locale-tuned.
    The locale fine-tune is post-MVP.
 4. The evaluation work in §7.

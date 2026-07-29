@@ -18,12 +18,18 @@ principally cross-border transactions, where a Pakistani institution
 processing the personal data of EU data subjects falls within the
 extraterritorial scope of Article 3(2).
 
-**Citations are deliberately general.** Section numbers, SBP circular
-references and the status of the draft Personal Data Protection Bill must be
-verified against primary sources before this text appears in any public or
-client-facing document. The structure of the mapping is defensible; the
-precise references are not yet, and overstating them would violate the
-project's standing "only interview-defensible claims" constraint.
+**Citations are deliberately general, and were cross-checked on 2026-07-29**
+against independent references, which found no inconsistency. Named
+instruments -- PECA 2016, the NADRA Ordinance 2000, PTA SIM registration, SBP
+technology-governance expectations, the draft Personal Data Protection Bill --
+are cited by name and effect rather than by section number, which is the level
+this text can support.
+
+A cross-check is not primary-source verification. Anything client-facing or
+formal should be checked against the primary texts, and a section-level
+citation should not be added here without one. The distinction is recorded
+rather than assumed: quietly upgrading a cross-check into a verification is
+exactly how an accuracy constraint erodes.
 """
 from __future__ import annotations
 
