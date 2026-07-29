@@ -5,8 +5,9 @@ exists, what has been measured, what is decided, what is open. Proposals are
 labelled as proposals; nothing here should be read as settled unless it says
 so.
 
-Repo: `github.com/AffanBasra/PipelineGuard` (private). Branch `master` at
-`91eb289`. Working tree clean. 158 tests passing in ~1s.
+Repo: `github.com/AffanBasra/PipelineGuard` (private). Last updated
+2026-07-29 on branch `governance-report`, which is ahead of `master` by the
+corpus survey and the governance report. 202 tests passing.
 
 ---
 
@@ -31,8 +32,9 @@ claims.** No invented metrics, no overselling, and READMEs state honest scope.
 
 ## 2. What exists and works
 
-~1,100 lines of source, ~1,400 lines of tests, 158 tests, no broker or
-database required to run the suite.
+~1,400 lines of source, ~1,800 lines of tests, 202 tests. No broker or
+database is required for 190 of them; the 12 integration tests skip when no
+Postgres is reachable.
 
 **Infrastructure.** `docker-compose.yml` runs Kafka 3.8 (KRaft, no ZooKeeper)
 and Postgres 16. Topics are created explicitly by `scripts/create_topics.py`
@@ -69,6 +71,21 @@ Fail-closed quarantines additionally record `failure_class` and
 **Observability.** `observability.py` provides console logging and a periodic
 stats line reporting throughput and detection-latency percentiles over a
 bounded rolling window.
+
+**Governance report.** `report.py` renders the audit trail as Markdown for a
+compliance reviewer — scope of scan, disposition, tiers, personal data
+observed with its regulatory basis, where it was found, items requiring
+review, failures, system properties, limitations. It reads the audit trail and
+nothing else, so it inherits the property that no PII value can appear in it.
+Quarantine is split into two worklists (fail-closed = engineering, uncertain =
+human decision). `compliance.py` maps entity types to data categories and the
+regime that makes them matter. A generated example is committed at
+`docs/sample-report.md`.
+
+Its SQL is tested against a real Postgres in `tests/integration/`, skipped
+when none is reachable — the first integration tests in the project, added
+because the report's logic *is* its SQL and a fake connection would have
+tested the renderer against its own fixtures.
 
 ---
 
@@ -317,10 +334,13 @@ repo goes public):
    `service_completed_successfully`, and `restart: unless-stopped` is what
    makes crash-and-replay real. `docker compose up --scale processor=3` then
    gives the multi-consumer demo in one command.
-2. **Governance report.** Written for a compliance reviewer — findings by
-   entity type over a period, quarantine queue with reasons, failure classes —
-   with provenance (window covered, records scanned, throughput, tier
-   breakdown) that serves both that reader and an engineering one. Not built.
+2. ~~**Governance report.**~~ **Built** — `report.py` + `compliance.py`, 50
+   new tests, sample at `docs/sample-report.md`. Citations name instruments
+   and their effect rather than section numbers, and were cross-checked
+   against independent references on 2026-07-29 with no inconsistency found —
+   which is not primary-source verification, and a section-level citation
+   should not be added without one. Remaining: the report is not yet reachable
+   from `docker compose`.
 3. **Tier 2, off-the-shelf encoder**, honestly labelled as not locale-tuned.
    The locale fine-tune is post-MVP.
 4. The evaluation work in §7.
@@ -351,8 +371,10 @@ conditional Go rewrite of one consumer.
   detection-only — the timer starts immediately before `process_message` and
   excludes consume, linger, audit, produce and flush. Labelled as such in the
   README; a second measurement from `event_ts` remains to be added.
-- Integration tests against a live stack: not attempted. `main()` is covered
-  by fakes, which proves wiring but not broker behaviour.
+- Integration tests against a live stack: **partly closed.** The report's SQL
+  is now tested against a real Postgres. Kafka remains untested against a live
+  broker — `processor.main()` is covered by fakes, which proves wiring but not
+  broker behaviour.
 - Kafka has no named volume, so its log does not survive `docker compose down`.
   Convenient during benchmarking, incoherent for a system whose durability
   argument rests on that log.
