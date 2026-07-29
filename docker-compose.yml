@@ -1,3 +1,21 @@
+# Two config surfaces exist and are easy to confuse:
+#
+#   from the host       kafka -> localhost:9092    postgres -> localhost:5433
+#   between containers  kafka -> kafka:19092       postgres -> postgres:5432
+#
+# The application defaults in config.py are the host values, because that is
+# where the test suite and ad-hoc runs live. Every containerised service below
+# therefore overrides them. .env is excluded from the image (see .dockerignore)
+# so it cannot silently reinstate the host values inside a container.
+
+x-app-env: &app-env
+  KAFKA_BOOTSTRAP: kafka:19092
+  POSTGRES_DSN: postgresql://pipelineguard:pipelineguard@postgres:5432/pipelineguard
+
+x-app-image: &app-image
+  build: .
+  image: pipelineguard:local
+
 services:
   kafka:
     image: apache/kafka:3.8.0
@@ -19,6 +37,12 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       # Topics are created explicitly by scripts/create_topics.py — no surprises.
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      # Without this the log lives under /tmp and does not survive `down`,
+      # which is incoherent for a system whose durability argument rests on
+      # that log. See the kafkadata volume note at the bottom of this file.
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - kafkadata:/var/lib/kafka/data
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
       interval: 10s
@@ -43,5 +67,71 @@ services:
       timeout: 5s
       retries: 10
 
+  # Runs once and exits. Broker auto-create is disabled, so the processor
+  # would subscribe to nothing without this. `service_completed_successfully`
+  # on the processor is what turns "topics probably exist by now" into an
+  # ordering guarantee.
+  topics-init:
+    <<: *app-image
+    container_name: pg-topics-init
+    command: ["python", "scripts/create_topics.py"]
+    environment: *app-env
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: "no"
+
+  processor:
+    <<: *app-image
+    # Deliberately no container_name: compose refuses to scale a service that
+    # has one, and `docker compose up --scale processor=3` is the whole
+    # consumer-group demonstration.
+    environment: *app-env
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      topics-init:
+        condition: service_completed_successfully
+    # This is what makes the crash-and-replay design real rather than
+    # asserted. An infrastructure failure kills the process by design; the
+    # restart replays from the last committed offset, and the idempotent
+    # audit upsert makes the repeat harmless.
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------- #
+  # On-demand tools. The `tools` profile keeps them out of `docker compose
+  # up`, while `docker compose run` activates a service's profile
+  # automatically -- so they are available without ever starting by accident.
+  #
+  # `entrypoint` rather than `command` so arguments append cleanly:
+  #     docker compose run --rm producer --rate 50 --count 1000
+  # ---------------------------------------------------------------------- #
+  producer:
+    <<: *app-image
+    profiles: ["tools"]
+    entrypoint: ["python", "-m", "pipelineguard.producer"]
+    environment: *app-env
+    depends_on:
+      kafka:
+        condition: service_healthy
+      topics-init:
+        condition: service_completed_successfully
+
+  report:
+    <<: *app-image
+    profiles: ["tools"]
+    entrypoint: ["python", "-m", "pipelineguard.report"]
+    environment: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
 volumes:
   pgdata:
+  # The Kafka log. Previously absent, which meant `docker compose down`
+  # discarded every message and every committed offset -- convenient while
+  # benchmarking, incoherent for a pipeline whose at-least-once argument
+  # rests on the log surviving a restart.
+  kafkadata:
