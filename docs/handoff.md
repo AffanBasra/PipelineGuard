@@ -44,7 +44,8 @@ no named volume, so its log does not survive `docker compose down`.
 
 **Synthetic stream.** `generator/transactions.py` produces Pakistani bank
 transactions — CNIC, PK IBAN (with valid ISO 7064 mod-97 check digits), PK
-mobile numbers, Roman-Urdu names, plus a free-text memo field. ~2% of IBANs
+mobile numbers, Pakistani names in Latin script, plus a free-text memo field
+(currently English; there is no Roman Urdu in the pipeline). ~2% of IBANs
 are corrupted deliberately so the quarantine path is exercised.
 `producer.py` is a rate-controlled producer with delivery callbacks and a
 progress bar.
@@ -275,7 +276,7 @@ whichever way it goes.**
 existing loop. Measure recall, latency and escalation rate together.
 
 **Phase 4 — Pakistani evaluation set.** No public corpus covers CNIC, PK IBAN
-or Roman-Urdu names. A few hundred hand-built records with names sourced
+or Pakistani names. A few hundred hand-built records with names sourced
 independently (e.g. WikiANN-ur or a public name list rather than written by
 the author), disjoint between generation and evaluation, labelled honestly as
 self-constructed.

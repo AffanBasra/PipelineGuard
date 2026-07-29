@@ -18,7 +18,8 @@ a Postgres audit trail from which a governance report is generated.
 ```
 
 > **Honest scope:** the input streams are synthetic (Faker + hand-built
-> Pakistani-locale generators — CNIC, PK IBAN, Urdu/Roman-Urdu names). No real
+> Pakistani-locale generators — CNIC, PK IBAN, Pakistani names in Latin
+> script). No real
 > PII is processed or stored; the audit trail records entity *types and spans*,
 > never values. Delivery semantics are **at-least-once with idempotent audit
 > writes** — see [Design decisions](#design-decisions) for why not exactly-once.

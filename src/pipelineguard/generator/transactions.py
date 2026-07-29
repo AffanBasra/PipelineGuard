@@ -13,7 +13,9 @@ from faker import Faker
 
 fake = Faker()
 
-# Roman-Urdu / Pakistani first and last names — the locale differentiator.
+# Pakistani first and last names, Latin script — the locale differentiator.
+# NOT Roman Urdu: these are transliterated proper nouns, not the Urdu language
+# written in Latin script. See docs/tier2-detection-findings.md.
 # Deliberately includes names that are also common words/ambiguous tokens
 # (e.g. "Iman", "Noor") to stress Tier 2 later.
 FIRST_NAMES = [

@@ -128,11 +128,24 @@ detection, micro-batched inference, the escalation path and the latency gap
 between ~0.4 µs rules and ~20 ms encoder, at a fraction of the cost of the
 fine-tune.
 
-The locale fine-tune then becomes an upgrade with a measured before/after
-("off-the-shelf NER missed X% of Roman-Urdu names; locale-substituted training
-took it to Y%"), which is a far stronger claim than an F1 number in isolation —
-and it needs the pipeline in place to measure against anyway. Ships labelled
-honestly as not locale-tuned.
+The locale fine-tune then becomes an upgrade with a measured before/after,
+which is a far stronger claim than an F1 number in isolation — and it needs
+the pipeline in place to measure against anyway. Ships labelled honestly as
+not locale-tuned.
+
+**Correction (2026-07-29): the before/after is about addresses, not names.**
+This entry previously proposed the framing *"off-the-shelf NER missed X% of
+Roman-Urdu names; locale-substituted training took it to Y%"*. That premise
+was tested and is false. `nvidia/gliner-PII` scores identically on Pakistani
+names in English, code-switched and Roman-Urdu sentences — 100% any-hit in
+every difficulty band, flat to the percentage point. Only a weak English-only
+model degrades.
+
+Addresses are where it breaks: the same model covers 96% of an English-form
+address in an English sentence and **51%** of a Roman-Urdu-form address in a
+Roman-Urdu sentence, leaving the house number and street in the clear while
+finding the city. Both variables contribute independently. Full numbers and
+method in [tier2-detection-findings.md](tier2-detection-findings.md).
 
 **Tier assignment by cost, not by capability.** *(settled)*
 Tier 1 rules handle anything with a checkable format (CNIC, IBAN, phone,
