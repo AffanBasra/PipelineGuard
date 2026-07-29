@@ -25,14 +25,27 @@ already been recorded. A Postgres outage therefore halts the pipeline rather
 than letting unlogged data through — the correct fail-closed behaviour for a
 governance tool.
 
-Commit invariant: the offset is committed only after the produce is confirmed
-durable (flush drained AND no delivery error). commit() is asynchronous by
-design: safety comes from idempotent audit upserts, not from commit synchrony,
-and a synchronous commit would add a coordinator round trip (~ms) to a
-per-message budget measured in microseconds.
+Commit invariant: the offset is committed only after every produce in the
+batch is confirmed durable (flush drained AND no delivery error, checked
+across the whole batch, not just the last message). commit() is asynchronous
+by design: safety comes from idempotent audit upserts, not from commit
+synchrony, and a synchronous commit would add a coordinator round trip (~ms)
+to a per-message budget measured in microseconds.
+
+Batching: the loop fetches up to --batch-size messages per consume() call,
+runs process_message over each, then hands the whole batch to
+audit.record_batch() and produces every outcome before a single flush().
+This only changes the granularity the two invariants above apply at — audit
+still precedes emit, and commit still comes last, now for the batch instead
+of one message. Messages carrying msg.error() (broker-side notices: EOF,
+rebalance) are filtered out before they reach process_message,
+record_batch(), or highest_offsets() — an error entry still carries a real
+offset, and letting it through would silently advance the commit position
+past a message that was never processed.
 
 Run:
     python -m pipelineguard.processor [--stats-every 5] [--log-level INFO]
+    [--batch-size 500] [--batch-timeout-ms 1000] [--exit-after 0]
 Verify end-to-end:
     python scripts/create_topics.py
     python -m pipelineguard.producer --rate 50 --count 500
@@ -50,9 +63,9 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 
-from confluent_kafka import Consumer, Producer
+from confluent_kafka import Consumer, KafkaError, KafkaException, Producer, TopicPartition
 
-from pipelineguard.audit import AuditWriter
+from pipelineguard.audit import AuditRecord, AuditWriter
 from pipelineguard.config import settings
 from pipelineguard.detectors.tier1_rules import RulesDetector
 from pipelineguard.models import Envelope, Finding
@@ -61,6 +74,18 @@ from pipelineguard.observability import StatsReporter, setup_logging
 log = logging.getLogger("pipelineguard.processor")
 
 _FAILURE_DETAIL_MAXLEN = 500
+
+# The group coordinator moved this consumer's assignment under it mid-commit —
+# routine during a rebalance, not a sign the coordinator is unreachable.
+# Everything else on a commit (including a plain timeout) means it might be,
+# and must still crash-and-replay rather than be swallowed here.
+_TOLERATED_COMMIT_ERRORS = frozenset(
+    {
+        KafkaError.ILLEGAL_GENERATION,       # 22
+        KafkaError.UNKNOWN_MEMBER_ID,        # 25
+        KafkaError.REBALANCE_IN_PROGRESS,    # 27
+    }
+)
 
 
 class DeliveryFailed(RuntimeError):
@@ -100,6 +125,40 @@ def poison_id(msg) -> str:
             f"kafka://{msg.topic()}/{msg.partition()}/{msg.offset()}",
         )
     )
+
+
+def highest_offsets(messages) -> list[TopicPartition]:
+    """The commit position for a batch that may span multiple partitions.
+
+    consumer.commit(msg) only knows how to position one (topic, partition);
+    a batch from consume() can contain messages from all of them, so each
+    partition needs its own commit position: the highest offset seen in that
+    partition, plus one (the position Kafka should resume from on restart).
+
+    Takes the max explicitly rather than the last message seen per partition.
+    Ordering within a partition holds today, but relying on that instead of
+    computing the max is an unstated assumption — it would fail silently if
+    anything upstream (batching, retries) ever violated it.
+    """
+    highest: dict[tuple[str, int], int] = {}
+    for msg in messages:
+        key = (msg.topic(), msg.partition())
+        highest[key] = max(highest.get(key, msg.offset()), msg.offset())
+    return [
+        TopicPartition(topic, partition, offset + 1)
+        for (topic, partition), offset in highest.items()
+    ]
+
+
+def is_rebalance_error(exc: KafkaException) -> bool:
+    """True if a commit failed for the routine reason that group membership
+    moved under it (rebalance in progress, this member's id or generation
+    already superseded) rather than because the coordinator is genuinely
+    unreachable. Pulled out as its own predicate — rather than inlined as a
+    branch in main() — so the classification itself gets exhaustive, cheap
+    tests, and main() only needs a couple proving it calls this correctly.
+    """
+    return exc.args[0].code() in _TOLERATED_COMMIT_ERRORS
 
 
 def redact(text: str, findings: list[Finding]) -> str:
@@ -221,12 +280,21 @@ def process_message(msg, detector: RulesDetector) -> Outcome:
         )
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--stats-every", type=float, default=5.0, help="stats line interval (s)")
     ap.add_argument("--log-level", default="INFO")
-    ap.add_argument("--flush-timeout", type=float, default=10.0, help="per-message flush timeout (s)")
-    args = ap.parse_args()
+    ap.add_argument("--flush-timeout", type=float, default=10.0, help="flush timeout per batch (s)")
+    ap.add_argument("--batch-size", type=int, default=500, help="max messages fetched per consume() call")
+    ap.add_argument(
+        "--batch-timeout-ms", type=float, default=1000.0,
+        help="max time to wait for a batch to fill before processing what arrived (ms)",
+    )
+    ap.add_argument(
+        "--exit-after", type=int, default=0,
+        help="stop after processing at least N messages, for benchmarking (0 = run forever)",
+    )
+    args = ap.parse_args(argv)
 
     setup_logging(args.log_level)
 
@@ -257,65 +325,116 @@ def main() -> None:
         settings.consumer_group,
     )
 
+    processed_total = 0
+
     try:
         while True:
-            msg = consumer.poll(1.0)
+            messages = consumer.consume(args.batch_size, timeout=args.batch_timeout_ms / 1000.0)
             stats.maybe_report()
-            if msg is None:
-                continue
-            if msg.error():
-                # Broker-side notice (rebalance, EOF, etc). Nothing to audit.
-                log.error("consumer error: %s", msg.error())
+            if not messages:
+                # Linger expired with no traffic — the normal idle case, not
+                # an error. Nothing to process, nothing to commit.
                 continue
 
-            t0 = time.perf_counter()
-            outcome = process_message(msg, detector)
-            latency_ms = (time.perf_counter() - t0) * 1000
+            good_messages = []
+            for msg in messages:
+                if msg.error():
+                    # Broker-side notice (rebalance, EOF, etc), not a record.
+                    # It still carries a topic/partition/offset, so it must
+                    # never reach process_message, record_batch, or
+                    # highest_offsets — including it would advance the commit
+                    # position past a message that was never processed.
+                    log.error("consumer error: %s", msg.error())
+                    continue
+                good_messages.append(msg)
+
+            if not good_messages:
+                continue
+
+            processed_total += len(good_messages)
+
+            processed = []   # (msg, outcome, latency_ms)
+            for msg in good_messages:
+                t0 = time.perf_counter()
+                outcome = process_message(msg, detector)
+                latency_ms = (time.perf_counter() - t0) * 1000
+                processed.append((msg, outcome, latency_ms))
 
             # ---- infrastructure layer: exceptions below here kill the process ----
-            audit.record(
-                outcome.envelope,
-                msg.topic(),
-                outcome.findings,
-                outcome.action,
-                latency_ms,
-                failure=outcome.failure,
+            audit.record_batch(
+                [
+                    AuditRecord(
+                        outcome.envelope, msg.topic(), outcome.findings,
+                        outcome.action, latency_ms, outcome.failure,
+                    )
+                    for msg, outcome, latency_ms in processed
+                ]
             )
 
-            target = (
-                settings.topic_txn_quarantine
-                if outcome.action == "quarantined"
-                else settings.topic_txn_clean
-            )
-            tracker = DeliveryTracker()
-            headers = (
-                [("failure_class", outcome.failure[0].encode())] if outcome.failure else None
-            )
-            producer.produce(
-                target,
-                key=outcome.envelope.message_id.encode(),
-                value=outcome.out_bytes,
-                headers=headers,
-                on_delivery=tracker,
-            )
+            trackers = []   # (msg, target, outcome, latency_ms, tracker)
+            for msg, outcome, latency_ms in processed:
+                target = (
+                    settings.topic_txn_quarantine
+                    if outcome.action == "quarantined"
+                    else settings.topic_txn_clean
+                )
+                tracker = DeliveryTracker()
+                headers = (
+                    [("failure_class", outcome.failure[0].encode())] if outcome.failure else None
+                )
+                producer.produce(
+                    target,
+                    key=outcome.envelope.message_id.encode(),
+                    value=outcome.out_bytes,
+                    headers=headers,
+                    on_delivery=tracker,
+                )
+                trackers.append((msg, target, outcome, latency_ms, tracker))
 
             # Both checks are needed: `remaining` catches "still queued when the
             # timeout expired"; tracker.error catches "left the queue by failing".
-            # Neither implies the other, and either means the message is not durable.
+            # Neither implies the other, and either means a message is not durable.
+            # The check spans every tracker in the batch — one failed delivery
+            # among N must block the commit for all N, not just the last one.
             remaining = producer.flush(args.flush_timeout)
-            if remaining or tracker.error:
+            failed = [(msg, target, tracker) for msg, target, _, _, tracker in trackers if tracker.error]
+            if remaining or failed:
                 raise DeliveryFailed(
-                    f"{target} <- {msg.topic()}/{msg.partition()}@{msg.offset()}: "
-                    f"unflushed={remaining} error={tracker.error}"
+                    f"batch of {len(trackers)}: unflushed={remaining} "
+                    f"failed={[(m.topic(), m.partition(), m.offset(), t.error) for m, _, t in failed]}"
                 )
 
-            consumer.commit(msg)
-            stats.record(outcome.action, latency_ms, failed=outcome.failure is not None)
-            log.debug(
-                "%s %s/%s@%s -> %s (%d findings, %.2fms)",
-                outcome.action, msg.topic(), msg.partition(), msg.offset(),
-                target, len(outcome.findings), latency_ms,
-            )
+            try:
+                consumer.commit(offsets=highest_offsets(good_messages))
+            except KafkaException as exc:
+                if not is_rebalance_error(exc):
+                    raise
+                # The group moved on without us between processing this batch
+                # and committing it. The work itself is not lost or wrong: it
+                # was already audited and produced above, so the new owner of
+                # this partition will simply reprocess the same messages, and
+                # the audit upsert (keyed on message_id) makes that a no-op
+                # rather than a duplicate. Only the bookmark failed to move.
+                log.warning(
+                    "commit skipped, rebalance in progress (%s): batch of %d not committed, will be reprocessed",
+                    exc.args[0].name(), len(good_messages),
+                )
+
+            for msg, target, outcome, latency_ms, _ in trackers:
+                stats.record(outcome.action, latency_ms, failed=outcome.failure is not None)
+                log.debug(
+                    "%s %s/%s@%s -> %s (%d findings, %.2fms)",
+                    outcome.action, msg.topic(), msg.partition(), msg.offset(),
+                    target, len(outcome.findings), latency_ms,
+                )
+
+            # After the commit and the stats loop, deliberately — breaking
+            # earlier would leave this batch's offsets uncommitted despite it
+            # having already been audited and produced. Harmless given
+            # idempotency, but it would desync the benchmark's message count
+            # from what the audit table holds.
+            if args.exit_after and processed_total >= args.exit_after:
+                break
 
     except KeyboardInterrupt:
         log.info("interrupted, shutting down")

@@ -15,9 +15,9 @@ from __future__ import annotations
 
 import pytest
 
-from conftest import make_message
+from conftest import RecordingCursor, make_message
 from pipelineguard import processor as P
-from pipelineguard.audit import AuditWriter
+from pipelineguard.audit import AuditRecord, AuditWriter
 from pipelineguard.models import Envelope, Finding, Tier
 
 
@@ -131,3 +131,133 @@ def test_max_tier_is_zero_when_nothing_was_found(writer, recording_conn):
     writer.record(Envelope(payload={}), "txn.raw", [], "clean", 1.0)
     _, params = recording_conn.statements[0]
     assert params[3] == 0
+
+
+# --------------------------------------------------------------------------- #
+# Batch writes
+# --------------------------------------------------------------------------- #
+def make_records(n: int, findings: list[Finding] | None = None) -> list[AuditRecord]:
+    return [
+        AuditRecord(Envelope(payload={}), "txn.raw", findings or [], "redacted" if findings else "clean", 1.0)
+        for _ in range(n)
+    ]
+
+
+def test_record_batch_with_no_records_is_a_noop(writer, recording_conn):
+    writer.record_batch([])
+    assert recording_conn.statements == []
+    assert recording_conn.commits == 0
+
+
+def test_record_batch_writes_one_upsert_row_per_record(writer, recording_conn):
+    writer.record_batch(make_records(4))
+    assert len(recording_conn.statements_starting("INSERT INTO messages_processed")) == 4
+
+
+def test_record_batch_commits_exactly_once_regardless_of_batch_size(writer, recording_conn):
+    """The whole point of batching: N records must not mean N commits — that's
+    the round trip the feature exists to remove."""
+    writer.record_batch(make_records(5))
+    assert recording_conn.commits == 1
+
+
+def test_record_batch_uses_one_round_trip_per_statement_type(writer, recording_conn):
+    """A 5-record batch must not turn into 5x the SQL round trips: the message
+    upsert and findings insert go through executemany (one call, many rows),
+    and the findings delete collapses to a single statement over every
+    message_id in the batch. A loop that calls record() N times would pass
+    every other assertion here but show 10 executemany + 5 execute calls
+    instead of 2 and 1."""
+    findings = [Finding("CNIC", "cnic", 0, 5, Tier.RULES, 1.0)]
+    writer.record_batch(make_records(5, findings))
+    assert recording_conn.calls.count("executemany") == 2   # messages_processed, findings
+    assert recording_conn.calls.count("execute") == 1       # single DELETE over all ids
+
+
+def test_record_batch_deletes_findings_for_every_message_id_in_one_statement(writer, recording_conn):
+    records = make_records(3)
+    writer.record_batch(records)
+    deletes = recording_conn.statements_starting("DELETE FROM findings")
+    assert len(deletes) == 1
+    _, params = deletes[0]
+    assert set(params[0]) == {r.envelope.message_id for r in records}
+
+
+def test_record_batch_deletes_findings_before_inserting_new_ones(writer, recording_conn):
+    findings = [Finding("EMAIL", "email", 0, 5, Tier.RULES, 1.0)]
+    writer.record_batch(make_records(3, findings))
+
+    verbs = [s.strip().split()[0] + " " + s.strip().split()[2] for s, _ in recording_conn.statements]
+    assert verbs.index("DELETE findings") < verbs.index("INSERT findings")
+
+
+def test_record_batch_keeps_findings_attributed_to_the_right_message(writer, recording_conn):
+    """Findings from different records in the same batch must not cross-link
+    to the wrong message_id."""
+    rec_a = AuditRecord(
+        Envelope(payload={}), "txn.raw",
+        [Finding("CNIC", "cnic", 0, 5, Tier.RULES, 1.0)], "redacted", 1.0,
+    )
+    rec_b = AuditRecord(
+        Envelope(payload={}), "txn.raw",
+        [Finding("EMAIL", "email", 0, 5, Tier.RULES, 1.0)], "redacted", 1.0,
+    )
+    writer.record_batch([rec_a, rec_b])
+
+    inserts = recording_conn.statements_starting("INSERT INTO findings")
+    by_message_id = {params[0]: params[1] for _, params in inserts}
+    assert by_message_id[rec_a.envelope.message_id] == "CNIC"
+    assert by_message_id[rec_b.envelope.message_id] == "EMAIL"
+
+
+@pytest.mark.parametrize("order", ["clean_first", "dirty_first"])
+def test_record_batch_handles_a_mixed_batch_of_clean_and_findings_records(writer, recording_conn, order):
+    """Every other batch test uses a uniform batch (all-clean or all-findings),
+    which would hide a positional-zip bug where findings get attributed by
+    list index instead of by message_id. A mixed batch is the realistic
+    shape and the one that would actually catch it."""
+    clean = AuditRecord(Envelope(payload={}), "txn.raw", [], "clean", 1.0)
+    dirty = AuditRecord(
+        Envelope(payload={}), "txn.raw",
+        [Finding("CNIC", "cnic", 0, 5, Tier.RULES, 1.0)], "redacted", 1.0,
+    )
+    batch = [clean, dirty] if order == "clean_first" else [dirty, clean]
+    writer.record_batch(batch)
+
+    assert len(recording_conn.statements_starting("INSERT INTO messages_processed")) == 2
+    inserts = recording_conn.statements_starting("INSERT INTO findings")
+    assert len(inserts) == 1
+    _, params = inserts[0]
+    assert params[0] == dirty.envelope.message_id
+    assert params[1] == "CNIC"
+
+
+def test_record_batch_rolls_back_and_does_not_commit_on_a_mid_batch_failure(
+    writer, recording_conn, monkeypatch
+):
+    """conn.transaction() is what makes this structural: without it, a
+    mid-batch exception leaves the connection aborted with no commit ever
+    having happened, and — the danger — no rollback either, poisoning it for
+    every statement after."""
+
+    def boom(self, sql, params=None):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(RecordingCursor, "execute", boom)
+
+    with pytest.raises(RuntimeError):
+        writer.record_batch(make_records(3, [Finding("CNIC", "cnic", 0, 5, Tier.RULES, 1.0)]))
+
+    assert recording_conn.commits == 0
+    assert recording_conn.rollbacks == 1
+
+
+def test_record_batch_never_leaks_payload_values(writer, recording_conn, detector, pii_payload):
+    outcome = P.process_message(make_message(pii_payload), detector)
+    record = AuditRecord(outcome.envelope, "txn.raw", outcome.findings, outcome.action, 1.0)
+    writer.record_batch([record])
+
+    written = " ".join(str(p) for p in recording_conn.all_params_flat())
+    for value in pii_payload.values():
+        if isinstance(value, str):
+            assert value not in written, f"{value!r} leaked into the audit trail"
