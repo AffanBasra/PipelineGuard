@@ -31,8 +31,8 @@ a Postgres audit trail from which a governance report is generated.
 - [x] Processor: consume → detect → redact → route → audit
 - [x] Test suite (no broker or database required)
 - [x] Micro-batched processing + batch-size benchmark
+- [x] Governance report generator (Markdown, from the audit trail)
 - [ ] Dockerfile + processor service, so `docker compose up` runs the pipeline
-- [ ] Governance report generator
 - [ ] Tier 2: encoder NER — off-the-shelf first, locale fine-tune after
 - [ ] End-to-end latency measurement (current figures are detection-only)
 - [ ] Tier 3: pluggable LLM escalation (Gemini, Ollama)
@@ -61,6 +61,32 @@ SELECT failure_class, count(*) FROM messages_processed
 
 > Postgres is published on host port **5433** (5432 is commonly taken by a
 > native install). The container still listens on 5432 internally.
+
+### Governance report
+
+```bash
+python -m pipelineguard.report                              # Markdown to stdout
+python -m pipelineguard.report --since 2026-07-01 --output report.md
+```
+
+Written for a compliance reviewer: what personal data flowed through, over
+what period, what was done about it, and what needs a human. It reads the
+audit trail and nothing else — no Kafka, no message payloads — so it cannot
+disclose a value the audit trail declined to store. A generated example is
+committed at [docs/sample-report.md](docs/sample-report.md).
+
+Its two quarantine queues are deliberately separate: **failed closed** are
+deterministic defects that will fail identically on replay and need an
+engineering fix, while **uncertain** records are judgements the pipeline
+declined to make and need a person. Section 9 states what the report *cannot*
+show — chiefly that it describes what entered the pipeline, not what existed,
+which is a question about consumer lag that no audit table can answer.
+
+| flag | default | purpose |
+|---|---|---|
+| `--since` / `--until` | unbounded | ISO-8601 window on `processed_ts`, half-open `[since, until)` so adjacent reports partition exactly |
+| `--max-queue` | 50 | max review items listed per queue; totals are counted independently, so truncation is always disclosed |
+| `--output` | stdout | write to a file instead |
 
 ### Processor flags
 
@@ -158,7 +184,8 @@ pending measurement and open questions not yet decided — see
 
 ```bash
 pip install -e ".[dev]"
-pytest                      # ~1s, no Kafka or Postgres needed
+pytest                      # no Kafka or Postgres needed
+pytest -m integration       # the report's SQL, against a real Postgres
 pytest --cov=pipelineguard  # coverage report
 ```
 
@@ -176,6 +203,20 @@ filtering, commit ordering, rebalance tolerance); it is not a substitute for
 integration testing against a live stack, which this suite doesn't attempt.
 `producer.py`'s loop is untested for the same broker-bound reason — that gap
 is real and not yet filled.
+
+**The governance report is the one place that reasoning doesn't hold.** Its
+logic *is* its SQL — the `GROUP BY`s, the window boundaries, the join that
+distinguishes a quarantined record with no findings from one with several.
+Handing canned rows to a fake connection would have tested the renderer
+formatting its own fixtures while every query stayed unexercised and the suite
+went green. So the report is split: rendering and classification are pure
+functions tested offline, and the queries are tested against a real Postgres
+in `tests/integration/`, skipped automatically when no database is reachable.
+Each of those tests targets a specific way a query could be wrong and still
+look right, and all six mutations tried against them — inclusive upper bound,
+inner join for the uncertain queue, `avg` for `min` confidence, non-`DISTINCT`
+record counts, a queue total collapsed to its capped listing, and silently
+dropped unclassified entity types — were caught by exactly the intended test.
 
 ## Observability
 
@@ -287,5 +328,8 @@ src/pipelineguard/
   detectors/tier1_rules.py       Tier 1 rules engine
   processor.py                   the stream processor (consume→detect→route→audit)
   audit.py                       idempotent Postgres audit writer
+  compliance.py                  entity type → regulatory classification
+  report.py                      governance report (SQL over the audit trail → Markdown)
   observability.py               console logging + rolling throughput/latency stats
+docs/sample-report.md            a generated report, committed as an example
 ```
