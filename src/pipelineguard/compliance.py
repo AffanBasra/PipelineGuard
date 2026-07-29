@@ -1,4 +1,4 @@
-"""Regulatory classification of the entity types the pipeline detects.
+1"""Regulatory classification of the entity types the pipeline detects.
 
 What this module is: a mapping from PipelineGuard's entity types to the data
 category each one falls into, plus the regime that makes it matter. It exists
