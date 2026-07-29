@@ -1,0 +1,35 @@
+# Everything here is either large, host-specific, or actively wrong inside a
+# container. The build context is sent to the daemon in full on every build,
+# so exclusions are a rebuild-speed concern, not just tidiness.
+
+# 150 MB parquet. Excluding this alone is most of the build-context savings.
+data/
+
+# Host virtualenvs: large, and Linux wheels are not what Windows venvs hold.
+.venv/
+venv/
+
+# The container gets its configuration from compose `environment:` entries.
+# config.py calls load_dotenv(), which does NOT override variables already
+# set in the environment -- but that only helps if this file never reaches
+# the image. The host .env points at localhost:9092 and localhost:5433, both
+# unreachable from inside a container, and baking it in would produce a
+# confusing connection failure instead of a clear one.
+.env
+
+# Build, test and tooling output
+.git/
+.github/
+.idea/
+.pytest_cache/
+.coverage
+htmlcov/
+graphify-out/
+build/
+dist/
+*.egg-info/
+**/__pycache__/
+*.py[cod]
+
+# Local-only instructions, deliberately gitignored
+CLAUDE.md

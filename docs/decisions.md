@@ -480,6 +480,65 @@ silently to the wrong database rather than failing loudly.
 **Topics created explicitly; broker auto-create disabled.** *(settled)*
 Three partitions each, so consumer-group scaling can actually be demonstrated.
 
+**One image, four entry points.** *(settled)*
+Processor (default `CMD`), topic creation, producer and governance report all
+share every dependency, so four images would be four copies of the same
+layers. `python:3.12-slim` rather than the host's 3.14, because
+`confluent-kafka` and `psycopg[binary]` both publish manylinux wheels there —
+which is what keeps a compiler and a separate librdkafka build out of the
+image. The container has no reason to match the host interpreter.
+
+**Topic creation is a one-shot container the processor waits on.** *(settled)*
+`topics-init` runs `scripts/create_topics.py` and exits; the processor
+declares `condition: service_completed_successfully` against it. With broker
+auto-create disabled, a processor that started first would subscribe to
+nothing. This converts "the topics have probably been created by now" into an
+ordering guarantee.
+
+**The producer and report are profiled services, not started by `up`.**
+*(settled)*
+Both sit behind the `tools` profile, so `docker compose up` brings up a
+running pipeline idling on an empty topic rather than one that manufactures
+its own traffic. `docker compose run` activates a service's profile
+automatically, so they remain one command away. They use `entrypoint` rather
+than `command` so arguments append:
+`docker compose run --rm producer --rate 50 --count 1000`.
+
+A pipeline that always generates data cannot be brought up for a benchmark, and
+cannot demonstrate the empty-state governance report.
+
+**No `container_name` on the processor.** *(settled)*
+Compose refuses to scale a service that has one, and
+`docker compose up --scale processor=3` is the entire consumer-group
+demonstration. Verified: three consumers, one partition each, zero lag.
+
+**`restart: unless-stopped` on the processor.** *(settled)*
+This is what makes the crash-and-replay half of the failure taxonomy (§5) a
+property of the deployment rather than an assertion in a README. Verified by
+stopping Postgres under load: the processor crashed on the audit write and
+cycled through 5 restarts, then drained the backlog when Postgres returned —
+2,500 audit rows for 2,500 produced messages, no loss and no duplication.
+
+Worth knowing: `docker kill` does *not* trigger it, because Docker treats an
+explicit kill as a manual stop. The policy governs process exit, which is the
+case the design is about.
+
+**The Kafka log gets a named volume.** *(settled)*
+Previously absent, so `docker compose down` discarded every message and every
+committed offset. Convenient while benchmarking and incoherent for a pipeline
+whose at-least-once argument rests on that log surviving a restart. Verified
+across `down`/`up`: 2,000 messages and their committed offsets both survived,
+and the processor resumed without reprocessing.
+
+**`.dockerignore` is load-bearing, not hygiene.** *(settled)*
+`data/nemotron-pii/` holds a 150 MB parquet, and two virtualenvs sit in the
+repo root; the build context is sent to the daemon in full on every build.
+Excluding `.env` is the more important half: `config.py` calls
+`load_dotenv()`, and the host `.env` points at `localhost:9092` and
+`localhost:5433`, both unreachable from a container. Compose `environment:`
+entries win because `load_dotenv()` does not override variables already set —
+but only while the file never reaches the image.
+
 **Private until MVP; MVP is defined as four things.** *(settled)*
 Runs at volume under `docker compose up`, a benchmark from a real high-volume
 run, a governance report, and Tier 2 via an off-the-shelf pretrained encoder
@@ -648,8 +707,10 @@ reasoning is available if the scope is ever revisited.
 
 - **Benchmark methodology** — hardware disclosure, message-size distribution,
   and how to measure Tier 3 fairly given it is API-bound.
-- **`docker compose up` does not run the pipeline.** It starts infrastructure;
-  the processor still runs on the host. No Dockerfile for the processor.
+- ~~**`docker compose up` does not run the pipeline.**~~ **Closed** — Dockerfile
+  plus `topics-init`, `processor`, and profiled `producer`/`report` services.
+  `docker compose up` now brings up a running pipeline; `--scale processor=3`
+  gives the consumer-group demo in one command.
 - **Integration tests** against a live stack: not attempted.
 - **Tier 2** — base model, name-substitution training data, disjoint train/eval
   name split, where weights live.

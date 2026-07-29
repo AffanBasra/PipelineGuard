@@ -32,7 +32,7 @@ a Postgres audit trail from which a governance report is generated.
 - [x] Test suite (no broker or database required)
 - [x] Micro-batched processing + batch-size benchmark
 - [x] Governance report generator (Markdown, from the audit trail)
-- [ ] Dockerfile + processor service, so `docker compose up` runs the pipeline
+- [x] Dockerfile + processor service, so `docker compose up` runs the pipeline
 - [ ] Tier 2: encoder NER — off-the-shelf first, locale fine-tune after
 - [ ] End-to-end latency measurement (current figures are detection-only)
 - [ ] Tier 3: pluggable LLM escalation (Gemini, Ollama)
@@ -42,12 +42,64 @@ a Postgres audit trail from which a governance report is generated.
 ## Quick start
 
 ```bash
-docker compose up -d
+docker compose up -d                                       # broker, database, topics, firewall
+docker compose run --rm producer --rate 50 --count 1000    # feed txn.raw
+docker compose logs -f processor                           # watch it work
+```
+
+That is the whole thing — no local Python needed. `up` brings the stack to a
+running pipeline idling on an empty topic: Kafka and Postgres come up, a
+one-shot `topics-init` container creates the topics (broker auto-create is
+disabled), and the processor starts only once that container has *exited
+successfully*, so "the topics probably exist by now" is an ordering guarantee
+rather than a hope.
+
+```bash
+docker compose run --rm report                             # governance report to stdout
+docker compose up -d --scale processor=3                   # three consumers, one per partition
+```
+
+### Demonstrating crash-and-replay
+
+The [failure taxonomy](#design-decisions) below claims that an infrastructure
+failure crashes the process and replays on restart. `restart: unless-stopped`
+on the processor is what makes that real rather than asserted, and it can be
+watched:
+
+```bash
+docker compose stop postgres                               # infrastructure fails
+docker compose run --rm producer --rate 0 --count 500      # keep feeding it anyway
+docker compose logs processor | grep OperationalError      # crashing, not swallowing
+docker compose start postgres                              # infrastructure returns
+```
+
+The processor dies on the audit write, restarts, dies again, and keeps cycling
+until Postgres answers — then drains the backlog. Measured over exactly that
+sequence: 5 restarts while down, and afterwards **2,500 audit rows for 2,500
+produced messages — no loss and no duplication**, with consumer lag back to
+zero. Uncommitted offsets are what prevent the loss; the idempotent audit
+upsert is what prevents the duplication.
+
+Note that `docker kill` on the container will *not* trigger a restart — Docker
+treats an explicit kill as a manual stop. The behaviour above is about the
+process exiting, which is the case the design is actually about.
+
+<details>
+<summary>Running on the host instead</summary>
+
+```bash
+docker compose up -d kafka postgres
 pip install -e .                                           # src layout: editable install puts pipelineguard on the path
 python scripts/create_topics.py
-python -m pipelineguard.producer --rate 50 --count 1000    # feed txn.raw
-python -m pipelineguard.processor                          # run the firewall
+python -m pipelineguard.producer --rate 50 --count 1000
+python -m pipelineguard.processor
 ```
+
+The host defaults in `config.py` point at `localhost:9092` and `localhost:5433`;
+the compose services override them to `kafka:19092` and `postgres:5432`. `.env`
+is excluded from the image so it cannot reinstate host values inside a
+container.
+</details>
 
 Inspect results:
 
@@ -317,6 +369,8 @@ and exactly 40,000 IBAN detections — precisely two per message.
 ## Project layout
 
 ```
+Dockerfile                       one image, four entry points (processor, topics, producer, report)
+docker-compose.yml               broker, database, topic init, processor, on-demand tools
 db/init.sql                      audit schema (idempotent upserts by message_id)
 scripts/create_topics.py         explicit topic creation (auto-create disabled)
 src/pipelineguard/

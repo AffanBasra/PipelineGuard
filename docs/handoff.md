@@ -325,15 +325,13 @@ account for part of the result.
 benchmark, a governance report, and basic Tier 2 encoder support; then the
 repo goes public):
 
-1. **Dockerfile + processor service in compose.** Currently `docker compose up`
-   starts infrastructure only; the processor runs on the host. The documented
-   quick start is the first thing a reviewer tries. Scoped but not built — the
-   main gotcha is that the containerised processor must use `kafka:19092` and
-   `postgres:5432` (internal listeners), not the host-facing `localhost:9092`
-   and `5433`. A topic-creation init container should gate the processor via
-   `service_completed_successfully`, and `restart: unless-stopped` is what
-   makes crash-and-replay real. `docker compose up --scale processor=3` then
-   gives the multi-consumer demo in one command.
+1. ~~**Dockerfile + processor service in compose.**~~ **Built.** One image with
+   four entry points; `topics-init` gates the processor via
+   `service_completed_successfully`; producer and report sit behind a `tools`
+   profile. Verified end to end in containers: 3-way consumer scaling with one
+   partition each and zero lag, log and offsets surviving `down`/`up`, and
+   crash-and-replay through 5 restarts with Postgres down, recovering to 2,500
+   audit rows for 2,500 messages.
 2. ~~**Governance report.**~~ **Built** — `report.py` + `compliance.py`, 50
    new tests, sample at `docs/sample-report.md`. Citations name instruments
    and their effect rather than section numbers, and were cross-checked
@@ -375,9 +373,8 @@ conditional Go rewrite of one consumer.
   is now tested against a real Postgres. Kafka remains untested against a live
   broker — `processor.main()` is covered by fakes, which proves wiring but not
   broker behaviour.
-- Kafka has no named volume, so its log does not survive `docker compose down`.
-  Convenient during benchmarking, incoherent for a system whose durability
-  argument rests on that log.
+- ~~Kafka has no named volume~~ — **closed.** `kafkadata` added; verified that
+  2,000 messages and their committed offsets survive `docker compose down`.
 - Topic retention is unconfigured; quarantine plausibly warrants longer
   retention than clean, for compliance.
 - Quarantine is terminal — no reviewer workflow, and no distinction between a
