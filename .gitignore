@@ -15,3 +15,5 @@ CLAUDE.md
 htmlcov/
 build/
 dist/
+
+data/nemotron-pii/
