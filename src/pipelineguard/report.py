@@ -453,7 +453,13 @@ def render(data: ReportData) -> str:
                 f"- *GDPR:* {cls.gdpr_basis}",
                 "",
             ]
-        lines += [f"> {compliance.CROSS_BORDER_NOTE}", ""]
+        lines += [
+            f"> {compliance.CROSS_BORDER_NOTE}",
+            "",
+            "The Pakistani and GDPR bases above differ in character, not "
+            "merely in detail -- see section 8.",
+            "",
+        ]
 
         missing = compliance.unclassified([e.entity_type for e in data.entities])
         if missing:
@@ -530,9 +536,28 @@ def render(data: ReportData) -> str:
     else:
         lines += ["No processing failures were recorded in this period."]
 
-    lines += ["", "## 8. System properties", ""]
-    for title, body in compliance.SYSTEM_PROPERTIES:
-        lines += [f"**{title}**  ", body, ""]
+    lines += [
+        "",
+        "## 8. System properties",
+        "",
+        "What the pipeline does, and why each regime cares. The behaviour is "
+        "a statement of fact about this system; the two bases explain "
+        "significance and are not assertions that an obligation has been "
+        "discharged.",
+        "",
+        f"> {compliance.LEGAL_LANDSCAPE_NOTE}",
+        "",
+    ]
+    for prop in compliance.SYSTEM_PROPERTIES:
+        lines += [
+            f"### {prop.title}",
+            "",
+            prop.behaviour,
+            "",
+            f"- *Pakistan:* {prop.pk_basis}",
+            f"- *GDPR:* {prop.gdpr_basis}",
+            "",
+        ]
 
     lines += [
         "## 9. Limitations",

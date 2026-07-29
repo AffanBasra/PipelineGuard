@@ -1,7 +1,7 @@
 # Data Governance Report
 
 **Period covered:** all recorded activity (no window specified)  
-**Generated:** 2026-07-29 12:47:31Z  
+**Generated:** 2026-07-29 13:09:18Z  
 **Source:** PipelineGuard audit trail (`messages_processed`, `findings`)
 
 > This report describes what the pipeline observed and what it did. It is not a compliance determination and not legal advice. Regulatory references indicate why a category of data is significant, not that any obligation has been discharged.
@@ -59,25 +59,27 @@ Counts are of *detections*, not of distinct individuals -- the same person appea
 
 **IBAN_PK** -- Financial account identifier
 
-- *Pakistan:* Customer account information, subject to the banking confidentiality expectations that apply to institutions regulated by the State Bank of Pakistan.
+- *Pakistan:* Customer account information. Institutions regulated by the State Bank of Pakistan are subject to banking secrecy expectations and to SBP's technology governance and risk management framework for financial institutions, which requires auditable controls over customer data. This is the entity type where the Pakistani obligation is most concrete, because it is sectoral regulation rather than general law.
 - *GDPR:* Personal data under Art. 4(1) where it identifies a natural person; account identifiers are the clearest cross-border case, since an IBAN exists to be used internationally.
 
 **PHONE_PK** -- Contact identifier
 
-- *Pakistan:* Subscriber contact data. Pakistani mobile numbers are biometrically registered to a CNIC, so a number is more closely bound to a verified identity than in most jurisdictions.
+- *Pakistan:* More tightly bound to a verified identity than in most jurisdictions: SIM issuance is subject to biometric verification against NADRA records under the Pakistan Telecommunication Authority's registration regime, so a mobile number resolves to an identified person. PECA 2016 separately criminalises unauthorised SIM issuance. Treating a Pakistani mobile number as low-sensitivity contact data would therefore understate it.
 - *GDPR:* An identifier under Art. 4(1).
 
 **EMAIL** -- Contact identifier
 
-- *Pakistan:* Subscriber contact data.
+- *Pakistan:* No Pakistan-specific instrument attaches to an email address as such. It is personal data under the draft Personal Data Protection Bill's definition, and is protected today only by the general unauthorised-access and unauthorised-copying offences in PECA 2016 -- which bite on how the data is obtained, not on how a controller handles it.
 - *GDPR:* An identifier under Art. 4(1).
 
 **CNIC** -- National identity number
 
-- *Pakistan:* NADRA-issued national identifier. Unauthorised access to or disclosure of identity data held in an information system engages the offences created by PECA 2016.
+- *Pakistan:* Issued by NADRA under the National Database and Registration Authority Ordinance 2000, which governs the identity database and restricts use of the records it holds. PECA 2016 separately criminalises unauthorised use of identity information. The CNIC is the join key across Pakistani financial, telecom and government systems, so its exposure is the highest-consequence single event in this pipeline.
 - *GDPR:* An identifier under Art. 4(1); a national identification number is expressly contemplated as identifying data.
 
 > GDPR is relevant only where the data subject is in the EU -- for this pipeline, principally inbound remittances and EU-resident account holders. It does not attach to purely domestic transactions.
+
+The Pakistani and GDPR bases above differ in character, not merely in detail -- see section 8.
 
 
 ## 5. Where it was found
@@ -123,17 +125,37 @@ No processing failures were recorded in this period.
 
 ## 8. System properties
 
-**Records of processing (GDPR Art. 30)**  
-The audit trail records, per message, which categories of personal data were detected, in which field, at what time, and what was done about it. That is the substance of a record of processing activities, produced automatically rather than maintained by hand.
+What the pipeline does, and why each regime cares. The behaviour is a statement of fact about this system; the two bases explain significance and are not assertions that an obligation has been discharged.
 
-**Pseudonymisation (GDPR Art. 32(1)(a))**  
-Detected values are redacted in-stream before the record is forwarded, so downstream consumers receive data from which the identifiers have been removed.
+> Pakistan has no enacted general data protection statute. PECA 2016 creates criminal offences for unauthorised access to an information system and for misuse of identity information, but imposes no record-of-processing or data-subject-rights obligations on a controller. The Personal Data Protection Bill, which would supply that framework, remains a draft and is not in force. The Pakistani basis cited below is therefore a combination of the offences PECA does create, the sectoral expectations the State Bank of Pakistan places on regulated financial institutions, and the direction of the draft Bill -- not a single controlling statute. GDPR is cited where cross-border processing brings it into scope, and its articles are numbered because they exist.
 
-**Data minimisation (GDPR Art. 5(1)(c))**  
-The audit trail stores entity type, field, character span, tier and confidence. It never stores the matched value. The governance record is therefore not itself a store of personal data.
+### Automatic record of processing
 
-**Erasure (GDPR Art. 17)**  
+The audit trail records, per message, which categories of personal data were detected, in which field, at what time, and what was done about it -- produced automatically as a consequence of processing rather than maintained by hand.
+
+- *Pakistan:* No enacted Pakistani statute requires this today. PECA 2016 creates offences and imposes no record-keeping duty; the draft Personal Data Protection Bill moves in this direction. For a bank, SBP's technology governance expectations require auditable control over customer data, which this satisfies in substance.
+- *GDPR:* Art. 30 -- records of processing activities. This is the strongest alignment the project has, and it is structural rather than a claim: the record is a by-product of the pipeline running.
+
+### Redaction in stream
+
+Detected values are masked in place before the record is forwarded, so downstream consumers receive data from which the identifiers have been removed.
+
+- *Pakistan:* Directly reduces the surface for the PECA 2016 offences: a downstream system that never receives a CNIC cannot become the point at which identity information is unlawfully accessed or copied. For SBP-regulated institutions it also narrows who holds customer account data.
+- *GDPR:* Art. 32(1)(a) -- pseudonymisation as a security measure.
+
+### The audit trail stores no values
+
+It stores entity type, field, character span, tier and confidence -- never the matched text. The governance record is therefore not itself a store of personal data.
+
+- *Pakistan:* Keeps the compliance artifact from enlarging the institution's own exposure. A governance log that accumulated CNICs would become precisely the concentrated identity store that PECA 2016 exists to protect, defeating its purpose.
+- *GDPR:* Art. 5(1)(c) -- data minimisation.
+
+### Nothing to erase
+
 Because no values are retained, there is nothing in the audit trail to erase in response to a request. This is a property of the design, not an outstanding gap.
+
+- *Pakistan:* Anticipates the data-subject rights the draft Personal Data Protection Bill would introduce. No such enforceable right exists under current Pakistani law, so this is forward positioning rather than a discharged obligation.
+- *GDPR:* Art. 17 -- right to erasure.
 
 ## 9. Limitations
 

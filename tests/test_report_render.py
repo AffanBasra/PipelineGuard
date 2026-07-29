@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from pipelineguard import report
+from pipelineguard import compliance, report
 from pipelineguard.report import EntityRow, ReportData, ReviewItem
 
 T0 = datetime(2026, 7, 1, 9, 0, tzinfo=timezone.utc)
@@ -76,6 +76,19 @@ def test_classified_entities_carry_their_category_and_basis() -> None:
     assert "Financial account identifier" in out
     assert "PECA 2016" in out
     assert "State Bank of Pakistan" in out
+
+
+def test_system_properties_render_both_regimes() -> None:
+    """Section 8 must not read as a GDPR checklist with Pakistani decoration."""
+    out = report.render(make_data())
+    section = out.split("## 8. System properties")[1].split("## 9.")[0]
+    assert section.count("*Pakistan:*") == len(compliance.SYSTEM_PROPERTIES)
+    assert section.count("*GDPR:*") == len(compliance.SYSTEM_PROPERTIES)
+
+
+def test_report_states_why_the_two_regimes_differ() -> None:
+    out = report.render(make_data())
+    assert "no enacted general data protection statute" in out
 
 
 def test_unclassified_entity_types_are_surfaced_not_dropped() -> None:

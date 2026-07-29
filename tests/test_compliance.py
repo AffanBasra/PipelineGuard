@@ -20,6 +20,55 @@ def test_classify_returns_none_for_unknown() -> None:
     assert compliance.classify("NOT_A_REAL_TYPE") is None
 
 
+# Named Pakistani instruments. A pk_basis that references none of these is
+# not a Pakistani basis, whatever it says.
+PK_INSTRUMENTS = (
+    "PECA 2016",
+    "NADRA",
+    "National Database and Registration Authority",
+    "State Bank of Pakistan",
+    "SBP",
+    "Pakistan Telecommunication Authority",
+    "Personal Data Protection Bill",
+)
+
+
+def test_every_classification_names_a_pakistani_instrument() -> None:
+    """The regression guard for how this module first shipped.
+
+    Every entry cited GDPR articles; only two named any Pakistani instrument,
+    and two `pk_basis` fields were bare descriptions with no legal grounding
+    at all -- inverting the scope decision in docs/decisions.md section 1,
+    which puts Pakistani law first. Nothing failed, because nothing checked.
+    """
+    for entity_type, cls in compliance.CLASSIFICATIONS.items():
+        assert any(i in cls.pk_basis for i in PK_INSTRUMENTS), (
+            f"{entity_type}.pk_basis names no Pakistani instrument: {cls.pk_basis!r}"
+        )
+
+
+def test_every_system_property_cites_both_regimes() -> None:
+    """Section 8 was originally four GDPR articles and nothing else -- the
+    most substantive part of the compliance framing, with no Pakistani limb."""
+    assert compliance.SYSTEM_PROPERTIES
+    for prop in compliance.SYSTEM_PROPERTIES:
+        assert prop.title.strip(), prop
+        assert prop.behaviour.strip(), prop.title
+        assert prop.gdpr_basis.strip(), prop.title
+        assert any(i in prop.pk_basis for i in PK_INSTRUMENTS), (
+            f"{prop.title!r} has no Pakistani basis: {prop.pk_basis!r}"
+        )
+
+
+def test_landscape_note_states_why_the_regimes_differ() -> None:
+    """Honesty about the asymmetry is the alternative to padding it. If this
+    text is ever softened into implying Pakistan has an enacted general data
+    protection law, the report starts overclaiming."""
+    note = compliance.LEGAL_LANDSCAPE_NOTE
+    assert "no enacted general data protection statute" in note
+    assert "remains a draft" in note
+
+
 def test_classify_returns_the_mapping() -> None:
     cnic = compliance.classify("CNIC")
     assert cnic is not None

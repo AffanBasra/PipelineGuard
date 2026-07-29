@@ -1,4 +1,4 @@
-1"""Regulatory classification of the entity types the pipeline detects.
+"""Regulatory classification of the entity types the pipeline detects.
 
 What this module is: a mapping from PipelineGuard's entity types to the data
 category each one falls into, plus the regime that makes it matter. It exists
@@ -36,6 +36,25 @@ CROSS_BORDER_NOTE = (
     "holders. It does not attach to purely domestic transactions."
 )
 
+# The two regimes below differ in character, not merely in detail, and a
+# reader comparing them will notice that the Pakistani column cites no
+# equivalent of Art. 30. Stating why is more credible than padding it to
+# match: the asymmetry is a fact about the legal landscape, and a Pakistani
+# governance audience will recognise it immediately.
+LEGAL_LANDSCAPE_NOTE = (
+    "Pakistan has no enacted general data protection statute. PECA 2016 "
+    "creates criminal offences for unauthorised access to an information "
+    "system and for misuse of identity information, but imposes no "
+    "record-of-processing or data-subject-rights obligations on a controller. "
+    "The Personal Data Protection Bill, which would supply that framework, "
+    "remains a draft and is not in force. The Pakistani basis cited below is "
+    "therefore a combination of the offences PECA does create, the sectoral "
+    "expectations the State Bank of Pakistan places on regulated financial "
+    "institutions, and the direction of the draft Bill -- not a single "
+    "controlling statute. GDPR is cited where cross-border processing brings "
+    "it into scope, and its articles are numbered because they exist."
+)
+
 DISCLAIMER = (
     "This report describes what the pipeline observed and what it did. It is "
     "not a compliance determination and not legal advice. Regulatory "
@@ -61,9 +80,13 @@ CLASSIFICATIONS: dict[str, Classification] = {
     "CNIC": Classification(
         data_category="National identity number",
         pk_basis=(
-            "NADRA-issued national identifier. Unauthorised access to or "
-            "disclosure of identity data held in an information system "
-            "engages the offences created by PECA 2016."
+            "Issued by NADRA under the National Database and Registration "
+            "Authority Ordinance 2000, which governs the identity database "
+            "and restricts use of the records it holds. PECA 2016 separately "
+            "criminalises unauthorised use of identity information. The CNIC "
+            "is the join key across Pakistani financial, telecom and "
+            "government systems, so its exposure is the highest-consequence "
+            "single event in this pipeline."
         ),
         gdpr_basis=(
             "An identifier under Art. 4(1); a national identification number "
@@ -73,9 +96,13 @@ CLASSIFICATIONS: dict[str, Classification] = {
     "IBAN_PK": Classification(
         data_category="Financial account identifier",
         pk_basis=(
-            "Customer account information, subject to the banking "
-            "confidentiality expectations that apply to institutions "
-            "regulated by the State Bank of Pakistan."
+            "Customer account information. Institutions regulated by the "
+            "State Bank of Pakistan are subject to banking secrecy "
+            "expectations and to SBP's technology governance and risk "
+            "management framework for financial institutions, which requires "
+            "auditable controls over customer data. This is the entity type "
+            "where the Pakistani obligation is most concrete, because it is "
+            "sectoral regulation rather than general law."
         ),
         gdpr_basis=(
             "Personal data under Art. 4(1) where it identifies a natural "
@@ -86,48 +113,119 @@ CLASSIFICATIONS: dict[str, Classification] = {
     "PHONE_PK": Classification(
         data_category="Contact identifier",
         pk_basis=(
-            "Subscriber contact data. Pakistani mobile numbers are "
-            "biometrically registered to a CNIC, so a number is more closely "
-            "bound to a verified identity than in most jurisdictions."
+            "More tightly bound to a verified identity than in most "
+            "jurisdictions: SIM issuance is subject to biometric verification "
+            "against NADRA records under the Pakistan Telecommunication "
+            "Authority's registration regime, so a mobile number resolves to "
+            "an identified person. PECA 2016 separately criminalises "
+            "unauthorised SIM issuance. Treating a Pakistani mobile number as "
+            "low-sensitivity contact data would therefore understate it."
         ),
         gdpr_basis="An identifier under Art. 4(1).",
     ),
     "EMAIL": Classification(
         data_category="Contact identifier",
-        pk_basis="Subscriber contact data.",
+        # Deliberately the weakest entry here, and said plainly rather than
+        # padded to match the others. Inventing a Pakistan-specific basis for
+        # an email address would be exactly the overclaiming this module's
+        # docstring warns against.
+        pk_basis=(
+            "No Pakistan-specific instrument attaches to an email address as "
+            "such. It is personal data under the draft Personal Data "
+            "Protection Bill's definition, and is protected today only by the "
+            "general unauthorised-access and unauthorised-copying offences in "
+            "PECA 2016 -- which bite on how the data is obtained, not on how "
+            "a controller handles it."
+        ),
         gdpr_basis="An identifier under Art. 4(1).",
     ),
 }
 
-# Article 30 (records of processing activities) is the strongest alignment this
-# project has, and it is structural rather than a claim: the audit trail
-# records categories of personal data and what was done with them, which is
-# most of what Art. 30(1) asks a controller to maintain.
-SYSTEM_PROPERTIES: list[tuple[str, str]] = [
-    (
-        "Records of processing (GDPR Art. 30)",
-        "The audit trail records, per message, which categories of personal "
-        "data were detected, in which field, at what time, and what was done "
-        "about it. That is the substance of a record of processing "
-        "activities, produced automatically rather than maintained by hand.",
+@dataclass(frozen=True)
+class SystemProperty:
+    """A thing the pipeline does, and why each regime cares.
+
+    `behaviour` is regime-neutral and is the only part asserting fact about
+    this system; the two bases explain significance. Splitting them this way
+    is what stops the section from reading as a GDPR compliance checklist
+    with Pakistani decoration, which is what it was before -- all four
+    entries cited GDPR articles and no Pakistani instrument at all, inverting
+    the scope decision in docs/decisions.md section 1.
+    """
+
+    title: str
+    behaviour: str
+    pk_basis: str
+    gdpr_basis: str
+
+
+SYSTEM_PROPERTIES: list[SystemProperty] = [
+    SystemProperty(
+        title="Automatic record of processing",
+        behaviour=(
+            "The audit trail records, per message, which categories of "
+            "personal data were detected, in which field, at what time, and "
+            "what was done about it -- produced automatically as a "
+            "consequence of processing rather than maintained by hand."
+        ),
+        pk_basis=(
+            "No enacted Pakistani statute requires this today. PECA 2016 "
+            "creates offences and imposes no record-keeping duty; the draft "
+            "Personal Data Protection Bill moves in this direction. For a "
+            "bank, SBP's technology governance expectations require auditable "
+            "control over customer data, which this satisfies in substance."
+        ),
+        gdpr_basis=(
+            "Art. 30 -- records of processing activities. This is the "
+            "strongest alignment the project has, and it is structural rather "
+            "than a claim: the record is a by-product of the pipeline running."
+        ),
     ),
-    (
-        "Pseudonymisation (GDPR Art. 32(1)(a))",
-        "Detected values are redacted in-stream before the record is "
-        "forwarded, so downstream consumers receive data from which the "
-        "identifiers have been removed.",
+    SystemProperty(
+        title="Redaction in stream",
+        behaviour=(
+            "Detected values are masked in place before the record is "
+            "forwarded, so downstream consumers receive data from which the "
+            "identifiers have been removed."
+        ),
+        pk_basis=(
+            "Directly reduces the surface for the PECA 2016 offences: a "
+            "downstream system that never receives a CNIC cannot become the "
+            "point at which identity information is unlawfully accessed or "
+            "copied. For SBP-regulated institutions it also narrows who "
+            "holds customer account data."
+        ),
+        gdpr_basis="Art. 32(1)(a) -- pseudonymisation as a security measure.",
     ),
-    (
-        "Data minimisation (GDPR Art. 5(1)(c))",
-        "The audit trail stores entity type, field, character span, tier and "
-        "confidence. It never stores the matched value. The governance "
-        "record is therefore not itself a store of personal data.",
+    SystemProperty(
+        title="The audit trail stores no values",
+        behaviour=(
+            "It stores entity type, field, character span, tier and "
+            "confidence -- never the matched text. The governance record is "
+            "therefore not itself a store of personal data."
+        ),
+        pk_basis=(
+            "Keeps the compliance artifact from enlarging the institution's "
+            "own exposure. A governance log that accumulated CNICs would "
+            "become precisely the concentrated identity store that PECA 2016 "
+            "exists to protect, defeating its purpose."
+        ),
+        gdpr_basis="Art. 5(1)(c) -- data minimisation.",
     ),
-    (
-        "Erasure (GDPR Art. 17)",
-        "Because no values are retained, there is nothing in the audit trail "
-        "to erase in response to a request. This is a property of the "
-        "design, not an outstanding gap.",
+    SystemProperty(
+        title="Nothing to erase",
+        behaviour=(
+            "Because no values are retained, there is nothing in the audit "
+            "trail to erase in response to a request. This is a property of "
+            "the design, not an outstanding gap."
+        ),
+        pk_basis=(
+            "Anticipates the data-subject rights the draft Personal Data "
+            "Protection Bill would introduce. No such enforceable right "
+            "exists under current Pakistani law, so this is forward "
+            "positioning rather than a discharged obligation."
+        ),
+        gdpr_basis="Art. 17 -- right to erasure.",
     ),
 ]
 
