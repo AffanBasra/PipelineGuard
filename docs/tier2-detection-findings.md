@@ -417,6 +417,12 @@ a 2× speedup. Threshold and quantization are not independent knobs.
 
 ### 7.3 What it does not fix
 
+> **Superseded by §8.** int8 at 0.002 is *not* viable. It reaches fp32 coverage
+> by redacting almost everything — 94% of the characters in clean English memos
+> and 84% in clean Roman-Urdu ones. The recall parity below is an artifact of
+> firing on all input, and the correct best viable configuration is **ONNX fp32
+> at 31.0 ms/record**, not 20.7. The rest of this section is left as measured.
+
 Best viable configuration is **torch int8 at threshold 0.002, 20.7 ms/record**.
 Against the pipeline's measured 0.69 ms:
 
@@ -440,3 +446,128 @@ one lever with the right order of magnitude), a smaller backbone such as
 `gliner_small`, and reducing `max_len` from 384. Recalibrating ONNX int8 was
 also not attempted — it is slower than torch int8 (22.8 vs 20.7 ms), so it
 could not have won.
+
+---
+
+## 8. Precision — how much clean text does Tier 2 destroy?
+
+Measured 2026-08-05 with `scripts/probe_ner_precision.py`. Every case in §1–§7
+contains a real entity, so nothing so far measures over-redaction. That left
+`decisions.md` §3's standing justification for a low threshold — *"a false
+positive costs one over-redacted string, a false negative is a leak"* — as an
+assertion. It is now measured, and it is more expensive than that phrasing
+implies.
+
+43 negative inputs, none containing a person or an address, so **every**
+prediction is a false positive: 13 pipeline field values, the 5 memo templates
+at `transactions.py:35` that embed no name, and 25 hand-written Roman-Urdu and
+code-switched memos. Two metrics — `fires` (share of inputs with at least one
+spurious span) and `over-redacted` (share of all characters that would be
+masked).
+
+### 8.1 Results
+
+| config | thr | pipeline field | clean memo | PK negative |
+|---|---:|---:|---:|---:|
+| | | fires / over-red | fires / over-red | fires / over-red |
+| urchade fp32 | 0.25 | 54% / 46% | 20% / 8% | 40% / **21%** |
+| urchade fp32 | 0.40 | 31% / 29% | 20% / 8% | 32% / 17% |
+| urchade fp32 | 0.55 | 15% / 15% | 20% / 8% | 24% / 14% |
+| **urchade int8** | 0.002 | 100% / **98%** | 100% / **94%** | 100% / **84%** |
+| urchade int8 | 0.005 | 100% / 98% | 100% / 94% | 96% / 63% |
+| urchade int8 | 0.01 | 100% / 87% | 100% / 77% | 92% / 44% |
+| nvidia fp32 | 0.25 | 46% / 31% | 40% / 14% | **68%** / 23% |
+| nvidia fp32 | 0.55 | 23% / 19% | 40% / 10% | **68%** / 21% |
+
+### 8.2 int8 was a mirage, and this is why precision had to be measured
+
+§7.2 reported int8 at threshold 0.002 matching fp32 coverage at half the cost,
+and called it the leading candidate. **That conclusion was wrong.** It reaches
+that coverage by redacting nearly everything:
+
+```
+'Zakat contribution'    -> whole string, PERSON:first_name  (18/18 chars)
+'Utility bill payment'  -> whole string, PERSON + ADDRESS   (20/20 chars)
+'Loan installment'      -> whole string, PERSON + ADDRESS   (16/16 chars)
+'atm'                   -> PERSON:last_name + ADDRESS:address (3/3 chars)
+```
+
+100% of clean memos fire and 94% of their characters are masked. A model that
+flags all input scores perfect recall, and a recall-only evaluation cannot tell
+that apart from a model that works. **Two measurements were required to see
+it**, and the 2× speedup is not available at any usable threshold.
+
+### 8.3 A false positive is not "one over-redacted string"
+
+Even fp32 at 0.25 — the configuration §6 recommends — destroys whole memos:
+
+```
+'Paisay bhej diye hain'         -> whole string, PERSON  (21/21 chars)
+'Kiraya agle mahine bhejunga'   -> whole string, PERSON + ADDRESS  (27/27)
+'Rakam wapas bhej dein'         -> whole string  (21/21)
+'raast'                         -> PERSON:first_name
+'branch'                        -> ADDRESS:address
+```
+
+40% of clean Roman-Urdu memos are hit and 21% of their characters masked. The
+`decisions.md` §3 framing survives *directionally* — dropping the threshold from
+0.55 to 0.25 buys 33 points of address coverage (§6.1) for 7 points of
+over-redaction, a favourable ratio — but the absolute cost is a fifth of the
+clean stream's Roman-Urdu text, not one string.
+
+### 8.4 Roman Urdu is penalised twice
+
+| clean text | over-redaction, urchade @ 0.25 |
+|---|---:|
+| English memos | 8% |
+| Roman-Urdu memos | **21%** |
+
+**2.6× worse on the locale this project exists to serve** — and in the same
+direction as §3's detection finding. Roman-Urdu addresses are *under*-detected
+and Roman-Urdu clean text is *over*-redacted. Both failures come from the same
+place: the training distribution has not seen this language, so the model is
+uncertain in both directions at once.
+
+The name-homograph cases are the sharpest instance. Splitting the PK negatives
+into plain and ambiguous (Urdu nouns that are also Pakistani first names —
+`noor` = light, `iman` = faith, `sana` = praise, used here as ordinary nouns):
+
+| | plain | ambiguous |
+|---|---:|---:|
+| urchade @ 0.25 | 27% fire | **60%** fire |
+| nvidia @ 0.25 | 47% fire | **100%** fire |
+
+`transactions.py:19` puts those names in the generator "to stress Tier 2".
+§2 found they do not make *detection* harder — every model handles them as well
+as common names. They make **over-redaction** much harder, which is the
+opposite end of the same problem and the direction nobody looked.
+
+### 8.5 This reinforces the model choice
+
+nvidia fires on **68% of PK negatives at every threshold tested**, identical to
+the percentage point from 0.25 to 0.55 — the same threshold-insensitivity §6.2
+found in its PERSON numbers, and here it is a liability: there is no setting at
+which it over-redacts less. urchade ranges 24–40% and responds to the knob.
+
+Combined with §6.6, `urchade/gliner_multi_pii-v1` wins on cost, on PERSON
+coverage, on ADDRESS coverage at 0.25, on licence, on training-set
+independence, and now on precision.
+
+### 8.6 Limits
+
+- **43 negative cases**, hand-built. An indication, not a benchmark — the same
+  standing as §1's positive set.
+- **The Roman Urdu is written by the author**, who is not a native writer of it
+  (§5). It constrains this section exactly as it constrains §3.
+- **Over-redaction is measured on the assumption that every predicted span is
+  masked.** A production redactor might mask only the highest-scoring
+  non-overlapping spans, which would lower these numbers.
+- **The identifier fields are not pure negatives.** A PERSON hit on a CNIC is a
+  mislabel rather than a leak, and Tier 1 would have redacted that field
+  anyway, so `pipeline_field` over-redaction overstates real harm. The
+  `channel` values (`atm`, `branch`, `raast`) are true negatives and are the
+  ones that should worry.
+- **No precision measurement against an independent corpus.** Nemotron-PII has
+  gold spans and would give a defensible number on text this project did not
+  write; it is US/intl prose, so it answers a different question than the PK
+  negatives do. Not attempted here.
