@@ -358,3 +358,85 @@ vs 94% at threshold 0.25 — a 2-point gap, not the 28-point gap visible at 0.4.
   these are coverage numbers only. Nothing in this document says how much
   non-PII text either model would over-redact.
 - Address 2×2 cells remain **n=12**.
+
+---
+
+## 7. Can the cost be engineered away? Mostly no
+
+Measured 2026-08-05 with `scripts/probe_ner_runtime.py`, on
+`urchade/gliner_multi_pii-v1`, CPU. §6.3 leaves one live option: if the model
+can be made ~30× cheaper, tiering works; if not, the architecture claim has to
+be restated. This tests the two standard CPU routes.
+
+Accuracy is measured for every configuration, not just speed. `gliner/model.py:562`
+warns that *"stock DeBERTa-based models lose accuracy with int8"* absent
+quantization-aware training, and this is exactly such a model.
+
+### 7.1 Results
+
+| configuration | batch-8 ms/rec | speedup | PERSON cov | ADDRESS cov |
+|---|---:|---:|---:|---:|
+| torch fp32 @ 0.25 (baseline) | 40.9 | 1.00× | 99.4% | 84.7% |
+| torch int8 @ 0.25 | 20.7 | 1.97× | **0.0%** | **0.0%** |
+| **torch int8 @ 0.002** | **20.7** | **1.97×** | **98.4%** | **85.7%** |
+| ONNX fp32 @ 0.25 | 31.0 | 1.32× | 99.4% | 84.7% |
+| ONNX int8 @ 0.25 | 22.8 | 1.79× | 89.1% | 35.2% |
+
+ONNX fp32 reproduces fp32 coverage **exactly** (99.4% / 84.7%), which is the
+check that the export is numerically faithful rather than merely fast.
+
+### 7.2 int8 breaks calibration, not discrimination
+
+Read at the fp32 threshold, int8 looks totally destroyed — zero coverage. That
+reading is wrong, and the raw scores show why:
+
+```
+fp32   'Ayesha Malik' 0.999   'House 12' 0.347   'Islamabad' 0.582
+int8   'Ayesha Malik' 0.044   'House 12' 0.054   'Islamabad' 0.023
+```
+
+The *ranking* is intact — real entities still outscore `'Transfer'` (0.003) and
+`'to'` (0.0008). Quantization compresses the score distribution roughly 20×
+toward zero without reordering it. Recalibrating the threshold recovers the
+model:
+
+| int8 threshold | PERSON | ADDRESS | preds/case |
+|---:|---:|---:|---:|
+| 0.002 | 98.4% | **85.7%** | 3.64 |
+| 0.005 | 96.5% | 83.2% | 2.84 |
+| 0.01 | 85.0% | 65.1% | 1.93 |
+| 0.02 | 51.1% | 31.9% | 0.89 |
+
+At 0.002 int8 matches fp32 on both entity types — ADDRESS is marginally
+*better* — while emitting 3.64 predictions per case against fp32's 2.93, i.e.
+24% more spans, at half the cost. Whether that 24% is affordable is a precision
+question §7 does not answer; see §8.
+
+**Reporting int8 as unusable would have been wrong**, and would have discarded
+a 2× speedup. Threshold and quantization are not independent knobs.
+
+### 7.3 What it does not fix
+
+Best viable configuration is **torch int8 at threshold 0.002, 20.7 ms/record**.
+Against the pipeline's measured 0.69 ms:
+
+| escalation rate | per record | throughput |
+|---:|---:|---:|
+| 100% | 21.4 ms | 47 /s |
+| **50%** (the realistic floor) | 11.0 ms | **91 /s** |
+| 3.3% | 1.38 ms | 725 /s |
+
+Roughly half of all memos genuinely contain a name (5 of 10 templates at
+`transactions.py:35`), so 50% is the floor a *perfect* escalation predicate
+would reach. That floor moves from 43 rec/s to 91 rec/s — against 1,450 today.
+
+**Quantization buys ~2×. The gap is ~30×.** Runtime optimisation narrows it
+from 65× to 30× and does not close it. On CPU, Tier 2 in the synchronous path
+costs roughly an order of magnitude more than the tiering argument assumed,
+and no threshold, predicate or generator change alters that.
+
+What remains untested: GPU (NVIDIA's own testing used an A100, and a GPU is the
+one lever with the right order of magnitude), a smaller backbone such as
+`gliner_small`, and reducing `max_len` from 384. Recalibrating ONNX int8 was
+also not attempted — it is slower than torch int8 (22.8 vs 20.7 ms), so it
+could not have won.
