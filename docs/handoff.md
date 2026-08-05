@@ -283,7 +283,17 @@ self-constructed.
 
 **The escalation-rate measurement**, which is the point of the tiering claim:
 escalate a field to Tier 2 unless Tier 1's validated findings cover the entire
-field content. Measure in **bytes**, not fields, since encoder cost scales with
+field content.
+
+> **This rule is known to be unviable as written (2026-08-05).** Tier 2 costs
+> 44.6 ms per record batched, against a measured 0.69 ms per-record budget, so
+> the escalation rate must stay near 1% for tiering to pay. The memo is free
+> text and Tier 1 covers only CNIC/IBAN/phone/email, so this rule escalates
+> essentially every record — ~22 rec/s against 1,450. A replacement predicate
+> is an open design question; note that ~50% of memos genuinely contain a name,
+> so even a perfect oracle would escalate 50% and reach only ~43 rec/s. The
+> cost has to come out of the model, not the predicate. See
+> [tier2-detection-findings.md](tier2-detection-findings.md) §6.3. Measure in **bytes**, not fields, since encoder cost scales with
 sequence length. Run three configurations over the same corpus — Tier 2 on
 everything (ceiling recall, worst cost), Tier 1 only (floor recall, best
 cost), and tiered — then report recall retained versus model-only, latency
@@ -297,12 +307,25 @@ and unstructured records, because the contrast is the finding.
 Recorded because it shaped the plan, and because it constrains what can
 honestly be claimed.
 
-`gliner-PII` was fine-tuned **on** Nemotron-PII, and NVIDIA report 92% recall
-/ 64% F1 for it (implying ~49% precision — it over-detects roughly two-to-one,
-which is the correct bias for redaction). Evaluating that model on that corpus
-is evaluating it on its own training distribution. **If Tier 2 is GLiNER-PII,
-the detection-quality ceiling on this corpus is NVIDIA's number, not an
-improvement on it.**
+`gliner-PII` was fine-tuned **on** Nemotron-PII. Evaluating that model on that
+corpus is evaluating it on its own training distribution. **If Tier 2 is
+GLiNER-PII, the detection-quality ceiling on this corpus is NVIDIA's number,
+not an improvement on it.**
+
+*Correction (2026-08-05).* This paragraph previously read "NVIDIA report 92%
+recall / 64% F1 for it (implying ~49% precision)". That is not supported. The
+model card publishes **no recall figure at all**, and reports Strict F1 at
+threshold 0.3 of 0.70 on Argilla, **0.64 on AI4Privacy** and 0.87 on
+Nemotron-PII. The 0.64 was AI4Privacy's, not Nemotron's, and the precision
+figure was inferred from a recall number that does not exist. The card's own
+spread — 0.87 on its training distribution against 0.64–0.70 held out — is the
+generalisation gap this section is actually about, and it makes the point
+without an invented statistic.
+
+**Tier 2 model choice has since changed to `urchade/gliner_multi_pii-v1`**,
+which is not trained on Nemotron, so Phase 0–3 now yields a genuine held-out
+number rather than inheriting this ceiling. Reasoning in
+[tier2-detection-findings.md](tier2-detection-findings.md) §6.
 
 The conclusion drawn: the project is unlikely to win on detection accuracy —
 not against a purpose-built model on its home corpus, not on saturated
