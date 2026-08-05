@@ -522,6 +522,12 @@ clean stream's Roman-Urdu text, not one string.
 | English memos | 8% |
 | Roman-Urdu memos | **21%** |
 
+> **Partly corrected by §9.2.** Four of the 25 PK negatives contain a token no
+> Roman-Urdu corpus attests. Excluding them, over-redaction at 0.25 falls from
+> 21% to **16%** and the fire rate from 40% to 38%. The multiplier below is
+> therefore **2×, not 2.6×** — the effect is real and smaller than first
+> measured.
+
 **2.6× worse on the locale this project exists to serve** — and in the same
 direction as §3's detection finding. Roman-Urdu addresses are *under*-detected
 and Roman-Urdu clean text is *over*-redacted. Both failures come from the same
@@ -571,3 +577,90 @@ independence, and now on precision.
   gold spans and would give a defensible number on text this project did not
   write; it is US/intl prose, so it answers a different question than the PK
   negatives do. Not attempted here.
+
+---
+
+## 9. Is the Roman Urdu real? Mostly yes, with two defects
+
+Measured 2026-08-05 with `scripts/probe_urdu_plausibility.py`. §5 records that
+the Roman Urdu in these probes was written by the author, who is not a native
+writer of it — the softest point under the project's headline finding. This
+checks the probe vocabulary against Roman Urdu written by actual speakers.
+
+Three public corpora, so a word is attested by independent sources rather than
+by whichever one happened to be chosen:
+
+| corpus | licence | tokens |
+|---|---|---:|
+| `community-datasets/roman_urdu` | — | 264,286 |
+| `Khubaib01/RomanUrdu-NLP-Sentiment-Corpus` | Apache-2.0 | 1,764,194 |
+| `hafiz-hassaan-saeed/Roman-Urdu-Toxic-Corpus` | CC BY 4.0 | 1,402,163 |
+
+These are scraped social-media corpora that may contain real names, so they are
+used strictly one-directionally, per `decisions.md` §1: token frequencies are
+computed, this project's own word list is looked up against them, and only
+aggregate statistics about our words are retained. No corpus sentence is
+stored, printed or committed.
+
+### 9.1 The address nouns are real and common
+
+**53 of 55 probe words appear in all three corpora.** The three the entire §3
+address finding rests on, in occurrences per million tokens:
+
+| word | roman_urdu | sentiment | toxic |
+|---|---:|---:|---:|
+| `ghar` | 654.6 | 465.9 | 649.0 |
+| `gali` | 45.4 | 109.4 | 214.7 |
+| `makan` | 18.9 | 15.9 | 7.1 |
+| `pata` | 507.0 | 1014.1 | 493.5 |
+
+`ghar` is about as frequent as `waqt` (time) and more frequent than `bijli`
+(electricity). `makan` is the rarest of the three but attested in all three
+corpora. **§3's finding does not rest on invented words** — the models are
+failing on vocabulary Pakistanis demonstrably use.
+
+All 8 name-homograph nouns from §8.4 are attested too (`noor` 55–106,
+`aman` 91–151, `rehmat` 34–106 per million), so that result is not an artifact
+of unusual word choice either.
+
+### 9.2 Two genuine defects, and they inflated §8
+
+| token | attested | note |
+|---|---|---|
+| `bhejunga` | **0 / 3** | not attested anywhere |
+| `rakam` | 2 / 3, 0.6–1.4 pm | `raqam` is the standard form, 22–100 pm |
+
+`rakam` also appears in a *positive* case — `probe_ner_locale.py`'s
+`"Bhai {x} ko rakam bhaij di"` — so it is in the committed §2 numbers as well.
+(`customer`, `invoice` and `pending` were also flagged, but those are English
+loanwords, normal in code-switched Urdu and simply absent from colloquial
+corpora. Not defects.)
+
+This matters because an out-of-vocabulary token is exactly what a NER model
+over-flags, and **two of §8.3's three worst false positives contain one**:
+`'Kiraya agle mahine bhejunga'` and `'Rakam wapas bhej dein'` were both
+redacted whole. Excluding all four affected sentences:
+
+| PK negatives, urchade | thr 0.25 | thr 0.55 |
+|---|---:|---:|
+| all 25, as reported in §8 | 40% fire / 21% over-red | 24% / 14% |
+| **21 fully attested** | **38% fire / 16% over-red** | **19% / 8%** |
+
+So §8 overstated over-redaction by about a quarter. The effect survives: 38% of
+clean, fully-attested Roman-Urdu memos still fire at threshold 0.25, and
+`'Paisay bhej diye hain'` — every word attested in all three corpora — is still
+returned whole as a PERSON. The Roman-Urdu penalty is **2× English, not 2.6×**.
+
+### 9.3 Limits
+
+- **Attestation is not idiomaticity.** This shows the words are real and how
+  common they are. It does not test word order, agreement or register, and a
+  fluent speaker reading the templates would still be worth more than this.
+  §5's caveat is narrowed, not closed.
+- **The corpora are social media** — reviews, comments, tweets. Transaction
+  narrations are a different register, so frequency here is evidence the words
+  exist, not that they are what someone writes in a bank memo.
+- **Frequency is not correctness.** `rakam` is attested twice; it is still the
+  wrong spelling.
+- The two defects are recorded rather than silently fixed, because §2's
+  committed numbers were measured on the text as it stands.
