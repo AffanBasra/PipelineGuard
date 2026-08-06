@@ -7,22 +7,58 @@ uncertain records are quarantined for review, and every decision is written to
 a Postgres audit trail from which a governance report is generated.
 
 ```
-                        ┌────────────────────────────┐
- txn.raw ──────────────►│  processor                 │──► txn.clean       (redacted)
- (synthetic bank txns)  │  T1 rules (µs)      built  │──► txn.quarantine  (uncertain)
-                        │  T2 encoder (ms)    planned│
-                        │  T3 LLM (escalate)  planned│──► Postgres audit
-                        └────────────────────────────┘         │
-                                                               ▼
-                                                     governance report (planned)
+  ┌────────────┐
+  │  producer  │   synthetic PK bank transactions, ~40% with no memo
+  └─────┬──────┘
+        ▼
+    txn.raw ─────────────────────────────────── 24h · UNREDACTED input
+        │
+        ▼
+┌───────────────────────────────────────────────────────────────────────┐
+│ processor                                    consume(batch ≤ 500)     │
+│                                                                       │
+│  ── batched, once per Kafka batch ─────────────────────────────────   │
+│   A. collect non-empty free text          (best-effort, decides none) │
+│   B. ONE encoder call, chunked at 8   ──────────────► GPU / CPU       │
+│                                                                       │
+│  ── per message: DISPATCH BY FIELD, not escalation ────────────────   │
+│   account_holder  →  schema rule      whole field, confidence 1.0     │
+│   memo            →  T1 rules  +  T2 encoder     (spans unioned)      │
+│   cnic iban phone email → T1 rules    regex + checksum                │
+│                                                                       │
+│  ── route ─────────────────────────────────────────────────────────   │
+│   no findings ─────────────────► clean                                │
+│   T1 finding < 1.0 ────────────► quarantine   (original bytes)        │
+│   otherwise ─── redact ────────► redacted                             │
+│                                                                       │
+│   T3 LLM for ambiguous spans …………………………………………………… planned            │
+│                                                                       │
+│  audit BEFORE emit          ·          commit offsets LAST            │
+└──────┬──────────────────────────────────────────┬─────────────────────┘
+       ▼                                          ▼
+  txn.clean ── 168h · redacted        txn.quarantine ── 72h · UNREDACTED
+       │                                          │
+       └──────────────► Postgres audit ◄──────────┘
+                        type · field · span · tier · confidence
+                        never the value
+                                 │
+                                 ▼
+                        governance report (Markdown)
 ```
+
+**Tier 1 → Tier 2 is dispatch, not escalation.** Tier 1 has no name rule, so a
+memo is not a record it was *uncertain* about — it is one it has no opinion on.
+The schema already says which fields are free text, so the routing is fixed
+before either detector runs. Tier 2 → Tier 3 will be genuine escalation: same
+span, promoted on uncertainty.
 
 > **Honest scope:** the input streams are synthetic (Faker + hand-built
 > Pakistani-locale generators — CNIC, PK IBAN, Pakistani names in Latin
-> script). No real
-> PII is processed or stored; the audit trail records entity *types and spans*,
-> never values. Delivery semantics are **at-least-once with idempotent audit
-> writes** — see [Design decisions](#design-decisions) for why not exactly-once.
+> script). No real PII is processed or stored; the *audit trail* records entity
+> types and spans, never values — though `txn.raw` and `txn.quarantine` do carry
+> unredacted payloads, which is why their retention is set explicitly.
+> Delivery semantics are **at-least-once with idempotent audit writes** — see
+> [Design decisions](#design-decisions) for why not exactly-once.
 
 ## Status
 
@@ -34,7 +70,10 @@ a Postgres audit trail from which a governance report is generated.
 - [x] Micro-batched processing + batch-size benchmark
 - [x] Governance report generator (Markdown, from the audit trail)
 - [x] Dockerfile + processor service, so `docker compose up` runs the pipeline
-- [ ] Tier 2: encoder NER — off-the-shelf first, locale fine-tune after
+- [x] Schema-based redaction of declared PII fields (`account_holder`)
+- [x] Tier 2: encoder NER over free text, batched, GPU-optional
+- [ ] Tier 2 locale fine-tune (needs an evaluation set of independent provenance)
+- [ ] Flagging records whose redaction left nothing
 - [ ] End-to-end latency measurement (current figures are detection-only)
 - [ ] Tier 3: pluggable LLM escalation (Gemini, Ollama)
 - [ ] Support-chat free-text topic
@@ -151,6 +190,47 @@ which is a question about consumer lag that no audit table can answer.
 | `--stats-every` | 5 | seconds between throughput/latency stats lines |
 | `--exit-after` | 0 | stop after N messages (0 = run until interrupted); makes benchmark runs reproducible |
 | `--log-level` | INFO | `DEBUG` logs every message — never use it while benchmarking |
+
+## Tier 2 — the encoder
+
+Tier 1 cannot find a name. No rule can: a name has no format to match. That is
+the whole reason Tier 2 exists — **capability, not cost.** Before it, a memo
+reading `Transfer to Ayesha Malik` reached the clean topic verbatim, and so did
+`account_holder`, because Tier 1 produced no findings on either.
+
+Measured on 2,000 records ([full findings](docs/tier2-detection-findings.md)):
+
+| | Tier 1 only | + Tier 2 (GPU) |
+|---|---:|---:|
+| throughput | 439 rec/s | **159 rec/s** |
+| p50 detection | 0.09 ms | 6.43 ms |
+| names found in `memo` | **0** | **892** |
+
+`urchade/gliner_multi_pii-v1` at threshold 0.25, **99.4%** character coverage on
+PERSON. Four results worth knowing before changing anything:
+
+- **The threshold is not a probability.** It is an uncalibrated sigmoid cutoff
+  and does not transfer between checkpoints — `nvidia/gliner-PII` at this
+  model's 0.25 fires on 68% of clean Pakistani text. Swapping `TIER2_MODEL`
+  means re-running `scripts/probe_ner_sweep.py`; the detector logs a warning if
+  you don't.
+- **Labels are run one group per forward pass.** Folding them into a single
+  pass halves the cost and drops PERSON coverage to 90.9% — the labels compete
+  for the same spans.
+- **Batching is the whole speedup.** 7.2 ms/record at batch 8 against 29.4 at
+  batch 1, which is why inference happens in `main()` and findings are injected
+  into `process_message` rather than detected there.
+- **ADDRESS was measured, then removed.** Nothing in this pipeline contains an
+  address, so the pass could only ever be wrong — it fired on 30% of memos,
+  mostly re-tagging names. Restoring it is one line, plus a corpus.
+
+Off by default. Enable with `TIER2_ENABLED=true`, `TIER2_DEVICE=cuda|cpu|auto`.
+
+**Over-redaction is the accepted cost.** At this threshold ~38% of clean
+Roman-Urdu memos fire, and some are destroyed whole (`Kiraya jama karwa diya` →
+`[PERSON_NAME]`). Coverage was deliberately not traded away to fix it, and the
+false positives score up to 0.98 — high enough that no threshold change removes
+them. Flagging fully-saturated redactions is the open mitigation.
 
 ## Design decisions
 
@@ -392,7 +472,10 @@ and exactly 40,000 IBAN detections — precisely two per message.
 Dockerfile                       one image, four entry points (processor, topics, producer, report)
 docker-compose.yml               broker, database, topic init, processor, on-demand tools
 db/init.sql                      audit schema (idempotent upserts by message_id)
-scripts/create_topics.py         explicit topic creation (auto-create disabled)
+scripts/create_topics.py         explicit topic creation + retention (auto-create disabled)
+scripts/peek_topic.py            print recent messages on a topic (reads from the END)
+scripts/probe_ner_*.py           the Tier 2 measurement suite — model, threshold,
+                                 runtime, precision, redaction damage
 src/pipelineguard/
   config.py                      env-driven settings
   models.py                      Envelope, Finding, Tier
@@ -400,6 +483,8 @@ src/pipelineguard/
   producer.py                    rate-controlled producer with delivery callbacks
   detectors/base.py              Detector protocol
   detectors/tier1_rules.py       Tier 1 rules engine
+  detectors/schema_rules.py      declared-PII fields + the free-text registry
+  detectors/tier2_encoder.py     Tier 2 encoder, batched, GPU-optional
   processor.py                   the stream processor (consume→detect→route→audit)
   audit.py                       idempotent Postgres audit writer
   compliance.py                  entity type → regulatory classification
