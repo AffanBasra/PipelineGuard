@@ -8,11 +8,14 @@ originally emitted random check digits, so ~100% of traffic quarantined.
 """
 from __future__ import annotations
 
+import random
 import re
 
 import pytest
+from faker import Faker
 
 from pipelineguard.generator.transactions import (
+    BLANK_MEMO_RATE,
     CORRUPT_IBAN_RATE,
     _iban_check_digits,
     make_cnic,
@@ -101,3 +104,42 @@ def test_structured_pii_fields_are_fully_detected(detector, field):
         assert len(findings) == 1
         assert findings[0].span_start == 0
         assert findings[0].span_end == len(value)
+
+
+# --------------------------------------------------------------------------- #
+# Blank memos — the share of the stream that reaches Tier 2
+# --------------------------------------------------------------------------- #
+def test_blank_rate_bounds_are_exact():
+    """The two ends must be absolute, not approximate: 0.0 is what a benchmark
+    uses to force every record through Tier 2, and 1.0 is what proves the
+    encoder is skipped entirely rather than merely called with empty text."""
+    assert all(make_transaction(0.0)["memo"] for _ in range(200))
+    assert not any(make_transaction(1.0)["memo"] for _ in range(200))
+
+
+def test_default_blank_rate_is_honoured():
+    """Load-bearing: every non-blank memo pays Tier 2's forward pass, so a
+    default that silently drifted would move throughput without any code
+    changing."""
+    random.seed(11)
+    blanks = sum(not make_transaction()["memo"] for _ in range(2000))
+    assert abs(blanks / 2000 - BLANK_MEMO_RATE) < 0.05
+
+
+def test_blank_memo_still_produces_a_valid_record():
+    """A blank narration must not blank anything else — the structured PII is
+    still there and still has to be redacted."""
+    txn = make_transaction(1.0)
+    assert txn["memo"] == ""
+    assert txn["account_holder"] and txn["cnic"] and txn["iban_from"]
+
+
+def test_seeding_makes_runs_reproducible():
+    """The producer logs its seed so an odd measurement can be replayed. That is
+    only worth anything if the seed actually determines the output."""
+    def run():
+        random.seed(99)
+        Faker.seed(99)
+        return [make_transaction()["memo"] for _ in range(50)]
+
+    assert run() == run()

@@ -15,7 +15,9 @@ live Kafka/Postgres, which this suite doesn't attempt.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
+import time
 import uuid
 
 import pytest
@@ -746,3 +748,93 @@ def test_main_exit_after_zero_runs_until_consume_is_exhausted(monkeypatch):
     assert consumer.consume_calls == 4   # 3 real batches + the exhausted-script call
     assert len(audit.batches) == 3
     assert committed_offset_map(consumer) == {("txn.raw", 0): 3}
+
+
+# --------------------------------------------------------------------------- #
+# Tier 2 in the batch loop
+# --------------------------------------------------------------------------- #
+class FakeTier2:
+    """Records the batch it was handed, and flags the word 'Ayesha'."""
+
+    def __init__(self, delay_ms=0.0):
+        self.batches = []
+        self.delay_ms = delay_ms
+
+    def detect_batch(self, inputs):
+        self.batches.append(inputs)
+        if self.delay_ms:
+            time.sleep(self.delay_ms / 1000)
+        out = {}
+        for key, fields in inputs.items():
+            for field, text in fields.items():
+                if "Ayesha" in text:
+                    s = text.index("Ayesha")
+                    out.setdefault(key, {})[field] = [
+                        t2(field, s, s + len("Ayesha"))
+                    ]
+        return out
+
+
+def run_main_with_tier2(monkeypatch, payloads, tier2, **kw):
+    batch = [make_message(p) for p in payloads]
+    consumer, producer, audit, log = patch_main_deps(monkeypatch, [batch], **kw)
+    # Settings is a frozen dataclass, so swap the whole object rather than a
+    # field. dataclasses.replace keeps every other setting as configured.
+    monkeypatch.setattr(
+        P, "settings", dataclasses.replace(P.settings, tier2_enabled=True)
+    )
+    monkeypatch.setattr(P, "_load_tier2", lambda: tier2)
+    P.main(["--exit-after", str(len(batch)), "--stats-every", "999"])
+    return consumer, producer, audit, log
+
+
+def test_only_nonempty_free_text_is_escalated(monkeypatch):
+    """A blank memo must never reach the model — that is the whole reason
+    dispatch is on the field rather than on a prediction."""
+    tier2 = FakeTier2()
+    run_main_with_tier2(monkeypatch, [
+        {"memo": "Transfer to Ayesha Malik"},
+        {"memo": ""},
+        {"memo": "   "},
+        {"channel": "atm"},
+    ], tier2)
+
+    assert len(tier2.batches) == 1
+    assert set(tier2.batches[0]) == {0}
+
+
+def test_tier2_findings_reach_the_emitted_payload(monkeypatch):
+    tier2 = FakeTier2()
+    _c, producer, _a, _l = run_main_with_tier2(
+        monkeypatch, [{"memo": "Transfer to Ayesha Malik"}], tier2
+    )
+    emitted = producer.produced[0]
+    assert b"Ayesha" not in emitted["value"]
+    assert b"PERSON" in emitted["value"]
+
+
+def test_batch_makes_one_model_call_not_one_per_message(monkeypatch):
+    """The entire reason for the pre-pass: per-message inference costs 29.4 ms
+    against 7.2 batched."""
+    tier2 = FakeTier2()
+    run_main_with_tier2(
+        monkeypatch, [{"memo": f"Ayesha {i}"} for i in range(12)], tier2
+    )
+    assert len(tier2.batches) == 1
+    assert len(tier2.batches[0]) == 12
+
+
+def test_tier2_cost_is_charged_to_escalated_records(monkeypatch):
+    """The model call sits outside the per-message timer, so without explicit
+    attribution the audit would report sub-millisecond latency for records whose
+    real cost was milliseconds."""
+    tier2 = FakeTier2(delay_ms=40)
+    _c, _p, audit, _l = run_main_with_tier2(monkeypatch, [
+        {"memo": "Transfer to Ayesha Malik"},
+        {"memo": ""},
+    ], tier2)
+
+    by_memo = {r.envelope.payload.get("memo"): r.latency_ms
+               for batch in audit.batches for r in batch}
+    assert by_memo["Transfer to Ayesha Malik"] > 30    # carries the model cost
+    assert by_memo[""] < 10                            # skipped it entirely

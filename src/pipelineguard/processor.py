@@ -357,6 +357,22 @@ def process_message(
         )
 
 
+def _load_tier2():
+    """Build and warm the encoder. Imported here rather than at module scope so
+    the processor starts without torch when Tier 2 is off, and separated from
+    main() so the batch-loop tests can substitute a fake."""
+    from pipelineguard.detectors.tier2_encoder import Tier2Detector
+
+    tier2 = Tier2Detector(
+        settings.tier2_model,
+        threshold=settings.tier2_threshold,
+        device=settings.tier2_device,
+        batch_size=settings.tier2_batch_size,
+    )
+    tier2.load()
+    return tier2
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--stats-every", type=float, default=5.0, help="stats line interval (s)")
@@ -392,6 +408,12 @@ def main(argv: list[str] | None = None) -> None:
     detector = RulesDetector()
     audit = AuditWriter()
     stats = StatsReporter(log, interval_s=args.stats_every)
+
+    # Loaded before subscribing: weights and warmup take seconds, and paying
+    # that after the group assignment would stall the first batch.
+    tier2 = _load_tier2() if settings.tier2_enabled else None
+    if tier2 is None:
+        log.info("tier 2 disabled (TIER2_ENABLED=false); free text is rules-only")
 
     consumer.subscribe([settings.topic_txn_raw])
     log.info(
@@ -430,11 +452,39 @@ def main(argv: list[str] | None = None) -> None:
 
             processed_total += len(good_messages)
 
+            # ---- Tier 2, batched across the whole Kafka batch ----------------
+            # Phase A extracts free text without deciding anything; phase B runs
+            # one batched inference. Both must happen before the per-message
+            # loop, because the encoder only pays for itself in batches.
+            tier2_findings: dict[int, dict[str, list[Finding]]] = {}
+            escalated: set[int] = set()
+            tier2_ms = 0.0
+            if tier2 is not None:
+                inputs = {
+                    i: fields
+                    for i, msg in enumerate(good_messages)
+                    if (fields := free_text_fields(msg.value()))
+                }
+                escalated = set(inputs)
+                if inputs:
+                    t0 = time.perf_counter()
+                    tier2_findings = tier2.detect_batch(inputs)
+                    tier2_ms = (time.perf_counter() - t0) * 1000
+
+            # Amortised over the records that actually used it — charged on
+            # escalation, not on whether anything was found, since a memo that
+            # yields no findings still paid for the forward pass. Without this
+            # the audit would report sub-millisecond latencies for records whose
+            # dominant cost happened outside the per-message timer.
+            tier2_share = tier2_ms / len(escalated) if escalated else 0.0
+
             processed = []   # (msg, outcome, latency_ms)
-            for msg in good_messages:
+            for i, msg in enumerate(good_messages):
                 t0 = time.perf_counter()
-                outcome = process_message(msg, detector)
+                outcome = process_message(msg, detector, tier2_findings.get(i))
                 latency_ms = (time.perf_counter() - t0) * 1000
+                if i in escalated:
+                    latency_ms += tier2_share
                 processed.append((msg, outcome, latency_ms))
 
             # ---- infrastructure layer: exceptions below here kill the process ----

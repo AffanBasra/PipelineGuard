@@ -35,6 +35,9 @@ LABEL_GROUPS = {
 
 _WARMUP_TEXT = "Transfer to Ayesha Malik, House 12, Street 4, F-8/3 Islamabad"
 
+# The checkpoint the default threshold was swept against (findings §6.1).
+_TUNED_FOR = "urchade/gliner_multi_pii-v1"
+
 
 def resolve_device(requested: str) -> str:
     """cpu | cuda | auto -> the device actually used, falling back to cpu."""
@@ -57,11 +60,13 @@ class Tier2Detector:
     name = "tier2_encoder"
 
     def __init__(self, model_id: str, threshold: float = 0.25,
-                 device: str = "auto", batch_size: int = 8) -> None:
+                 device: str = "auto", batch_size: int = 8,
+                 label_groups: dict[str, list[str]] | None = None) -> None:
         self.model_id = model_id
         self.threshold = threshold
         self.requested_device = device
         self.batch_size = max(1, batch_size)
+        self.label_groups = label_groups or LABEL_GROUPS
         self.device = "cpu"
         self._model = None
 
@@ -76,13 +81,25 @@ class Tier2Detector:
         self._model = GLiNER.from_pretrained(self.model_id, map_location=self.device)
         self._model.eval()
         self._predict([_WARMUP_TEXT] * self.batch_size)
-        log.info("tier 2 ready (threshold %.2f, batch %d)",
-                 self.threshold, self.batch_size)
+        # Model and threshold are logged together on purpose. The threshold is an
+        # uncalibrated sigmoid cutoff, not a probability, so it does not transfer
+        # between checkpoints -- nvidia/gliner-PII at this model's 0.25 fires on
+        # 68% of clean Pakistani text. Swapping the model means re-running
+        # scripts/probe_ner_sweep.py, not reusing this number.
+        log.info("tier 2 ready: model=%s threshold=%.2f labels=%s batch=%d device=%s",
+                 self.model_id, self.threshold, list(self.label_groups),
+                 self.batch_size, self.device)
+        if self.model_id != _TUNED_FOR:
+            log.warning(
+                "threshold %.2f was tuned for %s, not %s -- re-run "
+                "scripts/probe_ner_sweep.py or results will not be comparable",
+                self.threshold, _TUNED_FOR, self.model_id,
+            )
 
     def _predict(self, texts: list[str]) -> list[list[tuple[dict, str]]]:
         """One batched pass per label group, zipped back per text."""
         per_text: list[list[tuple[dict, str]]] = [[] for _ in texts]
-        for entity_type, labels in LABEL_GROUPS.items():
+        for entity_type, labels in self.label_groups.items():
             batch = self._model.batch_predict_entities(
                 texts, labels, threshold=self.threshold
             )

@@ -92,15 +92,32 @@ def make_name() -> str:
     return f"{random.choice(FIRST_NAMES)} {random.choice(LAST_NAMES)}"
 
 
-def make_transaction() -> dict:
-    name = make_name()
-    memo = random.choice(MEMO_TEMPLATES).format(
+# Share of transactions carrying no narration at all. Load-bearing: dispatch
+# sends every non-empty memo to the encoder, so this sets how much of the stream
+# pays Tier 2's ~7 ms and therefore the pipeline's throughput.
+#
+# UNVALIDATED. Chosen as a plausible default, not measured against real banking
+# data — no such measurement exists in this project. Treat throughput figures as
+# conditional on it, and sweep it rather than trusting the single number.
+BLANK_MEMO_RATE = 0.40
+
+
+def make_memo(blank_rate: float = BLANK_MEMO_RATE) -> str:
+    """A narration, or "" for a transaction that carries none."""
+    if random.random() < blank_rate:
+        return ""
+    return random.choice(MEMO_TEMPLATES).format(
         name=make_name(),
         phone=make_phone(),
         cnic=make_cnic(),
         email=fake.email(),
         inv=random.randint(1000, 99999),
     )
+
+
+def make_transaction(blank_memo_rate: float = BLANK_MEMO_RATE) -> dict:
+    name = make_name()
+    memo = make_memo(blank_memo_rate)
     return {
         "account_holder": name,
         "cnic": make_cnic(),
