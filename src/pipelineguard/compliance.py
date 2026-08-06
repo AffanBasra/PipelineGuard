@@ -208,7 +208,12 @@ SYSTEM_PROPERTIES: list[SystemProperty] = [
         behaviour=(
             "It stores entity type, field, character span, tier and "
             "confidence -- never the matched text. The governance record is "
-            "therefore not itself a store of personal data."
+            "therefore not itself a store of personal data. This is a "
+            "property of the audit database only: txn.raw carries unredacted "
+            "input and txn.quarantine deliberately carries original bytes so "
+            "reviewers see what arrived, both retained on the broker (24h and "
+            "72h respectively) under whatever access controls the deployment "
+            "provides."
         ),
         pk_basis=(
             "Keeps the compliance artifact from enlarging the institution's "

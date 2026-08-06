@@ -223,6 +223,25 @@ type, field, span, tier and confidence — never the matched value.
 `messages_processed.failure_class` / `failure_detail` explain fail-closed
 quarantines, so "why was this quarantined" is answerable from SQL alone.
 
+**The topics are a different story, deliberately.** That property belongs to the
+audit database, not the system. `txn.raw` carries unredacted input by
+definition, and `txn.quarantine` carries the *original* bytes on purpose — a
+reviewer has to see what actually arrived. So the highest-risk store in the
+system is the one nobody thinks of as a store. Retention is therefore set as a
+data-protection control rather than a capacity one, in `scripts/create_topics.py`:
+
+| topic | contents | retention |
+|---|---|---|
+| `txn.raw` | unredacted input | **24h** — enough to replay a day-long outage |
+| `txn.clean` | redacted | 168h |
+| `txn.quarantine` | **unredacted originals** | **72h** — this value *is* the reviewer SLA |
+
+Shortening quarantine retention cuts exposure and raises the chance a record
+expires unreviewed; that tradeoff is the reason the number is explicit rather
+than inherited. The compose stack runs PLAINTEXT with no ACLs, which is normal
+for local development and **is not a production posture** — transport security
+and authorization are deployment concerns this repo does not configure.
+
 **Quarantine policy.** Confident detections are redacted in place and
 forwarded; only *uncertain* records (sub-threshold confidence, malformed
 messages) are quarantined — mirroring how production DLP systems avoid

@@ -407,13 +407,17 @@ def main(argv: list[str] | None = None) -> None:
     )
     detector = RulesDetector()
     audit = AuditWriter()
-    stats = StatsReporter(log, interval_s=args.stats_every)
 
     # Loaded before subscribing: weights and warmup take seconds, and paying
     # that after the group assignment would stall the first batch.
     tier2 = _load_tier2() if settings.tier2_enabled else None
     if tier2 is None:
         log.info("tier 2 disabled (TIER2_ENABLED=false); free text is rules-only")
+
+    # Constructed AFTER the model load, because it starts its clock in __init__.
+    # Built earlier, the tens of seconds spent fetching and warming weights would
+    # be counted as processing time and understate throughput by ~2.5x.
+    stats = StatsReporter(log, interval_s=args.stats_every)
 
     consumer.subscribe([settings.topic_txn_raw])
     log.info(

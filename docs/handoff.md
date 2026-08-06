@@ -428,8 +428,18 @@ conditional Go rewrite of one consumer.
   broker behaviour.
 - ~~Kafka has no named volume~~ — **closed.** `kafkadata` added; verified that
   2,000 messages and their committed offsets survive `docker compose down`.
-- Topic retention is unconfigured; quarantine plausibly warrants longer
-  retention than clean, for compliance.
+- ~~Topic retention is unconfigured~~ — **closed, and it was a security item
+  rather than the ops one it was filed as.** `txn.quarantine` carries
+  *unredacted originals* by design (`processor.py` forwards `raw` so reviewers
+  see what arrived), and it was inheriting the broker's 168h default on a
+  PLAINTEXT broker with no ACLs. The risk profile was inverted: the PII-free
+  audit database had authentication and unlimited retention, while the
+  PII-bearing topics had neither. Now set explicitly in
+  `scripts/create_topics.py` — raw 24h, clean 168h, quarantine 72h — and
+  applied to existing clusters via `incremental_alter_configs`, since topic
+  creation no-ops once a topic exists. Quarantine retention doubles as the
+  reviewer SLA: past it, a record is dropped unreviewed. Transport security and
+  authorization remain unaddressed and are deployment concerns.
 - Quarantine is terminal — no reviewer workflow, and no distinction between a
   record that failed once and one that fails permanently. **The routing rule for
   Tier 2 is now decided** (2026-08-06): no confidence band, because every graded
