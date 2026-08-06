@@ -23,11 +23,18 @@ probe_ner_sweep.py section 6.1 found 0.25 is where this model actually
 operates best, and a runtime change should be judged at the operating point
 it would ship at.
 
+Both of those are CPU paths. `--device cuda` measures the remaining lever:
+moving the model off the CPU entirely. That run reports torch fp32 only, since
+FBGEMM quantization and the ONNX CPUExecutionProvider have no GPU meaning --
+benchmarking them there would print CPU timings under a GPU heading.
+
 Usage:
     python scripts/probe_ner_runtime.py [--out runtime_results.json]
+                                        [--device cpu|cuda|auto]
 
 Needs `torch`, `gliner`, `onnx`, `onnxruntime`. Writes ONNX graphs to
-models/onnx/ (gitignored). The fp32 graph is ~1.1 GB.
+models/onnx/ (gitignored). The fp32 graph is ~1.1 GB. `--device` defaults to
+cpu, which is what every committed number in section 7 was measured on.
 """
 from __future__ import annotations
 
@@ -58,6 +65,45 @@ REPO = Path(__file__).resolve().parent.parent
 ONNX_DIR = REPO / "models" / "onnx"
 
 
+def resolve_device(requested: str) -> str:
+    """cpu | cuda | auto -> the device actually used.
+
+    Defaults to cpu and falls back to it rather than raising: the CPU numbers
+    are the ones the tiering argument rests on, so a machine without a GPU must
+    still be able to run this and reproduce them. GLiNER itself raises on
+    map_location='cuda' with no CUDA (gliner/model.py:1531), which is the wrong
+    behaviour for a benchmark that is useful on both.
+    """
+    import torch
+
+    if requested == "cpu":
+        return "cpu"
+    available = torch.cuda.is_available()
+    if available:
+        name = torch.cuda.get_device_name(0)
+        total = torch.cuda.get_device_properties(0).total_memory / 1e9
+        print(f"  device: cuda -- {name}, {total:.1f} GB, torch {torch.__version__}",
+              flush=True)
+        return "cuda"
+    if requested == "cuda":
+        print(f"  WARNING: --device cuda requested but torch reports no CUDA "
+              f"(build {torch.__version__}); falling back to cpu", flush=True)
+    return "cpu"
+
+
+def sync(device: str) -> None:
+    """Block until queued GPU work is done.
+
+    CUDA kernel launches are asynchronous, so perf_counter around a forward
+    pass measures the time to ENQUEUE it, not to run it -- which would report a
+    GPU as impossibly fast. No-op on CPU.
+    """
+    if device == "cuda":
+        import torch
+
+        torch.cuda.synchronize()
+
+
 def score(model, cases) -> dict:
     """Coverage by entity type at THRESHOLD, plus predictions per case.
 
@@ -85,19 +131,24 @@ def score(model, cases) -> dict:
     }
 
 
-def time_single(model, text, warmup=3, n=20) -> dict:
-    for _ in range(warmup):
+def time_single(model, text, warmup=3, n=20, device="cpu") -> dict:
+    # A GPU needs more warmup than a CPU: the first launches pay for context
+    # creation, kernel autotuning and allocator growth, any of which would
+    # otherwise land in the measured samples.
+    for _ in range(warmup if device == "cpu" else warmup * 5):
         model.predict_entities(text, LABELS["ADDRESS"], threshold=THRESHOLD)
+    sync(device)
     s = []
     for _ in range(n):
         t = time.perf_counter()
         model.predict_entities(text, LABELS["ADDRESS"], threshold=THRESHOLD)
+        sync(device)
         s.append((time.perf_counter() - t) * 1000)
     s.sort()
     return {"p50": statistics.median(s), "p95": s[int(0.95 * n) - 1], "min": s[0]}
 
 
-def time_batched(model, text, sizes=(1, 8, 32), n=8) -> dict:
+def time_batched(model, text, sizes=(1, 8, 32), n=8, device="cpu") -> dict:
     """Per-record cost at each batch size.
 
     probe_ner_sweep.py found batching saturates at 8, so 32 is carried only to
@@ -109,25 +160,41 @@ def time_batched(model, text, sizes=(1, 8, 32), n=8) -> dict:
         return out
     for bs in sizes:
         batch = [text] * bs
-        for _ in range(2):
-            model.batch_predict_entities(batch, LABELS["ADDRESS"], threshold=THRESHOLD)
-        s = []
-        for _ in range(n):
-            t = time.perf_counter()
-            model.batch_predict_entities(batch, LABELS["ADDRESS"], threshold=THRESHOLD)
-            s.append((time.perf_counter() - t) * 1000)
+        # A 4 GB card can run out of memory at the larger batch sizes. That is a
+        # result about this GPU, not a reason to lose the smaller batches that
+        # already succeeded -- and batch 8 is the number the summary reports.
+        try:
+            for _ in range(2 if device == "cpu" else 5):
+                model.batch_predict_entities(batch, LABELS["ADDRESS"], threshold=THRESHOLD)
+            sync(device)
+            s = []
+            for _ in range(n):
+                t = time.perf_counter()
+                model.batch_predict_entities(batch, LABELS["ADDRESS"], threshold=THRESHOLD)
+                sync(device)
+                s.append((time.perf_counter() - t) * 1000)
+        except RuntimeError as exc:
+            if "out of memory" not in str(exc).lower():
+                raise
+            print(f"    batch {bs}: OOM on {device}, skipping", flush=True)
+            out[f"batch_{bs}"] = {"error": "out of memory"}
+            if device == "cuda":
+                import torch
+
+                torch.cuda.empty_cache()
+            continue
         total = statistics.median(s)
         out[f"batch_{bs}"] = {"batch_p50_ms": total, "per_record_ms": total / bs}
     return out
 
 
-def measure(model, cases, label) -> dict:
+def measure(model, cases, label, device="cpu") -> dict:
     print(f"  [{label}] scoring {len(cases)} cases...", flush=True)
     t0 = time.perf_counter()
     acc = score(model, cases)
     print(f"  [{label}] scored in {time.perf_counter() - t0:.0f}s", flush=True)
-    single = time_single(model, MEMO)
-    batched = time_batched(model, MEMO)
+    single = time_single(model, MEMO, device=device)
+    batched = time_batched(model, MEMO, device=device)
     per_rec = batched.get("batch_8", {}).get("per_record_ms")
     line = (f"  [{label}] PERSON cov={acc['PERSON']['cov']:.1%}  "
             f"ADDRESS cov={acc['ADDRESS']['cov']:.1%}  "
@@ -181,18 +248,47 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--out", default="runtime_results.json")
     ap.add_argument("--skip-onnx", action="store_true")
+    ap.add_argument(
+        "--device", choices=("cpu", "cuda", "auto"), default="cpu",
+        help="cpu (default, and what the committed numbers were measured on), "
+             "cuda, or auto. Falls back to cpu if CUDA is unavailable.",
+    )
     args = ap.parse_args(argv)
 
     from gliner import GLiNER
 
+    device = resolve_device(args.device)
     cases = build_cases()
-    results = {}
+    results = {"_device": device}
 
     # ---- fp32 torch: the baseline every other row is a delta against --------
-    print("=" * 70, "\ntorch fp32 (baseline)\n", "=" * 70, flush=True)
-    model = GLiNER.from_pretrained(MODEL_ID)
+    print("=" * 70, f"\ntorch fp32 on {device} (baseline)\n", "=" * 70, flush=True)
+    model = GLiNER.from_pretrained(MODEL_ID, map_location=device)
     model.eval()
-    results["torch_fp32"] = measure(model, cases, "torch_fp32")
+    results["torch_fp32"] = measure(model, cases, "torch_fp32", device=device)
+
+    # Both remaining paths are CPU-specific and would measure nothing on a GPU:
+    # dynamic quantization dispatches to FBGEMM, a CPU backend
+    # (gliner/model.py:614), and the ONNX export below is loaded on the default
+    # CPUExecutionProvider. Running them here would silently benchmark the CPU
+    # while the summary table claimed a GPU row.
+    if device != "cpu":
+        print(f"\nskipping torch-int8 and ONNX: both are CPU paths, and on "
+              f"{device} they would report CPU timings under a GPU heading.",
+              flush=True)
+        with open(args.out, "w", encoding="utf-8") as fh:
+            json.dump(results, fh, indent=2)
+        print(f"\nwrote {args.out}")
+        r = results["torch_fp32"]
+        rec = r["batched"].get("batch_8", {}).get("per_record_ms")
+        print("\n" + "=" * 78)
+        print(f"{'config':<18} {'batch8 ms/rec':>14} {'ADDRESS cov':>12} {'PERSON cov':>11}")
+        print("-" * 78)
+        print(f"{'torch_fp32/' + device:<18} {rec if rec else float('nan'):>14.1f} "
+              f"{r['accuracy']['ADDRESS']['cov']:>11.1%} "
+              f"{r['accuracy']['PERSON']['cov']:>10.1%}")
+        print("=" * 78)
+        return 0
 
     # ---- torch dynamic int8 -------------------------------------------------
     print("=" * 70, "\ntorch int8 (dynamic quantization)\n", "=" * 70, flush=True)

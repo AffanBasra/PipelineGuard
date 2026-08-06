@@ -817,3 +817,98 @@ running it nowhere.
 - **Whether a fully-masked memo is worth a human at all** is unexamined here.
   The alternative is dropping the memo and emitting the rest of the record,
   which needs no reviewer.
+
+---
+
+## 11. The GPU — the one lever that moved, and what it does not buy
+
+§7 concluded that runtime optimization on CPU narrows the Tier 2 cost gap from
+65× to ~23× without closing it, leaving one untested lever with the right order
+of magnitude: move the model off the CPU. Measured here via
+`probe_ner_runtime.py --device cuda`.
+
+Hardware: **NVIDIA RTX 3050 Ti Laptop, 4.3 GB, sm_86**, torch 2.13.0+cu130.
+A laptop part, and a weak one by GPU standards — which makes this a floor
+rather than a headline.
+
+Two measurement details that decide whether the numbers mean anything. CUDA
+kernel launches are **asynchronous**, so timing a forward pass without
+`torch.cuda.synchronize()` measures the time to *enqueue* it and reports a GPU
+as impossibly fast; `sync()` is called after every timed call. And GPU warmup is
+5× longer than CPU, because the first launches pay for context creation, kernel
+autotuning and allocator growth.
+
+### 11.1 Results
+
+The CPU column was re-measured on the **same** cu130 wheel, so the comparison is
+not confounded by the torch build changing underneath it. It came out at
+40.5 ms against the 40.9 ms committed in §7 — within noise, so §7's numbers
+stand.
+
+| config | batch 1 | batch 8 | batch 32 | PERSON | ADDRESS |
+|---|---:|---:|---:|---:|---:|
+| CPU torch fp32 | 116.4 | 40.5 | 40.3 | 99.4% | 84.7% |
+| CPU ONNX fp32 (§7) | — | **31.0** | — | 99.4% | 84.7% |
+| **GPU torch fp32** | 29.4 | **8.03** | 7.64 | 99.4% | 84.7% |
+
+**3.9× faster than the best CPU configuration, at identical accuracy.**
+PERSON 0.9939 and ADDRESS 0.8466 match the CPU run to four decimals — this is
+the same model arriving at the same answers sooner, not a speed-for-quality
+trade. Contrast §7.2, where int8's 2× came with a collapsed score distribution.
+Batch 32 was measured without OOM on 4 GB, and saturation is still at batch 8.
+
+### 11.2 What it does to the throughput argument
+
+At the 50% escalation floor (roughly half of memos genuinely contain a name, so
+no predicate does better — §6.3), against the measured 0.69 ms/record Tier 1
+baseline of 1,450 msg/s:
+
+| config | ms/record | throughput | gap to 1,450 |
+|---|---:|---:|---:|
+| CPU ONNX fp32 | 16.2 | 62 rec/s | 23× |
+| **GPU, 50% escalation** | 4.7 | **213 rec/s** | **6.8×** |
+| GPU, 100% escalation | 8.7 | 115 rec/s | 12.6× |
+
+The gap goes from 23× to **6.8×**. That is the first change of this whole
+investigation that moves the number by an order of magnitude, and 213 rec/s is
+a throughput many real deployments would accept.
+
+### 11.3 Three things it does not buy
+
+**The advantage is entirely contingent on batching.** At batch 1 the GPU costs
+29.4 ms — statistically indistinguishable from the 31.0 ms CPU ONNX graph
+*batched*. The 3.9× exists only at batch 8 and above. The processor already
+consumes in batches (`--batch-size 500`), so this is reachable, but it couples
+Tier 2 throughput to batch fill and adds queuing latency that the per-record
+figure hides.
+
+**The tiering claim is about cost, not latency, and this does not obviously
+help it.** Tiering pays if escalating a subset to an expensive model is cheaper
+than running it on everything. A GPU instance costs a multiple of a comparable
+CPU instance, and if that multiple exceeds 3.9× then moving Tier 2 to a GPU is a
+cost *regression* even though every latency number improves. Settling this needs
+real prices for whatever the deployment target actually is — it is not
+answerable from these measurements, and it should not be asserted either way
+without them.
+
+**This is a laptop GPU with nothing else on it.** No Kafka, no Postgres, no
+audit writer competing for the host; a single process with exclusive use of the
+card. A datacenter part would very likely be faster, but a shared one under
+contention would not.
+
+### 11.4 Limits
+
+- One GPU, one model, fp32 only. **int8 and ONNX were deliberately skipped on
+  cuda** — dynamic quantization dispatches to FBGEMM (a CPU backend,
+  `gliner/model.py:614`) and the ONNX graph loads on the CPU execution
+  provider, so both would have reported CPU timings under a GPU heading.
+- **TensorRT and `onnxruntime-gpu` are untested**, and are the obvious next
+  lever if 6.8× still is not enough.
+- fp16/bf16 untested. On sm_86 that is plausibly another large factor and,
+  unlike int8, is not known to break calibration — but "plausibly" is not a
+  measurement.
+- `torch` and `gliner` are **not declared** in `requirements.txt` or
+  `pyproject.toml`; they were installed ad hoc for these probes. Correct while
+  Tier 2 is unshipped, a packaging gap the moment it is not — and a GPU build
+  makes the install platform-specific, which is a heavier dependency decision
+  than a pure-Python one.
