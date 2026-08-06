@@ -3,3 +3,9 @@ psycopg[binary]>=3.2
 faker>=26.0
 python-dotenv>=1.0
 tqdm>=4.66
+
+# Tier 2 encoder. Plain install pulls the CPU build of torch; for GPU (measured
+# at 8.03 ms/record against 31.0 on CPU) install it from the CUDA index first:
+#   pip install --index-url https://download.pytorch.org/whl/cu130 torch==2.13.0+cu130
+torch>=2.13
+gliner>=0.2.28

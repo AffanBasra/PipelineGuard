@@ -979,3 +979,32 @@ envelope. They were never a verdict on the design.
   over every string field. The design calls for dispatch: identifiers to rules,
   free text to the encoder, `account_holder` to a schema rule with no model at
   all.
+
+### 11.5 Correction — 8.03 ms/record was one label set, production needs two
+
+`probe_ner_runtime.py` times a single label list (`LABELS["ADDRESS"]`). The
+processor needs PERSON **and** ADDRESS, and the obvious economy — one pass over
+all six labels — was measured and rejected:
+
+| | combined, 1 pass | separate, 2 passes |
+|---|---:|---:|
+| PERSON coverage | 90.9% | **99.4%** |
+| ADDRESS coverage | 70.5% | **84.7%** |
+
+The labels compete for the same spans, so folding them into one call costs 8.5
+and 14.2 points. Given the standing decision not to trade coverage, Tier 2 runs
+one pass per label group and costs proportionally more.
+
+Measured through `Tier2Detector.detect_batch` on the same GPU, 237 texts at
+batch 8: **17.7 ms/record**, including the Python overhead of building findings.
+
+| | ms/record | at 50% escalation | gap to 1,450 |
+|---|---:|---:|---:|
+| §11.2 as published | 8.03 | 213 rec/s | 6.8× |
+| **actual** | **17.7** | **~105 rec/s** | **~14×** |
+
+§11.2's table is therefore optimistic by roughly 2×. The GPU is still the lever
+it was — CPU at two passes lands near 31 rec/s — but the honest gap is ~14×.
+
+The same correction applies to §7's CPU figures, which were also single-label:
+ONNX fp32's 31.0 ms is ~62 ms for a production pass.

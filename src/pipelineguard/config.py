@@ -22,5 +22,14 @@ class Settings:
     topic_txn_quarantine: str = os.getenv("TOPIC_TXN_QUARANTINE", "txn.quarantine")
     consumer_group: str = os.getenv("CONSUMER_GROUP", "pipelineguard-processor")
 
+    # Tier 2. Threshold 0.25 is where this model operates best, not a default:
+    # see tier2-detection-findings.md §6.1. Device falls back to CPU when CUDA
+    # is unavailable. Batch 8 saturates throughput; larger only costs VRAM.
+    tier2_enabled: bool = os.getenv("TIER2_ENABLED", "false").lower() == "true"
+    tier2_model: str = os.getenv("TIER2_MODEL", "urchade/gliner_multi_pii-v1")
+    tier2_threshold: float = float(os.getenv("TIER2_THRESHOLD", "0.25"))
+    tier2_device: str = os.getenv("TIER2_DEVICE", "auto")
+    tier2_batch_size: int = int(os.getenv("TIER2_BATCH_SIZE", "8"))
+
 
 settings = Settings()
