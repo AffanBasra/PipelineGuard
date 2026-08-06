@@ -67,6 +67,7 @@ from confluent_kafka import Consumer, KafkaError, KafkaException, Producer, Topi
 
 from pipelineguard.audit import AuditRecord, AuditWriter
 from pipelineguard.config import settings
+from pipelineguard.detectors.schema_rules import DECLARED_PII, SchemaDetector
 from pipelineguard.detectors.tier1_rules import RulesDetector
 from pipelineguard.models import Envelope, Finding
 from pipelineguard.observability import StatsReporter, setup_logging
@@ -74,6 +75,11 @@ from pipelineguard.observability import StatsReporter, setup_logging
 log = logging.getLogger("pipelineguard.processor")
 
 _FAILURE_DETAIL_MAXLEN = 500
+
+# Stateless and policy-only: no compiled patterns, no model, nothing to warm
+# up. A module-level instance keeps process_message's signature unchanged and
+# costs nothing per message.
+_SCHEMA = SchemaDetector()
 
 # The group coordinator moved this consumer's assignment under it mid-commit —
 # routine during a rebalance, not a sign the coordinator is unreachable.
@@ -230,9 +236,19 @@ def process_message(msg, detector: RulesDetector) -> Outcome:
                 f"payload is {type(envelope.payload).__name__}, expected object"
             )
 
+        # Dispatch by field, not a single detector over everything. A declared
+        # field is redacted on the strength of the schema; only the rest is
+        # actually detected. The two are deliberately exclusive: the schema
+        # finding already spans the whole field, so any rule hit inside it would
+        # be a redundant overlapping span, and redact() rewrites spans
+        # right-to-left assuming they do not overlap.
         findings_by_field: dict[str, list[Finding]] = {}
         for field, value in envelope.payload.items():
-            if isinstance(value, str):
+            if not isinstance(value, str):
+                continue
+            if field in DECLARED_PII:
+                findings_by_field[field] = _SCHEMA.detect(value, field)
+            else:
                 findings_by_field[field] = detector.detect(value, field)
 
         all_findings = [f for fs in findings_by_field.values() for f in fs]

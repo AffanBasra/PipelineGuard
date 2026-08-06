@@ -54,6 +54,56 @@ def test_message_with_confident_pii_is_redacted(detector, pii_payload):
     assert len(outcome.findings) >= 4
 
 
+def test_declared_field_is_redacted_not_detected(detector, pii_payload):
+    """account_holder holds a name in every record by contract, and Tier 1 has
+    no name rule — so before the schema rule existed this field reached the
+    clean topic verbatim. Asserts the value is gone, not merely that a finding
+    was recorded."""
+    outcome = P.process_message(make_message(pii_payload), detector)
+
+    assert outcome.action == "redacted"
+    assert payload_of(outcome)["account_holder"] == "[PERSON_NAME]"
+    assert "Ayesha Malik" not in outcome.out_bytes.decode()
+
+    declared = [f for f in outcome.findings if f.field == "account_holder"]
+    assert len(declared) == 1
+    assert declared[0].entity_type == "PERSON_NAME"
+    assert declared[0].confidence == 1.0
+
+
+def test_declared_field_is_not_also_rule_scanned(detector):
+    """The schema span already covers the whole field, so a rule hit inside it
+    would be a redundant overlapping span — and redact() rewrites spans
+    right-to-left assuming they do not overlap, so two spans here would corrupt
+    the output rather than merely duplicate work."""
+    payload = {"account_holder": "ayesha@example.com"}
+    outcome = P.process_message(make_message(payload), detector)
+
+    assert len(outcome.findings) == 1
+    assert outcome.findings[0].entity_type == "PERSON_NAME"
+    assert payload_of(outcome)["account_holder"] == "[PERSON_NAME]"
+
+
+def test_empty_declared_field_stays_clean(detector):
+    """No name present, so nothing to redact and no marker to invent."""
+    outcome = P.process_message(make_message({"account_holder": ""}), detector)
+
+    assert outcome.action == "clean"
+    assert outcome.findings == []
+    assert payload_of(outcome)["account_holder"] == ""
+
+
+def test_undeclared_fields_still_go_through_rules(detector):
+    """The dispatch must not have swallowed the normal path: a CNIC in an
+    ordinary field is still detected by Tier 1."""
+    payload = {"note": "CNIC 35202-1234567-1", "account_holder": "Ayesha Malik"}
+    outcome = P.process_message(make_message(payload), detector)
+
+    by_field = {f.field for f in outcome.findings}
+    assert by_field == {"note", "account_holder"}
+    assert "35202-1234567-1" not in outcome.out_bytes.decode()
+
+
 def test_message_with_uncertain_pii_is_quarantined(detector, pii_payload):
     """A checksum-failing IBAN yields confidence < 1.0, which must route the
     whole record to quarantine for review."""
