@@ -29,7 +29,7 @@ from conftest import (
     raw_message,
 )
 from pipelineguard import processor as P
-from pipelineguard.models import Envelope
+from pipelineguard.models import Envelope, Finding, Tier
 
 
 def payload_of(outcome) -> dict:
@@ -102,6 +102,143 @@ def test_undeclared_fields_still_go_through_rules(detector):
     by_field = {f.field for f in outcome.findings}
     assert by_field == {"note", "account_holder"}
     assert "35202-1234567-1" not in outcome.out_bytes.decode()
+
+
+# --------------------------------------------------------------------------- #
+# Tier 2 injection, span merging, free-text dispatch
+# --------------------------------------------------------------------------- #
+def t2(field, start, end, etype="PERSON", conf=0.87):
+    """An encoder finding, as main()'s batched pre-pass would supply it."""
+    return Finding(
+        entity_type=etype, field=field, span_start=start, span_end=end,
+        tier=Tier.ENCODER, confidence=conf,
+    )
+
+
+def test_injected_tier2_findings_redact_free_text(detector):
+    memo = "Transfer to Ayesha Malik"
+    outcome = P.process_message(
+        make_message({"memo": memo}), detector,
+        {"memo": [t2("memo", memo.index("Ayesha"), len(memo))]},
+    )
+
+    assert outcome.action == "redacted"
+    assert payload_of(outcome)["memo"] == "Transfer to [PERSON]"
+    assert "Ayesha Malik" not in outcome.out_bytes.decode()
+
+
+def test_tier2_findings_do_not_quarantine(detector):
+    """Encoder scores are continuous, so the old `confidence < 1.0` predicate
+    would send every record containing a name to review."""
+    outcome = P.process_message(
+        make_message({"memo": "Paid Ayesha Malik"}), detector,
+        {"memo": [t2("memo", 5, 17, conf=0.31)]},
+    )
+    assert outcome.action == "redacted"
+
+
+def test_tier1_checksum_failure_still_quarantines(detector):
+    """The narrowing must not have disabled the Tier 1 case it exists for."""
+    outcome = P.process_message(
+        make_message({"iban_from": "PK99MEZN5748718428058488"}), detector,
+    )
+    assert outcome.action == "quarantined"
+
+
+def test_free_text_gets_both_tiers(detector):
+    """A memo carries embedded identifiers as well as names."""
+    memo = "Refund to Ayesha Malik, call 03001234567"
+    outcome = P.process_message(
+        make_message({"memo": memo}), detector,
+        {"memo": [t2("memo", memo.index("Ayesha"), memo.index(","))]},
+    )
+
+    tiers = {f.tier for f in outcome.findings}
+    assert tiers == {Tier.RULES, Tier.ENCODER}
+    body = outcome.out_bytes.decode()
+    assert "Ayesha Malik" not in body and "03001234567" not in body
+
+
+def test_overlapping_spans_do_not_corrupt_output(detector):
+    """Tier 2 flags a name inside the local part of an address Tier 1 claims as
+    EMAIL. Naive right-to-left rewriting would emit nested garbage, and dropping
+    the narrower span would leave the leading characters in the clear."""
+    memo = "Refund processed, notify at ayesha.malik@example.com"
+    email_start = memo.index("ayesha")
+    outcome = P.process_message(
+        make_message({"memo": memo}), detector,
+        {"memo": [t2("memo", email_start, email_start + len("ayesha.malik"))]},
+    )
+
+    redacted = payload_of(outcome)["memo"]
+    assert redacted == "Refund processed, notify at [EMAIL+PERSON]"
+    assert "ayesha" not in redacted
+    assert redacted.count("[") == 1
+
+
+def test_merge_spans_unions_partial_overlap():
+    """The leak case stated directly: dropping either span leaves characters."""
+    findings = [
+        Finding("EMAIL", "memo", 10, 30, Tier.RULES, 1.0),
+        Finding("PERSON", "memo", 5, 15, Tier.ENCODER, 0.9),
+    ]
+    assert P.merge_spans(findings) == [(5, 30, "EMAIL+PERSON")]
+
+
+def test_merge_spans_keeps_touching_spans_separate():
+    findings = [
+        Finding("EMAIL", "memo", 0, 5, Tier.RULES, 1.0),
+        Finding("PHONE_PK", "memo", 5, 10, Tier.RULES, 1.0),
+    ]
+    assert P.merge_spans(findings) == [(0, 5, "EMAIL"), (5, 10, "PHONE_PK")]
+
+
+def test_empty_memo_is_clean(detector):
+    outcome = P.process_message(make_message({"memo": ""}), detector, {})
+    assert outcome.action == "clean"
+    assert outcome.findings == []
+
+
+# --------------------------------------------------------------------------- #
+# free_text_fields — the best-effort pre-pass
+# --------------------------------------------------------------------------- #
+def test_free_text_fields_extracts_only_free_text():
+    raw = make_message(
+        {"memo": "Paid Ayesha", "channel": "atm", "amount_pkr": 5.0}
+    ).value()
+    assert P.free_text_fields(raw) == {"memo": "Paid Ayesha"}
+
+
+@pytest.mark.parametrize("value", ["", "   ", "\n\t"])
+def test_free_text_fields_skips_blank(value):
+    """Blank memos must never enter the model batch."""
+    assert P.free_text_fields(make_message({"memo": value}).value()) == {}
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        None,
+        b"",
+        b"not json",
+        b"{}",                                  # no payload key
+        b'{"payload": "a string"}',             # payload not a dict
+        b'{"payload": {"memo": 42}}',           # memo not a string
+        "\udcff".encode("utf-8", "surrogatepass"),   # undecodable bytes
+    ],
+)
+def test_free_text_fields_never_raises(raw):
+    """Unreadable means absent from the batch, not an exception — process_message
+    still quarantines the message through the normal fail-closed path."""
+    assert P.free_text_fields(raw) == {}
+
+
+def test_unreadable_message_still_quarantines_after_prepass(detector):
+    """The pre-pass declining to read a message must not stop it being handled."""
+    assert P.free_text_fields(b"not json") == {}
+    outcome = P.process_message(StubMessage(b"not json"), detector, {})
+    assert outcome.action == "quarantined"
+    assert outcome.failure is not None
 
 
 def test_message_with_uncertain_pii_is_quarantined(detector, pii_payload):

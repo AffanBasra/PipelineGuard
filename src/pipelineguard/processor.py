@@ -57,6 +57,7 @@ Verify end-to-end:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import time
 import uuid
@@ -67,9 +68,13 @@ from confluent_kafka import Consumer, KafkaError, KafkaException, Producer, Topi
 
 from pipelineguard.audit import AuditRecord, AuditWriter
 from pipelineguard.config import settings
-from pipelineguard.detectors.schema_rules import DECLARED_PII, SchemaDetector
+from pipelineguard.detectors.schema_rules import (
+    DECLARED_PII,
+    FREE_TEXT,
+    SchemaDetector,
+)
 from pipelineguard.detectors.tier1_rules import RulesDetector
-from pipelineguard.models import Envelope, Finding
+from pipelineguard.models import Envelope, Finding, Tier
 from pipelineguard.observability import StatsReporter, setup_logging
 
 log = logging.getLogger("pipelineguard.processor")
@@ -167,19 +172,62 @@ def is_rebalance_error(exc: KafkaException) -> bool:
     return exc.args[0].code() in _TOLERATED_COMMIT_ERRORS
 
 
+def merge_spans(findings: list[Finding]) -> list[tuple[int, int, str]]:
+    """Overlapping findings unioned into disjoint spans, ascending.
+
+    Two tiers scan a memo and can claim overlapping characters — Tier 2 flags a
+    name inside a span Tier 1 already claims as EMAIL. Dropping the narrower one
+    would leak: Tier 1 [10,30] with Tier 2 [5,15] leaves [5,10] in the clear.
+
+    Collapses spans for the rewrite only; the findings themselves stay intact
+    for the audit.
+    """
+    if not findings:
+        return []
+    merged: list[tuple[int, int, set[str]]] = []
+    for f in sorted(findings, key=lambda x: (x.span_start, x.span_end)):
+        # Strict overlap only, so touching spans stay as "[EMAIL][PHONE]".
+        if merged and f.span_start < merged[-1][1]:
+            start, end, types = merged[-1]
+            merged[-1] = (start, max(end, f.span_end), types | {f.entity_type})
+        else:
+            merged.append((f.span_start, f.span_end, {f.entity_type}))
+    return [(s, e, "+".join(sorted(t))) for s, e, t in merged]
+
+
 def redact(text: str, findings: list[Finding]) -> str:
     """Replace each finding's span with [ENTITY_TYPE].
 
     Right-to-left: each replacement changes the string length, so applying them
-    left-to-right would invalidate every span after the first.
+    left-to-right would invalidate every span after the first. merge_spans()
+    returns spans ascending, so iterating in reverse preserves that property
+    while guaranteeing no span is rewritten twice.
     """
-    for finding in sorted(findings, key=lambda x: x.span_start, reverse=True):
-        text = (
-            text[: finding.span_start]
-            + f"[{finding.entity_type}]"
-            + text[finding.span_end :]
-        )
+    for start, end, label in reversed(merge_spans(findings)):
+        text = text[:start] + f"[{label}]" + text[end:]
     return text
+
+
+def free_text_fields(raw: bytes | None) -> dict[str, str]:
+    """Free-text values in one raw message, for the batched Tier 2 pre-pass.
+
+    Best-effort, never authoritative: anything unreadable yields {} and is absent
+    from the model batch. process_message still quarantines that message through
+    the existing fail-closed path, so this needs no error policy of its own.
+
+    Empty values are skipped — a record with no free text costs Tier 2 nothing.
+    """
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw.decode("utf-8"))["payload"]
+        return {
+            field: value
+            for field, value in payload.items()
+            if field in FREE_TEXT and isinstance(value, str) and value.strip()
+        }
+    except Exception:  # noqa: BLE001 — see docstring: unreadable means absent
+        return {}
 
 
 @dataclass
@@ -191,8 +239,17 @@ class Outcome:
     failure: tuple[str, str] | None      # (exception class, detail) if fail-closed
 
 
-def process_message(msg, detector: RulesDetector) -> Outcome:
+def process_message(
+    msg,
+    detector: RulesDetector,
+    tier2_findings: dict[str, list[Finding]] | None = None,
+) -> Outcome:
     """Parse, detect, redact and route one message. Never raises.
+
+    `tier2_findings` maps field -> encoder findings already computed for this
+    message by main()'s batched pre-pass. Injected rather than detected here
+    because the encoder is only worth its cost in batches (8.03 ms/record at
+    batch 8 against 29.4 at batch 1), and that keeps this function pure.
 
     Any unexpected error routes to quarantine rather than propagating: fail
     closed, never toward the clean topic. This is what makes crash-and-replay
@@ -236,18 +293,20 @@ def process_message(msg, detector: RulesDetector) -> Outcome:
                 f"payload is {type(envelope.payload).__name__}, expected object"
             )
 
-        # Dispatch by field, not a single detector over everything. A declared
-        # field is redacted on the strength of the schema; only the rest is
-        # actually detected. The two are deliberately exclusive: the schema
-        # finding already spans the whole field, so any rule hit inside it would
-        # be a redundant overlapping span, and redact() rewrites spans
-        # right-to-left assuming they do not overlap.
+        # Dispatch by field. A declared field is redacted on the schema alone —
+        # exclusive of rules, since its span already covers the whole value.
         findings_by_field: dict[str, list[Finding]] = {}
         for field, value in envelope.payload.items():
             if not isinstance(value, str):
                 continue
             if field in DECLARED_PII:
                 findings_by_field[field] = _SCHEMA.detect(value, field)
+            elif field in FREE_TEXT:
+                # Both tiers: rules for the embedded identifiers, encoder for
+                # the names. merge_spans() resolves any overlap at redaction.
+                findings_by_field[field] = detector.detect(value, field) + (
+                    tier2_findings or {}
+                ).get(field, [])
             else:
                 findings_by_field[field] = detector.detect(value, field)
 
@@ -262,9 +321,11 @@ def process_message(msg, detector: RulesDetector) -> Outcome:
             )
             return Outcome(envelope, [], "clean", out.to_bytes(), None)
 
-        if any(f.confidence < 1.0 for f in all_findings):
-            # Uncertain detection -> human review. Forward the ORIGINAL bytes so
-            # the reviewer sees exactly what arrived.
+        # Tier 1 only: a sub-1.0 rule finding means a checksum failed, which is a
+        # discrete defect worth a human. Tier 2 scores are continuous, so
+        # including them would quarantine every record containing a name.
+        if any(f.tier == Tier.RULES and f.confidence < 1.0 for f in all_findings):
+            # Forward the ORIGINAL bytes so the reviewer sees what arrived.
             return Outcome(envelope, all_findings, "quarantined", raw, None)
 
         redacted_payload = {
