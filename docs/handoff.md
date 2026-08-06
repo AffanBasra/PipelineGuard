@@ -402,7 +402,15 @@ conditional Go rewrite of one consumer.
 - Topic retention is unconfigured; quarantine plausibly warrants longer
   retention than clean, for compliance.
 - Quarantine is terminal — no reviewer workflow, and no distinction between a
-  record that failed once and one that fails permanently.
+  record that failed once and one that fails permanently. **The routing rule for
+  Tier 2 is now decided** (2026-08-06): no confidence band, because every graded
+  boundary was measured at 3–7% queue yield — positives are masked *more* than
+  negatives, so size cannot separate correct redaction from damage. Records are
+  **emitted and flagged**, not blocked (the data is already safe; diverting it
+  costs availability for no privacy gain), and the only flag is full
+  saturation — redaction left nothing at all. That is ~1% of records with no
+  false flags, and it knowingly leaves 64% of over-redaction invisible. See
+  [tier2-detection-findings.md](tier2-detection-findings.md) §10.
 - `schema_version` is validated and stored but nothing branches on it. Recorded
   as a deliberate forward-compatibility hook.
 - Sensitive-attribute PII (GDPR Article 9 categories — race, religion,
