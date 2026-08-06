@@ -293,7 +293,18 @@ field content.
 > is an open design question; note that ~50% of memos genuinely contain a name,
 > so even a perfect oracle would escalate 50% and reach only ~43 rec/s. The
 > cost has to come out of the model, not the predicate. See
-> [tier2-detection-findings.md](tier2-detection-findings.md) §6.3. Measure in **bytes**, not fields, since encoder cost scales with
+> [tier2-detection-findings.md](tier2-detection-findings.md) §6.3.
+>
+> **Updated 2026-08-06 — the model got cheaper, so this arithmetic moved.**
+> CPU runtime optimization gets Tier 2 to 31.0 ms (ONNX fp32; int8 was refuted
+> in §8), and a GPU gets it to 8.03 ms at batch 8 with identical accuracy. At
+> the same 50% escalation floor that is **213 rec/s on GPU against 62 on CPU** —
+> the gap to 1,450 narrows from 23× to 6.8×. The predicate is still not the
+> lever and this rule is still unviable as written, but "escalation must stay
+> near 1%" is no longer the constraint; on GPU it is nearer 50%, which is
+> exactly where the memo-shaped workload sits. Note the unsettled part: tiering
+> is a claim about **cost**, and a GPU instance costing more than 3.9× a CPU one
+> would make this a cost regression with better latency. See §11. Measure in **bytes**, not fields, since encoder cost scales with
 sequence length. Run three configurations over the same corpus — Tier 2 on
 everything (ceiling recall, worst cost), Tier 1 only (floor recall, best
 cost), and tiered — then report recall retained versus model-only, latency
