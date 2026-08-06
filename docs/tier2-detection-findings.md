@@ -1008,3 +1008,93 @@ it was — CPU at two passes lands near 31 rec/s — but the honest gap is ~14×
 
 The same correction applies to §7's CPU figures, which were also single-label:
 ONNX fp32's 31.0 ms is ~62 ms for a production pass.
+
+---
+
+## 13. ADDRESS dropped from Tier 2 — a capability with no field
+
+§3 and §6.2 established the address-form penalty as the strongest finding on
+this branch: −21 points for Urdu-form addresses on urchade, −18 on nvidia, two
+independent models agreeing. It is also the only place the Pakistani-locale
+angle is genuinely differentiated, since §2 refuted the equivalent claim for
+names.
+
+None of that is in question here. What was never checked is whether anything in
+the pipeline **contains** an address.
+
+### 13.1 Nothing does
+
+All ten `MEMO_TEMPLATES` in `generator/transactions.py`, in full:
+
+```
+Transfer to {name}              Zakat contribution      Salary for {name}
+Rent payment from {name}, ...   Utility bill payment    Eidi for {name}
+Sent by {name} (CNIC {cnic})    Loan installment        Refund ... {email}
+Payment against order #{inv}, contact {phone}
+```
+
+No address placeholder, and `make_transaction()` has no address field. A grep
+for `address|ghar|gali|makan|sector|house` across the whole generator returns
+nothing. So on this stream the ADDRESS pass has **no true positive available to
+it** — every span it emits is false by construction.
+
+### 13.2 Measured: 30% false-positive rate, mostly on names
+
+200 generated memos, urchade at threshold 0.25:
+
+| | fired on |
+|---|---:|
+| PERSON_NAME | 119 (60%) |
+| **ADDRESS** | **60 (30%)** — all false |
+
+```
+'Transfer to Muhammad Gill'             -> ADDRESS 'Muhammad Gill'         0.493
+'Rent payment from Eman Syed, ...'      -> ADDRESS 'Eman Syed'             0.938
+'Rent payment from Hamza Butt, ...'     -> ADDRESS 'Hamza Butt'            0.973
+'Sent by Rizwan Malik (CNIC 37320-...)' -> ADDRESS 'CNIC 37320-6821782-0'  0.408
+```
+
+It re-tags people's names as addresses, some at 0.97 — high enough that no
+threshold change removes them. Because those spans overlap what PERSON_NAME
+already found, `merge_spans` unions them and the redacted *text* is mostly
+unchanged; the damage is to the audit trail, which records ADDRESS findings for
+records containing no address, and to cost.
+
+### 13.3 Cost
+
+The ADDRESS labels were one of two forward passes. Measured by interleaving both
+configurations in one process (cross-process comparison is invalid on a laptop
+GPU, which throttles under sustained load — an earlier single-shot reading gave
+20.7 ms for *less* work):
+
+| config | median ms/record | samples |
+|---|---:|---|
+| PERSON + ADDRESS | 17.7 | 13.6–22.0 |
+| **PERSON only** | **7.2** | 6.7–13.4 |
+
+**59% saved.** More than the ~50% a pass-count argument predicts, because the
+spurious spans also cost post-processing. Variance is wide in both; medians only.
+
+Throughput, against the 0.69 ms/record Tier 1 baseline of 1,450 msg/s. Note the
+escalation rate is **100%, not the 50% used in §11.2** — dispatch is on "is this
+field non-empty free text", not "does it contain a name", and every template
+this generator emits produces a non-empty memo:
+
+| | ms/record | throughput | gap to 1,450 |
+|---|---:|---:|---:|
+| with ADDRESS | 18.4 | 54 rec/s | 27× |
+| **without** | **7.9** | **127 rec/s** | **11×** |
+
+### 13.4 What this does and does not decide
+
+- **PERSON coverage is unchanged at 99.4%**, re-measured after the removal.
+- The §3/§6.2 finding stands. It is a real property of these models, recorded
+  and reproducible; it is simply not load-bearing for a stream with no
+  addresses in it.
+- **Restoring ADDRESS is one line** in `LABEL_GROUPS`, and a test pins its
+  absence so it cannot drift back silently.
+- A *declared* address field would need none of this — it is `account_holder`
+  again, a schema rule at zero cost and 100% coverage. Only addresses embedded
+  in free text need a model.
+- Whether real Pakistani bank memos contain inline addresses is **unmeasured**,
+  and is the question that decides if this ever comes back.

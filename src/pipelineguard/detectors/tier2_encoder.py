@@ -19,13 +19,18 @@ log = logging.getLogger("pipelineguard.tier2")
 # PERSON_NAME matches what the schema rule emits, so the two arms of the
 # dispatch stay comparable in the audit.
 #
-# One forward pass PER GROUP, not one pass over all six labels. Measured: the
-# combined pass halves the cost and drops PERSON coverage 99.4% -> 90.9% and
-# ADDRESS 84.7% -> 70.5%, because the labels compete for the same spans. Two
-# passes is the price of the coverage §6 reports.
+# One forward pass PER GROUP, never one pass over all labels at once: combining
+# them halves the cost but drops PERSON coverage 99.4% -> 90.9%, because the
+# labels compete for the same spans.
+#
+# ADDRESS labels (address, street_address, location) are deliberately absent.
+# No memo template produces an address and there is no address field, so on this
+# stream the pass could only ever be wrong -- measured at 30% false-positive
+# rate over 200 generated memos, mostly re-tagging names it had already found.
+# See tier2-detection-findings.md §13. Restoring it is one line, plus a corpus
+# that actually contains addresses.
 LABEL_GROUPS = {
     "PERSON_NAME": ["person", "first_name", "last_name"],
-    "ADDRESS": ["address", "street_address", "location"],
 }
 
 _WARMUP_TEXT = "Transfer to Ayesha Malik, House 12, Street 4, F-8/3 Islamabad"

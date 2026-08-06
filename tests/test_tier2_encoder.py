@@ -60,11 +60,20 @@ def test_requires_load_before_use():
 
 def test_maps_labels_to_entity_types(detector):
     findings = detector.detect("Ayesha went to Islamabad", "memo")
-    by_type = {f.entity_type for f in findings}
-    assert by_type == {"PERSON_NAME", "ADDRESS"}
+    assert {f.entity_type for f in findings} == {"PERSON_NAME"}
     assert all(f.tier == Tier.ENCODER for f in findings)
     assert all(f.field == "memo" for f in findings)
     assert all(0.0 < f.confidence <= 1.0 for f in findings)
+
+
+def test_address_labels_are_never_requested(detector):
+    """No memo template produces an address and there is no address field, so
+    this pass could only ever be wrong — measured at a 30% false-positive rate
+    over 200 generated memos, mostly re-tagging names it had already found. It
+    was half of Tier 2's cost, so pin the removal rather than trust it."""
+    detector.detect_batch({0: {"memo": "Ayesha went to Islamabad"}})
+    requested = {label for _n, labels in detector._model.calls for label in labels}
+    assert requested.isdisjoint({"address", "street_address", "location"})
 
 
 def test_spans_point_at_the_right_characters(detector):
@@ -75,7 +84,7 @@ def test_spans_point_at_the_right_characters(detector):
 
 def test_one_pass_per_label_group(detector):
     """Groups are run separately on purpose: a single combined pass drops
-    PERSON coverage 99.4% -> 90.9% and ADDRESS 84.7% -> 70.5%."""
+i    PERSON coverage 99.4% -> 90.9%, because labels compete for the same spans."""
     detector.detect_batch({0: {"memo": "Ayesha"}})
     assert len(detector._model.calls) == len(LABEL_GROUPS)
     assert {c[1] for c in detector._model.calls} == {
@@ -100,8 +109,9 @@ def test_results_land_on_the_right_message(detector):
         9: {"memo": "Islamabad only"},
     })
     assert 7 not in out                      # no findings -> key omitted
+    assert 9 not in out                      # ADDRESS labels are not requested
     assert {f.entity_type for f in out[8]["memo"]} == {"PERSON_NAME"}
-    assert {f.entity_type for f in out[9]["memo"]} == {"ADDRESS"}
+    assert out[8]["memo"][0].span_start == 0
 
 
 def test_empty_input_makes_no_calls(detector):
@@ -111,6 +121,6 @@ def test_empty_input_makes_no_calls(detector):
 
 
 def test_multiple_fields_per_message(detector):
-    out = detector.detect_batch({0: {"memo": "Ayesha", "note": "Islamabad"}})
+    out = detector.detect_batch({0: {"memo": "Ayesha here", "note": "Ayesha there"}})
     assert set(out[0]) == {"memo", "note"}
     assert out[0]["note"][0].field == "note"
