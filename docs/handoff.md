@@ -155,9 +155,16 @@ marked settled / provisional / open. The load-bearing ones:
   bool.
 - **Detection logic is pure functions**, which is why the test suite needs no
   infrastructure.
-- **Tier assignment by cost, not capability** — rules for anything with a
-  checkable format, encoder for contextual entities, LLM only for ambiguous
-  spans.
+- **Tier assignment by capability; cost decides deployment** — rules for
+  anything with a checkable format, encoder for contextual entities (names,
+  addresses) *because no rule can match them at all*, LLM only for ambiguous
+  spans. Within the tools that can do a job, pick the cheapest. Corrected
+  2026-08-06 from "by cost, not capability", which read as though throughput
+  measurements could argue Tier 2 out of the design; they only bound it. See
+  `decisions.md`.
+- **Tier 1 → Tier 2 is dispatch, not escalation** — the schema says which
+  fields are free text, so it is known before either detector runs. Tier 2 →
+  Tier 3 is real escalation (same span, promoted on uncertainty).
 
 ---
 
@@ -284,6 +291,17 @@ self-constructed.
 **The escalation-rate measurement**, which is the point of the tiering claim:
 escalate a field to Tier 2 unless Tier 1's validated findings cover the entire
 field content.
+
+> **Retired as a category error (2026-08-06).** There is no Tier 1 → Tier 2
+> escalation to measure. This rule predicts, from Tier 1's output, something the
+> schema already states: whether the field is free text. Tier 1 has no name
+> rule, so a memo is not a record it was *uncertain* about — it is one it has no
+> opinion on, and absence of a finding is silence rather than low confidence.
+> The relationship is **dispatch by field type**, fixed before either detector
+> runs. What replaces this measurement is the throughput envelope in §11:
+> free-text redaction on, versus off. The two blockquotes below are kept because
+> the arithmetic in them is still correct and still bounds deployment — but they
+> answer "what does this cost", not "is the architecture right".
 
 > **This rule is known to be unviable as written (2026-08-05).** Tier 2 costs
 > 44.6 ms per record batched, against a measured 0.69 ms per-record budget, so

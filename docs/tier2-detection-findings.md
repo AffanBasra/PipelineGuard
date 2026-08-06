@@ -912,3 +912,70 @@ contention would not.
   Tier 2 is unshipped, a packaging gap the moment it is not — and a GPU build
   makes the install platform-specific, which is a heavier dependency decision
   than a pure-Python one.
+
+---
+
+## 12. What the cost numbers were, and were not, evidence for
+
+§6.3, §7 and §11 are written as though throughput were adjudicating the
+architecture: "65× the entire budget", "the gap does not close", "tiering only
+pays below ~1.55% escalation". That framing came from a decision entry titled
+*"Tier assignment by cost, not by capability"* — a title that argues the
+opposite of its own body, which reserves Tier 2 for *"entities with no format to
+match"*. Corrected in `decisions.md` on 2026-08-06.
+
+**Tier 2 exists because free text has no format to match.** No rule finds
+`Ayesha Malik` in a memo — §2 measured that Tier 1's entire vocabulary
+(CNIC, IBAN, phone, email) has nothing to say about names, and a memo produces
+no findings at all rather than uncertain ones. Free-text redaction is the
+product. It cannot be optimised away, because there is no cheaper thing that
+does it.
+
+So every cost figure in this document keeps its value and changes its job:
+
+| section | measured | what it actually bounds |
+|---|---|---|
+| §6.3 | 44.6 ms/record | throughput with free-text redaction on |
+| §7 | ONNX 31.0, int8 refuted | how much of that is recoverable on CPU |
+| §11 | GPU 8.03 ms | how much is recoverable at all |
+
+None of them is evidence that Tier 2 is the wrong design, and §7's "the gap does
+not close" should be read as *"this is what the capability costs"*, not *"this
+capability failed to justify itself"*. **The honest comparison is not 213 rec/s
+against 1,450.** 1,450 is the throughput of a pipeline that leaks every name in
+every memo — it is not a competing configuration, it is the same product with
+its main function switched off. The real statement is:
+
+> Structured identifiers cost 0.69 ms/record via rules. Free-text redaction
+> costs an additional 8.03 ms/record on a GPU, 31.0 on CPU. Throughput is
+> ~213 rec/s with free-text redaction enabled at the 50% memo rate, ~1,450
+> without it.
+
+That is a capability/cost curve a reader can price against their own workload,
+and it is a considerably stronger claim than the tiering argument it replaces —
+because it is true, and the tiering argument was undermined by §6.3 onward.
+
+### 12.1 What this does not excuse
+
+The reframe is not permission to stop caring about throughput. Capability that
+cannot be afforded on the target stream is not capability, and 213 rec/s is a
+real ceiling — a workload needing 5,000 msg/s is not served by a better
+framing. §11.3's cost caveat also survives intact: if a GPU instance costs more
+than 3.9× a CPU one, the GPU is a cost regression that merely looks faster.
+
+What changes is which question those numbers answer. They size the deployment
+envelope. They were never a verdict on the design.
+
+### 12.2 Consequences elsewhere
+
+- **The escalation predicate stops being an open question.** Dispatch is by
+  field type, which the schema fixes before either detector runs, so there is
+  nothing to predict. The 50% figure was only ever a problem for a cost
+  argument that no longer carries the weight. Retired in `handoff.md` §8.
+- **§10.4 is promoted from an aside to a reason.** Pointing Tier 2 at
+  identifier fields masks 50% of their characters, so dispatch is not just
+  cheaper than scanning every field — it is more correct.
+- **`processor.py:234` is now wrong in a stateable way.** It runs one detector
+  over every string field. The design calls for dispatch: identifiers to rules,
+  free text to the encoder, `account_holder` to a schema rule with no model at
+  all.
