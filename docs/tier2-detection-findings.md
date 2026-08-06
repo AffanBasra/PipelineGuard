@@ -664,3 +664,156 @@ returned whole as a PERSON. The Roman-Urdu penalty is **2× English, not 2.6×**
   wrong spelling.
 - The two defects are recorded rather than silently fixed, because §2's
   committed numbers were measured on the text as it stands.
+
+---
+
+## 10. Which records are worth a human? Only the destroyed ones
+
+§8 measured over-redaction and the decision that followed was to **keep
+threshold 0.25** — coverage is not traded away — and mitigate the resulting
+damage with a review queue instead. That converts "which records get reviewed"
+into a boundary somebody has to pick, and picking it by eye would put an
+invented number in the routing path.
+
+The constraint that shapes the whole question: **at runtime there is no ground
+truth.** The processor cannot know whether a masked span was a real name or a
+false positive; if it could, it would not need the model. The only quantity it
+can compute is how much of the memo was masked. So the boundary has to be a
+function of masked fraction alone.
+
+Measured by `scripts/probe_redaction_damage.py` at threshold 0.25 on
+`urchade/gliner_multi_pii-v1`, over both corpora at once — 237 positives from
+`probe_ner_locale.build_cases()` and 30 free-text negatives from
+`probe_ner_precision.build_negatives()`. Both label sets run on every case,
+because production runs both and a PERSON memo still absorbs whatever the
+ADDRESS labels fire on.
+
+### 10.1 Masked fraction does not separate good redaction from bad
+
+The intuition behind a graded confidence band was that heavily-masked records
+are the suspicious ones. It is false, and backwards:
+
+| group | n | mean masked | p50 | max | untouched |
+|---|---:|---:|---:|---:|---:|
+| pos / address_roman_urdu | 24 | **72%** | 75% | 96% | 0% |
+| pos / address_codeswitch | 24 | 65% | 71% | 79% | 0% |
+| pos / address_english | 24 | 56% | 67% | 81% | 0% |
+| pos / person_english | 55 | 45% | 45% | 80% | 0% |
+| pos / person_roman_urdu | 55 | 38% | 33% | 62% | 0% |
+| pos / person_codeswitch | 55 | 32% | 30% | 56% | 0% |
+| neg / pk_ambiguous | 10 | 27% | 16% | 100% | 40% |
+| neg / pk_plain | 15 | 21% | 0% | 100% | 73% |
+| neg / clean_memo | 5 | 5% | 0% | 23% | 80% |
+
+**Positives are masked more than negatives at every percentile.** That is not a
+malfunction — an address genuinely is most of `"Ghar 12, Gali 4, F-8/3
+Islamabad"`, so removing it correctly consumes most of the memo. Size cannot
+distinguish the two because correct redaction of a short memo is, by
+construction, large.
+
+The sweep makes the cost explicit. `queue yield` is the share of the review
+queue that is actually repairable damage:
+
+| B | flagged | of pos | of neg | damage caught | queue yield |
+|---:|---:|---:|---:|---:|---:|
+| 0.20 | 88% | 95% | 27% | 73% | **3%** |
+| 0.40 | 49% | 52% | 20% | 55% | 5% |
+| 0.60 | 27% | 28% | 13% | 36% | 6% |
+| 0.80 | 5% | 4% | 13% | 36% | 31% |
+| 0.90 | 3% | 2% | 13% | 36% | 50% |
+| **1.00** | **1%** | **0%** | 13% | 36% | **100%** |
+
+Any graded band drowns the reviewer: at 0.20 they inspect 88% of the stream and
+97% of what they see was handled correctly. A band is not a viable design here.
+
+### 10.2 The one rule that works is a degenerate-state check
+
+At B = 1.00 the picture inverts: 1% of records flagged, **no positives at all**,
+and every flagged record genuinely damaged. The four that qualify:
+
+```
+100%  'Paisay bhej diye hain'
+100%  'Kiraya agle mahine bhejunga'
+100%  'Rakam wapas bhej dein'
+100%  'Rehmat ho gayi hai'
+```
+
+This works because it is not a tuned threshold but a **qualitative state**:
+redaction consumed the entire field and left nothing. A legitimate redaction
+essentially never reaches it, because a real memo has structure around the
+entity — `"Transfer to X"` still leaves `"Transfer to"`. The rule is
+*"flag when redaction leaves nothing"*, which needs no calibration and cannot
+drift with the score distribution the way §7.2 showed a threshold can.
+
+The margin is thin and should be stated: `address_roman_urdu` peaks at 96%
+masked, four points below the line. The rule must therefore test **full
+saturation**, not `>= 0.9x` — the exactness is what makes it safe.
+
+### 10.3 A second signal was tested and refuted
+
+Masked fraction is blind to *partial* over-redaction, which is 64% of the
+damage. So a second, independent signal was tried: characters labelled **both**
+PERSON and ADDRESS. The reasoning was that the two are mutually exclusive in
+reality — a run of characters is somebody's name or where they live, never both
+— so overlap is the model contradicting itself rather than finding two things.
+
+It does not work, for the same reason §10.1 does not:
+
+| group | any conflict | mean frac |
+|---|---:|---:|
+| pos / address_codeswitch | **54%** | 15% |
+| pos / address_roman_urdu | 46% | 15% |
+| pos / person_english | 38% | **36%** |
+| neg / pk_ambiguous | 20% | 13% |
+| neg / pk_plain | 13% | 13% |
+
+Conflict fires *more* on real entities than on clean text. Label confusion is a
+property of the model being unsure **which** entity it found, not whether there
+is one. Adding it to the rule strictly worsens the outcome — queue yield falls
+from 100% to 8–14% while flagging 28% of positives:
+
+| C | flagged | of pos | damage caught | queue yield |
+|---:|---:|---:|---:|---:|
+| 0.01 | 27% | 28% | 55% | 8% |
+| 0.25 | 21% | 21% | 55% | 11% |
+| 0.50 | 13% | 13% | 45% | 14% |
+| **off** | **1%** | **0%** | 36% | **100%** |
+
+Recorded rather than dropped: it was a plausible mechanism, and the measurement
+is the only reason it is not in the router.
+
+### 10.4 Incidental — the field scoping decision is confirmed
+
+`pipeline_field` negatives were excluded from the boundary analysis because
+Tier 2 is scoped to free text. Scored anyway, they mask **50% of characters on
+average, 100% at worst**, with only 46% untouched — `channel` values like
+`'atm'` come back as PERSON *and* ADDRESS. Running Tier 2 over every string
+field, as `processor.py:234` does for Tier 1, would be substantially worse than
+running it nowhere.
+
+### 10.5 What this changes
+
+- **No confidence band.** The middle-band design is dropped; §10.1 shows every
+  graded boundary has 3–7% yield.
+- **Flag on full saturation only**, emitted-and-flagged rather than blocked:
+  the record is already safe, so diverting it costs availability for no privacy
+  gain. The flag belongs in the audit row, not in a routing decision.
+- **~1% of records reach review**, which is a queue a human can actually work.
+- **64% of over-redaction is accepted, unflagged and invisible.** This is the
+  real cost of the §8 decision to keep coverage, and it should be stated
+  plainly rather than implied by the 36% figure.
+
+### 10.6 Limits
+
+- **30 free-text negatives, 11 of them damaged, 4 saturated.** The 100% yield
+  at B = 1.00 rests on those 4. It is a small sample and the right reading is
+  "no positive came close to saturation", not "precision is exactly 1.0".
+- Measured at one threshold (0.25) on one model. If either changes, the
+  saturation rule survives — it is scale-free — but the 36% damage-caught
+  figure does not.
+- Negatives are still the author's Roman Urdu, with §9's two defects present.
+  Three of the four saturated records contain an attested vocabulary; one
+  (`'Kiraya agle mahine bhejunga'`) contains the unattested `bhejunga`.
+- **Whether a fully-masked memo is worth a human at all** is unexamined here.
+  The alternative is dropping the memo and emitting the rest of the record,
+  which needs no reviewer.
