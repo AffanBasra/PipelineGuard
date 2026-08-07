@@ -175,10 +175,10 @@ def test_half_open_window_label_names_both_ends() -> None:
 @pytest.mark.parametrize(
     "types, confidence, expected",
     [
-        (None, None, "no findings recorded"),
-        ("", None, "no findings recorded"),
-        ("CNIC", None, "CNIC"),
-        ("CNIC, EMAIL", 0.5, "CNIC, EMAIL (lowest confidence 0.50)"),
+        (None, None, "quarantined with no sub-threshold rule finding recorded"),
+        ("", None, "quarantined with no sub-threshold rule finding recorded"),
+        ("CNIC", None, "CNIC failed validation"),
+        ("CNIC, EMAIL", 0.5, "CNIC, EMAIL failed validation (confidence 0.50)"),
     ],
 )
 def test_uncertain_detail_handles_the_left_join_nulls(types, confidence, expected) -> None:

@@ -141,11 +141,18 @@ WHERE {_WINDOW} AND action = 'quarantined' AND failure_class IS NOT NULL;
 # LEFT JOIN, unlike _Q_ENTITIES: a message can be quarantined as uncertain
 # with no findings at all, and dropping those would hide exactly the records
 # most in need of review.
+# The aggregates are FILTERed to tier 1 sub-1.0 findings because those are what
+# actually triggered the quarantine (processor.py routes on exactly that
+# predicate). Without the filter, min() ran over every finding on the message,
+# so once Tier 2 landed its continuous scores became the reported "lowest
+# confidence" -- telling a reviewer an encoder was unsure when the real cause
+# was a failed IBAN checksum.
 _Q_UNCERTAIN = f"""
 SELECT m.message_id,
        m.processed_ts,
-       string_agg(DISTINCT f.entity_type, ', '),
-       min(f.confidence)
+       string_agg(DISTINCT f.entity_type, ', ')
+           FILTER (WHERE f.tier = 1 AND f.confidence < 1.0),
+       min(f.confidence) FILTER (WHERE f.tier = 1 AND f.confidence < 1.0)
 FROM messages_processed m
 LEFT JOIN findings f USING (message_id)
 WHERE {_WINDOW} AND m.action = 'quarantined' AND m.failure_class IS NULL
@@ -290,13 +297,19 @@ def fetch(conn: Any, since: datetime | None, until: datetime | None, max_queue: 
 
 
 def _uncertain_detail(entity_types: str | None, min_confidence: float | None) -> str:
-    """A message quarantined as uncertain may carry no findings at all -- the
-    LEFT JOIN yields NULLs there. Say so rather than rendering 'None'."""
+    """What actually put this record in the queue.
+
+    Both arguments are already filtered to the tier 1 sub-1.0 findings the
+    processor routes on, so this names the trigger rather than everything the
+    message happened to contain. NULL means no such finding was recorded --
+    possible if the routing rule changes without this query following it, and
+    worth showing plainly rather than as 'None'.
+    """
     if not entity_types:
-        return "no findings recorded"
+        return "quarantined with no sub-threshold rule finding recorded"
     if min_confidence is None:
-        return entity_types
-    return f"{entity_types} (lowest confidence {min_confidence:.2f})"
+        return f"{entity_types} failed validation"
+    return f"{entity_types} failed validation (confidence {min_confidence:.2f})"
 
 
 # --------------------------------------------------------------------------- #
@@ -439,6 +452,16 @@ def render(data: ReportData) -> str:
             "the audit trail stores no value with which to link them. That is "
             "a deliberate consequence of not retaining personal data.",
         ]
+        # A type found by two detectors has a min confidence that describes
+        # only one of them, which would otherwise read as doubt about both.
+        mixed = [
+            (e.entity_type, compliance.MIXED_PROVENANCE[e.entity_type])
+            for e in data.entities
+            if e.entity_type in compliance.MIXED_PROVENANCE
+        ]
+        if mixed:
+            lines += [""]
+            lines += [f"**{etype}.** {note}" for etype, note in mixed]
 
         lines += ["", "### Regulatory basis", ""]
         for e in data.entities:

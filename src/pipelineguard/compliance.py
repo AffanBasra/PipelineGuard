@@ -145,6 +145,43 @@ CLASSIFICATIONS: dict[str, Classification] = {
         ),
         gdpr_basis="An identifier under Art. 4(1).",
     ),
+    "PERSON_NAME": Classification(
+        data_category="Name",
+        # The only entity type here that is not a structured identifier, and
+        # the only one detected by two different mechanisms. Both facts change
+        # how a reviewer should read a count of it, so both are stated.
+        pk_basis=(
+            "A name is not an identifier issued by any authority, so no "
+            "Pakistan-specific instrument attaches to it the way the NADRA "
+            "Ordinance attaches to a CNIC. It is personal data under the "
+            "draft Personal Data Protection Bill's definition, and PECA 2016 "
+            "reaches it only through the general unauthorised-access and "
+            "identity-misuse offences. Its practical significance here is "
+            "combinatorial: a name beside an account number in the same "
+            "record is what turns a transaction into an identified one, "
+            "which is why it is redacted rather than tolerated."
+        ),
+        gdpr_basis=(
+            "Personal data under Art. 4(1) -- the canonical example, since a "
+            "name is the paradigm case of information relating to an "
+            "identified natural person."
+        ),
+    ),
+}
+
+# Entity types found by more than one detector, and what that means for a
+# count. PERSON_NAME comes from a schema rule on declared fields at confidence
+# 1.0, and from the Tier 2 encoder over free text at whatever it scored -- so
+# its total mixes a contractual guarantee with a probabilistic judgement, and
+# its minimum confidence describes only the latter.
+MIXED_PROVENANCE: dict[str, str] = {
+    "PERSON_NAME": (
+        "Detected two ways: declared fields are redacted whole from the "
+        "schema at confidence 1.0, while names in free text are found by the "
+        "Tier 2 encoder and carry its score. A minimum confidence below 1.0 "
+        "therefore reflects the encoder's uncertainty about free text, not "
+        "any doubt about the declared field."
+    ),
 }
 
 @dataclass(frozen=True)
