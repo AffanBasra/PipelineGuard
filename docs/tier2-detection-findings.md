@@ -1098,3 +1098,139 @@ this generator emits produces a non-empty memo:
   in free text need a model.
 - Whether real Pakistani bank memos contain inline addresses is **unmeasured**,
   and is the question that decides if this ever comes back.
+
+---
+
+## 14. Real addresses — the model we picked is the worst one tested
+
+§3 and §6.2 recorded the strongest finding on this branch: encoders lose ~21
+points of character coverage on Urdu-form addresses, replicated across two
+models. §5 recorded what sat underneath it — **the author wrote every one of
+those addresses.** §13 then dropped ADDRESS from Tier 2, because nothing in the
+pipeline contains one.
+
+This scores four encoders on **7,371 real OpenStreetMap addresses** instead.
+
+### 14.1 Method
+
+`scripts/build_address_corpus.py` reads an Overpass export (9,446 elements,
+Lahore-metro) and emits deduplicated addresses. `scripts/probe_address_real.py`
+substitutes each into the *same* `ADDRESS_TEMPLATES` frames §6.2 used, so one
+variable changes: the address is real instead of hand-written. The gold span
+needs no alignment — the script inserts the address and knows the offsets.
+
+300 addresses balanced across kind, through 12 frames = **3,600 cases** per
+model per threshold.
+
+**The privacy control.** Raw OSM carries real personal data: a `building=house`
+node in this file holds `name="Muhammad Ibrahim"`, and 296 elements carry phone
+numbers. Only `addr:*` keys are read, plus `building` as a single documented
+exception — it describes a structure, not a person, and is what makes the
+residential split reportable. Enforced by test, not convention.
+
+**Two things deduplication exposed.** Karachi looked like 253 addresses; it is
+`Nazimabad 5` repeated 252 times. And 101 street values already end in the city,
+so appending `addr:city` produced `Lahore, Pakistan, Lahore` — an address nobody
+wrote, which would have been scored as one.
+
+### 14.2 Results
+
+| model | thr | ALL | residential | commercial | gap | any-hit |
+|---|---:|---:|---:|---:|---:|---:|
+| **gliner-community/gliner_medium-v2.5** | 0.25 | **85.8%** | **84.1%** | 88.4% | 4.3 | 99.6% |
+| nvidia/gliner-PII | 0.25 | 80.2% | 79.5% | 82.5% | **3.0** | 98.9% |
+| urchade/gliner_multi_pii-v1 | 0.25 | 75.9% | 70.0% | 82.4% | 12.4 | 99.2% |
+| xlm-roberta-large-conll03 | 0.5 | 45.0% | **27.4%** | 72.6% | **45.2** | 98.3% |
+
+**`urchade/gliner_multi_pii-v1` — the model this project selected and shipped —
+is the worst of the three GLiNER checkpoints on real addresses**, and has the
+largest residential penalty of the three by a factor of three.
+
+That selection was not wrong on its own terms. §6.1 chose urchade on PERSON
+coverage (99.4% against nvidia's 91%), cost, and licence. Nothing here disturbs
+those. It does mean the choice was never tested on the axis that matters for
+addresses, because §13 had removed addresses from the pipeline.
+
+### 14.3 The finding that matters: residential is harder than commercial
+
+Every model is worse on homes than on businesses. A home address is personal
+data. A shop's address largely is not. **The models are weakest on precisely the
+category that is PII.**
+
+The size of that penalty is a property of the model, not of the task:
+
+- `nvidia` 3.0 points, `gliner_community` 4.3 — small.
+- `urchade` 12.4 — four times either.
+- `xlm-roberta-conll03` 45.2 — the model is close to useless on homes.
+
+The XLM-R number has a mechanical explanation, and it is worth stating because
+it generalises. CoNLL03 offers `PER/ORG/LOC/MISC` and **has no address class**.
+A commercial address is caught as `ORG`, because it is a business. A residential
+address has no label that fits. A general-purpose NER model is not a weak
+address detector — for homes it is barely a detector at all.
+
+### 14.4 Coverage is not the problem; completeness is
+
+Every model finds *something* in nearly every address:
+
+```
+gliner_community   coverage 85.8%   any-hit 99.6%
+urchade            coverage 75.9%   any-hit 99.2%
+xlmr_conll         coverage 45.0%   any-hit 98.3%
+```
+
+xlm-roberta locates 98.3% of addresses and covers 45% of their characters. This
+is §3's failure mode on real data: **it finds the city and leaves the house
+number in the clear.** A pipeline shipping that looks like it redacted the
+address. A total miss would at least be visible.
+
+### 14.5 A §6.2 caveat, retired
+
+§6.2 recorded that urchade scores *higher* on Roman-Urdu frames than English,
+called it "not explicable", and attributed it to noise at n=12. It replicates at
+n=1,200 on addresses neither of us wrote:
+
+| model | english | codeswitch | roman_urdu |
+|---|---:|---:|---:|
+| gliner_community | 87.9% | 84.8% | 84.7% |
+| nvidia | **90.9%** | 75.3% | 74.4% |
+| urchade | **69.6%** | 74.7% | **83.4%** |
+| xlmr_conll | 44.9% | 45.0% | 45.0% |
+
+urchade rises 13.8 points into Roman Urdu; nvidia falls 16.5. §6.2's conclusion
+— that the sentence-language effect does not replicate *across* models — stands.
+Its dismissal of urchade's direction as noise does not. I still have no
+explanation, and should stop offering one.
+
+### 14.6 What this says about fine-tuning
+
+The question was whether the address gap justifies fine-tuning an encoder. On
+this evidence, **largely not yet.**
+
+An off-the-shelf model nobody had tried reaches **85.8% overall and 84.1% on
+residential**, ten points above the model in use. The obvious cheap move is to
+evaluate `gliner_community` properly — on PERSON as well, at its own swept
+threshold, and for cost — before training anything. Fine-tuning to recover
+ground that a checkpoint swap already covers would be effort spent on the wrong
+problem.
+
+What would still justify fine-tuning: 84% is not 99%, and the residual is
+concentrated in house numbers, which are the identifying part.
+
+### 14.7 Limits
+
+- **Lahore-metro only.** 8,466 of 9,446 elements. Islamabad sector forms
+  (`F-8/3`) are 0.3% of the corpus, so the controlled comparison against §6.2 —
+  whose addresses were Islamabad sectors — **cannot be made from this data.**
+  Comparing these numbers to §6.2's changes provenance, city and convention at
+  once. Model-against-model here is controlled; the §6.2 comparison is not.
+- **78.7% of the corpus has no building type**, so the residential/commercial
+  split rests on 840 and 713 addresses respectively, not on the full 7,371.
+- **Sentence frames are still hand-written.** The addresses are independent;
+  the surrounding memo text is not. Half-independent, not fully.
+- 51 Urdu-script addresses were excluded. Script coverage is a separate
+  question and would confound the residential comparison.
+- `xlm-roberta-large-conll03` is scored at a single threshold. Its scores are
+  real probabilities and do not respond to GLiNER's cutoffs.
+- Both `gliner_community` and `xlm-roberta` failed on first run with network
+  errors, not model errors. Re-run before trusting any single number here.
