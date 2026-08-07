@@ -182,11 +182,26 @@ def test_duplicates_are_collapsed():
 
 @pytest.mark.parametrize(
     "city, expected",
-    [("lahore", "Lahore"), ("LAHORE", "Lahore"), ("لاہور", "Lahore"),
-     ("Lahore", "Lahore"), ("Multan", "Multan")],
+    [
+        ("lahore", "Lahore"), ("LAHORE", "Lahore"), ("Lahore", "Lahore"),
+        # Urdu-script city names, which is how most OSM records write them.
+        ("لاہور", "Lahore"), ("اسلام آباد", "Islamabad"),
+        ("راولپنڈی", "Rawalpindi"),
+        # Values carrying province and country too.
+        ("Rawalpindi, Punjab, Pakistan", "Rawalpindi"),
+        ("Lahore, Pakistan", "Lahore"),
+        ("Multan", "Multan"),
+    ],
 )
 def test_city_variants_normalise(city, expected):
     assert normalise_city(city) == expected
+
+
+def test_unknown_cities_pass_through_unchanged():
+    """Normalisation must not invent a match. A city not in the alias table or
+    the prefix list keeps its own name rather than being folded into one."""
+    assert normalise_city("Sialkot") == "Sialkot"
+    assert normalise_city("Gujranwala") == "Gujranwala"
 
 
 @pytest.mark.parametrize(

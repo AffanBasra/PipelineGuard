@@ -71,8 +71,21 @@ CITY_ALIASES = {
     "کراچی": "Karachi",
     "اسلام آباد": "Islamabad",
     "اسلام‌آباد": "Islamabad",
+    "راولپنڈی": "Rawalpindi",
+    "فیصل آباد": "Faisalabad",
+    "ملتان": "Multan",
+    "پشاور": "Peshawar",
+    "کوئٹہ": "Quetta",
     "shahdara": "Shahdara",
 }
+
+# addr:city values that carry the province or country as well:
+# 'Rawalpindi, Punjab, Pakistan'. Matched on the leading city name so they group
+# with the plain form rather than each becoming its own row in the report.
+CITY_PREFIXES = (
+    "Islamabad", "Karachi", "Lahore", "Rawalpindi",
+    "Faisalabad", "Multan", "Peshawar", "Quetta",
+)
 
 # Structural vocabulary that marks a planned-development address. These are the
 # forms §3 found encoders lose ground on, so the corpus is classified by them.
@@ -151,7 +164,15 @@ def classify_kind(element: dict) -> str:
 
 
 def normalise_city(city: str) -> str:
-    return CITY_ALIASES.get(city.strip().lower(), city.strip())
+    cleaned = city.strip()
+    alias = CITY_ALIASES.get(cleaned.lower())
+    if alias:
+        return alias
+    # 'Rawalpindi, Punjab, Pakistan' -> 'Rawalpindi'
+    for prefix in CITY_PREFIXES:
+        if cleaned.lower().startswith(prefix.lower()):
+            return prefix
+    return cleaned
 
 
 def compose(tags: dict[str, str]) -> str | None:

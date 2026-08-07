@@ -59,33 +59,51 @@ ATTRIBUTION = (
     "https://www.openstreetmap.org/copyright"
 )
 
-# Ordered by how much each one adds, so --cities on a slow link can stop early.
-CITIES = [
-    "Islamabad",     # sector forms (F-8/3, G-9/1) -- what §3 and §6.2 tested
-    "Karachi",       # largest city; block and phase conventions
-    "Lahore",        # cross-check against the 8,466 in the Kaggle export
-    "Rawalpindi",
-    "Faisalabad",
-    "Multan",
-    "Peshawar",
-    "Quetta",
-]
+# Bounding boxes, not named areas. Three approaches were tried against the live
+# API and only this one works:
+#
+#   area["name"=...]                -> 0 elements; PK boundaries are Urdu-script
+#   area["name:en"=...]             -> resolves, but also matches three
+#                                      'Islomobod' hamlets in Central Asia, and
+#                                      the address query inside it times out
+#   area(<explicit id>)             -> 504; scanning an admin area for every
+#                                      addr:street node is too expensive
+#   bbox                            -> 5,320 elements for Islamabad in seconds
+#
+# Boxes are generous and overlap slightly (Islamabad's includes part of
+# Rawalpindi). That is harmless: addr:city is preserved, and the corpus builder
+# deduplicates.
+# south,west,north,east. Taken from Nominatim's administrative boundary for each
+# city, widened slightly, NOT written from memory -- the first version was and
+# six of the eight boxes clipped the city. Verify with
+# scripts/verify_bboxes.py after any change.
+#
+# Multan and Quetta resolve to a point in Nominatim's city search (it matches an
+# office node and a railway station), so their district boundary is used
+# instead. That is wider than the city, which costs some precision in the
+# addr:city column and no correctness -- addr:city is preserved per record.
+CITY_BBOX = {
+    # sector forms (F-8/3, G-9/1) -- what §3 and §6.2 tested
+    "Islamabad": "33.46,72.80,33.82,73.39",
+    "Karachi": "24.42,66.28,25.68,67.59",
+    # cross-check against the 8,466 in the Kaggle export
+    "Lahore": "31.18,73.99,31.73,74.67",
+    "Rawalpindi": "33.06,72.61,33.89,73.66",
+    "Faisalabad": "31.33,72.99,31.53,73.20",
+    "Multan": "29.41,71.00,30.46,71.84",
+    "Peshawar": "33.91,71.36,34.08,71.63",
+    "Quetta": "29.80,66.22,30.49,67.29",
+}
+CITIES = list(CITY_BBOX)
 
 # addr:street is the anchor because every one of the 9,446 elements in the
-# Kaggle export carries it, so it is the tag that actually selects addresses.
-# `out tags` and not `out center tags`: no geometry is needed, and dropping it
-# cuts the payload by roughly half.
-#
-# Matched on name:en, NOT name. Pakistani administrative boundaries in OSM are
-# named in Urdu script -- Punjab is 'پنجاب', Islamabad is 'اسلام‌آباد' -- so
-# area["name"="Islamabad"] resolves to nothing and the query returns 0 elements
-# with a 200, which reads as "this city has no addresses" rather than as a bug.
+# Kaggle export carries it. `out tags` and not `out center tags`: no geometry is
+# needed, and dropping it roughly halves the payload.
 QUERY = """
 [out:json][timeout:180];
-area["name:en"="{city}"]["boundary"="administrative"]->.searchArea;
 (
-  node["addr:street"](area.searchArea);
-  way["addr:street"](area.searchArea);
+  node["addr:street"]({bbox});
+  way["addr:street"]({bbox});
 );
 out tags;
 """
@@ -107,7 +125,7 @@ def fetch_city(city: str, timeout: float = 300.0) -> dict:
         try:
             response = requests.post(
                 mirror,
-                data={"data": QUERY.format(city=city)},
+                data={"data": QUERY.format(bbox=CITY_BBOX[city])},
                 headers={"User-Agent": USER_AGENT},
                 timeout=timeout,
             )

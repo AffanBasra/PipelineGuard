@@ -39,7 +39,12 @@ os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from probe_ner_locale import ADDRESS_TEMPLATES, char_coverage  # noqa: E402
+from probe_ner_locale import (  # noqa: E402
+    ADDRESS_TEMPLATES,
+    NAME_TEMPLATES,
+    NAMES,
+    char_coverage,
+)
 
 REPO = Path(__file__).resolve().parent.parent
 CORPUS = REPO / "data" / "osm-addresses" / "addresses.json"
@@ -54,7 +59,14 @@ MODELS = [
      "token"),
 ]
 
-GLINER_LABELS = ["address", "street_address", "location"]
+GLINER_LABELS = {
+    "address": ["address", "street_address", "location"],
+    "person": ["person", "first_name", "last_name"],
+}
+# CoNLL03 has no address class. LOC is the closest it can offer for an address
+# and ORG catches business addresses; PER is a genuine match for a name.
+TOKEN_LABELS = {"address": ("LOC", "ORG"), "person": ("PER",)}
+
 THRESHOLDS = (0.25, 0.40, 0.55)
 
 # Reported separately. 'unknown' is carried because it is 78.7% of the corpus
@@ -100,31 +112,57 @@ def build_cases(records: list[dict]) -> list[tuple]:
     return cases
 
 
-def load_gliner(model_id: str):
+def build_person_cases() -> list[tuple]:
+    """The same shape, over §2's synthetic names.
+
+    Names stay synthetic on purpose. docs/decisions.md §1 forbids processing
+    real personal data, and a real person's name is exactly that -- so unlike
+    addresses, there is no honest way to source these externally. That makes
+    the PERSON numbers comparable to §2 rather than independent of it, and the
+    writeup has to say so.
+
+    `kind` carries the name difficulty band (common / rare / ambiguous) so the
+    same reporting code works for both entity types.
+    """
+    cases = []
+    for style, templates in NAME_TEMPLATES.items():
+        for template in templates:
+            for band, name in NAMES:
+                text = template.format(x=name)
+                start = text.index(name)
+                cases.append((style, band, "name", name,
+                              text, start, start + len(name)))
+    return cases
+
+
+def load_gliner(model_id: str, entity: str):
     from gliner import GLiNER
     import torch
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = GLiNER.from_pretrained(model_id, map_location=device)
     model.eval()
+    labels = GLINER_LABELS[entity]
 
     def predict(texts: list[str], threshold: float):
-        batch = model.batch_predict_entities(texts, GLINER_LABELS,
-                                             threshold=threshold)
+        batch = model.batch_predict_entities(texts, labels, threshold=threshold)
         return [[(e["start"], e["end"], "") for e in ents] for ents in batch]
 
     return predict
 
 
-def load_token_classifier(model_id: str):
-    """CoNLL03 has no address class. LOC is the closest thing it can offer, and
-    that mismatch is part of the result rather than a flaw in the harness --
-    §3 recorded the same thing for dslim/bert-base-NER."""
+def load_token_classifier(model_id: str, entity: str):
+    """CoNLL03 has no address class, so ADDRESS is scored against LOC and ORG --
+    the closest labels it can offer. That mismatch is part of the result rather
+    than a flaw in the harness; §3 recorded the same for dslim/bert-base-NER.
+    PER is a genuine match for a name, so the PERSON numbers are a fair test of
+    this model and the ADDRESS numbers are not."""
     import torch
     from transformers import pipeline
 
     ner = pipeline("ner", model=model_id, aggregation_strategy="simple",
                    device=0 if torch.cuda.is_available() else -1)
+    wanted = TOKEN_LABELS[entity]
 
     def predict(texts: list[str], threshold: float):
         out = []
@@ -132,7 +170,7 @@ def load_token_classifier(model_id: str):
             out.append([
                 (e["start"], e["end"], "")
                 for e in result
-                if e["entity_group"] in ("LOC", "ORG") and e["score"] >= threshold
+                if e["entity_group"] in wanted and e["score"] >= threshold
             ])
         return out
 
@@ -165,6 +203,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--sample", type=int, default=300,
                     help="addresses per kind bucket (each is run through every frame)")
     ap.add_argument("--only", nargs="*", default=None)
+    ap.add_argument("--entity", choices=("address", "person"),
+                    default="address")
     ap.add_argument("--out", default="address_real_results.json")
     args = ap.parse_args(argv)
 
@@ -187,8 +227,8 @@ def main(argv: list[str] | None = None) -> int:
             continue
         print("=" * 76, f"\n{name}  ({model_id})\n", "=" * 76, flush=True)
         try:
-            predict = (load_gliner if kind == "gliner" else
-                       load_token_classifier)(model_id)
+            loader = load_gliner if kind == "gliner" else load_token_classifier
+            predict = loader(model_id, args.entity)
         except Exception as exc:  # noqa: BLE001 -- one bad model must not sink the run
             print(f"  FAILED to load: {type(exc).__name__}: {exc}", flush=True)
             results[name] = {"error": f"{type(exc).__name__}: {exc}"}
@@ -202,10 +242,11 @@ def main(argv: list[str] | None = None) -> int:
             t0 = time.perf_counter()
             entry[str(threshold)] = score(predict, cases, threshold)
             row = entry[str(threshold)]
+            buckets = " ".join(
+                f"{k.split(':')[1]} {v['coverage']:.1%}"
+                for k, v in sorted(row.items()) if k.startswith("kind:"))
             print(f"  thr {threshold}  ALL {row['ALL:ALL']['coverage']:.1%}  "
-                  f"residential {row.get('kind:residential', {}).get('coverage', 0):.1%}  "
-                  f"commercial {row.get('kind:commercial', {}).get('coverage', 0):.1%}  "
-                  f"({time.perf_counter() - t0:.0f}s)", flush=True)
+                  f"{buckets}  ({time.perf_counter() - t0:.0f}s)", flush=True)
         results[name] = entry
 
     Path(args.out).write_text(json.dumps(results, indent=2), encoding="utf-8")
