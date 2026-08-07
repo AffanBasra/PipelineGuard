@@ -185,7 +185,35 @@ def test_uncertain_queue_includes_messages_with_no_findings(isolated) -> None:
     data = report.fetch(isolated, None, None)
     assert data.uncertain_total == 1
     assert len(data.uncertain) == 1
-    assert data.uncertain[0].detail == "no findings recorded"
+    assert data.uncertain[0].detail == (
+        "quarantined with no sub-threshold rule finding recorded"
+    )
+
+
+def test_uncertain_reason_names_the_trigger_not_every_finding(isolated) -> None:
+    """The processor quarantines on a tier 1 finding below 1.0 and nothing else,
+    so the reason must describe that finding. Aggregating over every finding on
+    the message meant Tier 2's continuous scores became the reported "lowest
+    confidence" the moment the encoder shipped -- telling a reviewer the model
+    was unsure when the cause was a failed IBAN checksum."""
+    add(
+        isolated,
+        action="quarantined",
+        processed_ts=T0,
+        findings=(
+            ("IBAN_PK", "iban_from", 0.5, 1),      # the actual trigger
+            ("CNIC", "cnic", 1.0, 1),              # validated, not a cause
+            ("PERSON_NAME", "memo", 0.25, 2),      # encoder score, not a cause
+        ),
+    )
+
+    data = report.fetch(isolated, None, None)
+    detail = data.uncertain[0].detail
+    assert "IBAN_PK" in detail
+    assert "0.50" in detail
+    assert "0.25" not in detail        # the encoder score must not appear
+    assert "PERSON_NAME" not in detail
+    assert "CNIC" not in detail        # validated findings are not the reason
 
 
 def test_quarantine_splits_into_disjoint_queues(isolated) -> None:

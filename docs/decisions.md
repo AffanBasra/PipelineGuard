@@ -128,18 +128,73 @@ detection, micro-batched inference, the escalation path and the latency gap
 between ~0.4 µs rules and ~20 ms encoder, at a fraction of the cost of the
 fine-tune.
 
-The locale fine-tune then becomes an upgrade with a measured before/after
-("off-the-shelf NER missed X% of Roman-Urdu names; locale-substituted training
-took it to Y%"), which is a far stronger claim than an F1 number in isolation —
-and it needs the pipeline in place to measure against anyway. Ships labelled
-honestly as not locale-tuned.
+The locale fine-tune then becomes an upgrade with a measured before/after,
+which is a far stronger claim than an F1 number in isolation — and it needs
+the pipeline in place to measure against anyway. Ships labelled honestly as
+not locale-tuned.
 
-**Tier assignment by cost, not by capability.** *(settled)*
+**Correction (2026-07-29): the before/after is about addresses, not names.**
+This entry previously proposed the framing *"off-the-shelf NER missed X% of
+Roman-Urdu names; locale-substituted training took it to Y%"*. That premise
+was tested and is false. `nvidia/gliner-PII` scores identically on Pakistani
+names in English, code-switched and Roman-Urdu sentences — 100% any-hit in
+every difficulty band, flat to the percentage point. Only a weak English-only
+model degrades.
+
+Addresses are where it breaks: the same model covers 96% of an English-form
+address in an English sentence and **51%** of a Roman-Urdu-form address in a
+Roman-Urdu sentence, leaving the house number and street in the clear while
+finding the city. Both variables contribute independently. Full numbers and
+method in [tier2-detection-findings.md](tier2-detection-findings.md).
+
+**Tier assignment by cost, not by capability.**
+*(mislabelled — corrected below, 2026-08-06)*
 Tier 1 rules handle anything with a checkable format (CNIC, IBAN, phone,
 email) at ~0.4 µs per pattern. Tier 2 (encoder) is reserved for entities with
 no format to match — names, addresses. Tier 3 (LLM) only for ambiguous spans.
 Using a 110M-parameter model to find an email address would be four orders of
 magnitude slower for a worse answer.
+
+**Tier 2 exists for capability. Cost decides deployment, not existence.**
+*(settled — replaces the title above)*
+The entry above argues its own opposite: "reserved for entities with **no
+format to match**" is a capability claim, and only the last sentence (don't use
+an encoder for an email) is about cost. The correct statement is narrower than
+the old title and stronger:
+
+- **Tier 2 exists because free text has no format to match.** No rule finds
+  `Ayesha Malik` in a memo. This is not an optimisation — it is the only thing
+  that does the job at all, and it is the redaction firewall's actual product.
+- **Cost decides how it is deployed**, not whether it is needed. 40.5 ms on
+  CPU, 31.0 ONNX, 8.03 on GPU (§7, §11 of the findings) set the throughput
+  envelope. They cannot argue Tier 2 out of the design, because nothing else
+  covers free text.
+- **Within the set of tools that CAN do a job, pick the cheapest.** That is all
+  the original entry's last sentence ever claimed, and it stays true.
+
+Why the mislabel mattered: it let cost measurements be read as evidence about
+whether the architecture was right. §6.3's "65× the budget" was recorded as
+though it threatened the tiering claim. It never did — it only ever bounded
+throughput. The two questions are separate, and conflating them made a
+deployment constraint look like a refutation.
+
+**There is no Tier 1 → Tier 2 escalation.** *(settled)*
+Escalation means running something cheap and promoting on uncertainty. Tier 1
+has no name rule, so a memo is not a record Tier 1 was uncertain about — it is
+a record Tier 1 has no opinion on. Absence of a finding is silence, not low
+confidence. So the relationship is **dispatch by field type**, decided by the
+schema and known before either detector runs:
+
+    identifier fields (cnic, iban, phone, email)  -> Tier 1 rules
+    free text (memo)                              -> Tier 2 encoder
+    declared PII (account_holder)                 -> schema rule, no model
+
+Tier 2 → Tier 3 remains genuine escalation: same span, promoted on uncertainty.
+This kills the "escalation predicate" as an open design question — there is
+nothing to predict, because the schema already says which fields are free text.
+It also explains §10.4: pointing Tier 2 at identifier fields masks 50% of their
+characters, so dispatch is not merely cheaper than scanning everything, it is
+more correct.
 
 **Validate after matching, don't just match.** *(settled)*
 CNIC province digit, IBAN ISO 7064 mod-97, phone prefix normalization. This is

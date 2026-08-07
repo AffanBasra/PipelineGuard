@@ -5,7 +5,10 @@ __pycache__/
 venv/
 *.egg-info/
 .pytest_cache/
-models/          # fine-tuned encoder weights (tracked via HF, not git)
+# Encoder weights and exported ONNX graphs (tracked via HF, not git).
+# The comment is on its own line: git treats a trailing "#" as part of the
+# pattern, not as a comment, so "models/ # ..." silently matched nothing.
+models/
 .idea/
 graphify-out/
 CLAUDE.md

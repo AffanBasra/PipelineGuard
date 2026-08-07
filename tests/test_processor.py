@@ -15,7 +15,9 @@ live Kafka/Postgres, which this suite doesn't attempt.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
+import time
 import uuid
 
 import pytest
@@ -29,7 +31,7 @@ from conftest import (
     raw_message,
 )
 from pipelineguard import processor as P
-from pipelineguard.models import Envelope
+from pipelineguard.models import Envelope, Finding, Tier
 
 
 def payload_of(outcome) -> dict:
@@ -52,6 +54,193 @@ def test_message_with_confident_pii_is_redacted(detector, pii_payload):
     assert outcome.action == "redacted"
     assert outcome.failure is None
     assert len(outcome.findings) >= 4
+
+
+def test_declared_field_is_redacted_not_detected(detector, pii_payload):
+    """account_holder holds a name in every record by contract, and Tier 1 has
+    no name rule — so before the schema rule existed this field reached the
+    clean topic verbatim. Asserts the value is gone, not merely that a finding
+    was recorded."""
+    outcome = P.process_message(make_message(pii_payload), detector)
+
+    assert outcome.action == "redacted"
+    assert payload_of(outcome)["account_holder"] == "[PERSON_NAME]"
+    assert "Ayesha Malik" not in outcome.out_bytes.decode()
+
+    declared = [f for f in outcome.findings if f.field == "account_holder"]
+    assert len(declared) == 1
+    assert declared[0].entity_type == "PERSON_NAME"
+    assert declared[0].confidence == 1.0
+
+
+def test_declared_field_is_not_also_rule_scanned(detector):
+    """The schema span already covers the whole field, so a rule hit inside it
+    would be a redundant overlapping span — and redact() rewrites spans
+    right-to-left assuming they do not overlap, so two spans here would corrupt
+    the output rather than merely duplicate work."""
+    payload = {"account_holder": "ayesha@example.com"}
+    outcome = P.process_message(make_message(payload), detector)
+
+    assert len(outcome.findings) == 1
+    assert outcome.findings[0].entity_type == "PERSON_NAME"
+    assert payload_of(outcome)["account_holder"] == "[PERSON_NAME]"
+
+
+def test_empty_declared_field_stays_clean(detector):
+    """No name present, so nothing to redact and no marker to invent."""
+    outcome = P.process_message(make_message({"account_holder": ""}), detector)
+
+    assert outcome.action == "clean"
+    assert outcome.findings == []
+    assert payload_of(outcome)["account_holder"] == ""
+
+
+def test_undeclared_fields_still_go_through_rules(detector):
+    """The dispatch must not have swallowed the normal path: a CNIC in an
+    ordinary field is still detected by Tier 1."""
+    payload = {"note": "CNIC 35202-1234567-1", "account_holder": "Ayesha Malik"}
+    outcome = P.process_message(make_message(payload), detector)
+
+    by_field = {f.field for f in outcome.findings}
+    assert by_field == {"note", "account_holder"}
+    assert "35202-1234567-1" not in outcome.out_bytes.decode()
+
+
+# --------------------------------------------------------------------------- #
+# Tier 2 injection, span merging, free-text dispatch
+# --------------------------------------------------------------------------- #
+def t2(field, start, end, etype="PERSON", conf=0.87):
+    """An encoder finding, as main()'s batched pre-pass would supply it."""
+    return Finding(
+        entity_type=etype, field=field, span_start=start, span_end=end,
+        tier=Tier.ENCODER, confidence=conf,
+    )
+
+
+def test_injected_tier2_findings_redact_free_text(detector):
+    memo = "Transfer to Ayesha Malik"
+    outcome = P.process_message(
+        make_message({"memo": memo}), detector,
+        {"memo": [t2("memo", memo.index("Ayesha"), len(memo))]},
+    )
+
+    assert outcome.action == "redacted"
+    assert payload_of(outcome)["memo"] == "Transfer to [PERSON]"
+    assert "Ayesha Malik" not in outcome.out_bytes.decode()
+
+
+def test_tier2_findings_do_not_quarantine(detector):
+    """Encoder scores are continuous, so the old `confidence < 1.0` predicate
+    would send every record containing a name to review."""
+    outcome = P.process_message(
+        make_message({"memo": "Paid Ayesha Malik"}), detector,
+        {"memo": [t2("memo", 5, 17, conf=0.31)]},
+    )
+    assert outcome.action == "redacted"
+
+
+def test_tier1_checksum_failure_still_quarantines(detector):
+    """The narrowing must not have disabled the Tier 1 case it exists for."""
+    outcome = P.process_message(
+        make_message({"iban_from": "PK99MEZN5748718428058488"}), detector,
+    )
+    assert outcome.action == "quarantined"
+
+
+def test_free_text_gets_both_tiers(detector):
+    """A memo carries embedded identifiers as well as names."""
+    memo = "Refund to Ayesha Malik, call 03001234567"
+    outcome = P.process_message(
+        make_message({"memo": memo}), detector,
+        {"memo": [t2("memo", memo.index("Ayesha"), memo.index(","))]},
+    )
+
+    tiers = {f.tier for f in outcome.findings}
+    assert tiers == {Tier.RULES, Tier.ENCODER}
+    body = outcome.out_bytes.decode()
+    assert "Ayesha Malik" not in body and "03001234567" not in body
+
+
+def test_overlapping_spans_do_not_corrupt_output(detector):
+    """Tier 2 flags a name inside the local part of an address Tier 1 claims as
+    EMAIL. Naive right-to-left rewriting would emit nested garbage, and dropping
+    the narrower span would leave the leading characters in the clear."""
+    memo = "Refund processed, notify at ayesha.malik@example.com"
+    email_start = memo.index("ayesha")
+    outcome = P.process_message(
+        make_message({"memo": memo}), detector,
+        {"memo": [t2("memo", email_start, email_start + len("ayesha.malik"))]},
+    )
+
+    redacted = payload_of(outcome)["memo"]
+    assert redacted == "Refund processed, notify at [EMAIL+PERSON]"
+    assert "ayesha" not in redacted
+    assert redacted.count("[") == 1
+
+
+def test_merge_spans_unions_partial_overlap():
+    """The leak case stated directly: dropping either span leaves characters."""
+    findings = [
+        Finding("EMAIL", "memo", 10, 30, Tier.RULES, 1.0),
+        Finding("PERSON", "memo", 5, 15, Tier.ENCODER, 0.9),
+    ]
+    assert P.merge_spans(findings) == [(5, 30, "EMAIL+PERSON")]
+
+
+def test_merge_spans_keeps_touching_spans_separate():
+    findings = [
+        Finding("EMAIL", "memo", 0, 5, Tier.RULES, 1.0),
+        Finding("PHONE_PK", "memo", 5, 10, Tier.RULES, 1.0),
+    ]
+    assert P.merge_spans(findings) == [(0, 5, "EMAIL"), (5, 10, "PHONE_PK")]
+
+
+def test_empty_memo_is_clean(detector):
+    outcome = P.process_message(make_message({"memo": ""}), detector, {})
+    assert outcome.action == "clean"
+    assert outcome.findings == []
+
+
+# --------------------------------------------------------------------------- #
+# free_text_fields — the best-effort pre-pass
+# --------------------------------------------------------------------------- #
+def test_free_text_fields_extracts_only_free_text():
+    raw = make_message(
+        {"memo": "Paid Ayesha", "channel": "atm", "amount_pkr": 5.0}
+    ).value()
+    assert P.free_text_fields(raw) == {"memo": "Paid Ayesha"}
+
+
+@pytest.mark.parametrize("value", ["", "   ", "\n\t"])
+def test_free_text_fields_skips_blank(value):
+    """Blank memos must never enter the model batch."""
+    assert P.free_text_fields(make_message({"memo": value}).value()) == {}
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        None,
+        b"",
+        b"not json",
+        b"{}",                                  # no payload key
+        b'{"payload": "a string"}',             # payload not a dict
+        b'{"payload": {"memo": 42}}',           # memo not a string
+        "\udcff".encode("utf-8", "surrogatepass"),   # undecodable bytes
+    ],
+)
+def test_free_text_fields_never_raises(raw):
+    """Unreadable means absent from the batch, not an exception — process_message
+    still quarantines the message through the normal fail-closed path."""
+    assert P.free_text_fields(raw) == {}
+
+
+def test_unreadable_message_still_quarantines_after_prepass(detector):
+    """The pre-pass declining to read a message must not stop it being handled."""
+    assert P.free_text_fields(b"not json") == {}
+    outcome = P.process_message(StubMessage(b"not json"), detector, {})
+    assert outcome.action == "quarantined"
+    assert outcome.failure is not None
 
 
 def test_message_with_uncertain_pii_is_quarantined(detector, pii_payload):
@@ -559,3 +748,93 @@ def test_main_exit_after_zero_runs_until_consume_is_exhausted(monkeypatch):
     assert consumer.consume_calls == 4   # 3 real batches + the exhausted-script call
     assert len(audit.batches) == 3
     assert committed_offset_map(consumer) == {("txn.raw", 0): 3}
+
+
+# --------------------------------------------------------------------------- #
+# Tier 2 in the batch loop
+# --------------------------------------------------------------------------- #
+class FakeTier2:
+    """Records the batch it was handed, and flags the word 'Ayesha'."""
+
+    def __init__(self, delay_ms=0.0):
+        self.batches = []
+        self.delay_ms = delay_ms
+
+    def detect_batch(self, inputs):
+        self.batches.append(inputs)
+        if self.delay_ms:
+            time.sleep(self.delay_ms / 1000)
+        out = {}
+        for key, fields in inputs.items():
+            for field, text in fields.items():
+                if "Ayesha" in text:
+                    s = text.index("Ayesha")
+                    out.setdefault(key, {})[field] = [
+                        t2(field, s, s + len("Ayesha"))
+                    ]
+        return out
+
+
+def run_main_with_tier2(monkeypatch, payloads, tier2, **kw):
+    batch = [make_message(p) for p in payloads]
+    consumer, producer, audit, log = patch_main_deps(monkeypatch, [batch], **kw)
+    # Settings is a frozen dataclass, so swap the whole object rather than a
+    # field. dataclasses.replace keeps every other setting as configured.
+    monkeypatch.setattr(
+        P, "settings", dataclasses.replace(P.settings, tier2_enabled=True)
+    )
+    monkeypatch.setattr(P, "_load_tier2", lambda: tier2)
+    P.main(["--exit-after", str(len(batch)), "--stats-every", "999"])
+    return consumer, producer, audit, log
+
+
+def test_only_nonempty_free_text_is_escalated(monkeypatch):
+    """A blank memo must never reach the model — that is the whole reason
+    dispatch is on the field rather than on a prediction."""
+    tier2 = FakeTier2()
+    run_main_with_tier2(monkeypatch, [
+        {"memo": "Transfer to Ayesha Malik"},
+        {"memo": ""},
+        {"memo": "   "},
+        {"channel": "atm"},
+    ], tier2)
+
+    assert len(tier2.batches) == 1
+    assert set(tier2.batches[0]) == {0}
+
+
+def test_tier2_findings_reach_the_emitted_payload(monkeypatch):
+    tier2 = FakeTier2()
+    _c, producer, _a, _l = run_main_with_tier2(
+        monkeypatch, [{"memo": "Transfer to Ayesha Malik"}], tier2
+    )
+    emitted = producer.produced[0]
+    assert b"Ayesha" not in emitted["value"]
+    assert b"PERSON" in emitted["value"]
+
+
+def test_batch_makes_one_model_call_not_one_per_message(monkeypatch):
+    """The entire reason for the pre-pass: per-message inference costs 29.4 ms
+    against 7.2 batched."""
+    tier2 = FakeTier2()
+    run_main_with_tier2(
+        monkeypatch, [{"memo": f"Ayesha {i}"} for i in range(12)], tier2
+    )
+    assert len(tier2.batches) == 1
+    assert len(tier2.batches[0]) == 12
+
+
+def test_tier2_cost_is_charged_to_escalated_records(monkeypatch):
+    """The model call sits outside the per-message timer, so without explicit
+    attribution the audit would report sub-millisecond latency for records whose
+    real cost was milliseconds."""
+    tier2 = FakeTier2(delay_ms=40)
+    _c, _p, audit, _l = run_main_with_tier2(monkeypatch, [
+        {"memo": "Transfer to Ayesha Malik"},
+        {"memo": ""},
+    ], tier2)
+
+    by_memo = {r.envelope.payload.get("memo"): r.latency_ms
+               for batch in audit.batches for r in batch}
+    assert by_memo["Transfer to Ayesha Malik"] > 30    # carries the model cost
+    assert by_memo[""] < 10                            # skipped it entirely

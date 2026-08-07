@@ -44,7 +44,8 @@ no named volume, so its log does not survive `docker compose down`.
 
 **Synthetic stream.** `generator/transactions.py` produces Pakistani bank
 transactions — CNIC, PK IBAN (with valid ISO 7064 mod-97 check digits), PK
-mobile numbers, Roman-Urdu names, plus a free-text memo field. ~2% of IBANs
+mobile numbers, Pakistani names in Latin script, plus a free-text memo field
+(currently English; there is no Roman Urdu in the pipeline). ~2% of IBANs
 are corrupted deliberately so the quarantine path is exercised.
 `producer.py` is a rate-controlled producer with delivery callbacks and a
 progress bar.
@@ -154,9 +155,16 @@ marked settled / provisional / open. The load-bearing ones:
   bool.
 - **Detection logic is pure functions**, which is why the test suite needs no
   infrastructure.
-- **Tier assignment by cost, not capability** — rules for anything with a
-  checkable format, encoder for contextual entities, LLM only for ambiguous
-  spans.
+- **Tier assignment by capability; cost decides deployment** — rules for
+  anything with a checkable format, encoder for contextual entities (names,
+  addresses) *because no rule can match them at all*, LLM only for ambiguous
+  spans. Within the tools that can do a job, pick the cheapest. Corrected
+  2026-08-06 from "by cost, not capability", which read as though throughput
+  measurements could argue Tier 2 out of the design; they only bound it. See
+  `decisions.md`.
+- **Tier 1 → Tier 2 is dispatch, not escalation** — the schema says which
+  fields are free text, so it is known before either detector runs. Tier 2 →
+  Tier 3 is real escalation (same span, promoted on uncertainty).
 
 ---
 
@@ -275,14 +283,46 @@ whichever way it goes.**
 existing loop. Measure recall, latency and escalation rate together.
 
 **Phase 4 — Pakistani evaluation set.** No public corpus covers CNIC, PK IBAN
-or Roman-Urdu names. A few hundred hand-built records with names sourced
+or Pakistani names. A few hundred hand-built records with names sourced
 independently (e.g. WikiANN-ur or a public name list rather than written by
 the author), disjoint between generation and evaluation, labelled honestly as
 self-constructed.
 
 **The escalation-rate measurement**, which is the point of the tiering claim:
 escalate a field to Tier 2 unless Tier 1's validated findings cover the entire
-field content. Measure in **bytes**, not fields, since encoder cost scales with
+field content.
+
+> **Retired as a category error (2026-08-06).** There is no Tier 1 → Tier 2
+> escalation to measure. This rule predicts, from Tier 1's output, something the
+> schema already states: whether the field is free text. Tier 1 has no name
+> rule, so a memo is not a record it was *uncertain* about — it is one it has no
+> opinion on, and absence of a finding is silence rather than low confidence.
+> The relationship is **dispatch by field type**, fixed before either detector
+> runs. What replaces this measurement is the throughput envelope in §11:
+> free-text redaction on, versus off. The two blockquotes below are kept because
+> the arithmetic in them is still correct and still bounds deployment — but they
+> answer "what does this cost", not "is the architecture right".
+
+> **This rule is known to be unviable as written (2026-08-05).** Tier 2 costs
+> 44.6 ms per record batched, against a measured 0.69 ms per-record budget, so
+> the escalation rate must stay near 1% for tiering to pay. The memo is free
+> text and Tier 1 covers only CNIC/IBAN/phone/email, so this rule escalates
+> essentially every record — ~22 rec/s against 1,450. A replacement predicate
+> is an open design question; note that ~50% of memos genuinely contain a name,
+> so even a perfect oracle would escalate 50% and reach only ~43 rec/s. The
+> cost has to come out of the model, not the predicate. See
+> [tier2-detection-findings.md](tier2-detection-findings.md) §6.3.
+>
+> **Updated 2026-08-06 — the model got cheaper, so this arithmetic moved.**
+> CPU runtime optimization gets Tier 2 to 31.0 ms (ONNX fp32; int8 was refuted
+> in §8), and a GPU gets it to 8.03 ms at batch 8 with identical accuracy. At
+> the same 50% escalation floor that is **213 rec/s on GPU against 62 on CPU** —
+> the gap to 1,450 narrows from 23× to 6.8×. The predicate is still not the
+> lever and this rule is still unviable as written, but "escalation must stay
+> near 1%" is no longer the constraint; on GPU it is nearer 50%, which is
+> exactly where the memo-shaped workload sits. Note the unsettled part: tiering
+> is a claim about **cost**, and a GPU instance costing more than 3.9× a CPU one
+> would make this a cost regression with better latency. See §11. Measure in **bytes**, not fields, since encoder cost scales with
 sequence length. Run three configurations over the same corpus — Tier 2 on
 everything (ceiling recall, worst cost), Tier 1 only (floor recall, best
 cost), and tiered — then report recall retained versus model-only, latency
@@ -296,12 +336,25 @@ and unstructured records, because the contrast is the finding.
 Recorded because it shaped the plan, and because it constrains what can
 honestly be claimed.
 
-`gliner-PII` was fine-tuned **on** Nemotron-PII, and NVIDIA report 92% recall
-/ 64% F1 for it (implying ~49% precision — it over-detects roughly two-to-one,
-which is the correct bias for redaction). Evaluating that model on that corpus
-is evaluating it on its own training distribution. **If Tier 2 is GLiNER-PII,
-the detection-quality ceiling on this corpus is NVIDIA's number, not an
-improvement on it.**
+`gliner-PII` was fine-tuned **on** Nemotron-PII. Evaluating that model on that
+corpus is evaluating it on its own training distribution. **If Tier 2 is
+GLiNER-PII, the detection-quality ceiling on this corpus is NVIDIA's number,
+not an improvement on it.**
+
+*Correction (2026-08-05).* This paragraph previously read "NVIDIA report 92%
+recall / 64% F1 for it (implying ~49% precision)". That is not supported. The
+model card publishes **no recall figure at all**, and reports Strict F1 at
+threshold 0.3 of 0.70 on Argilla, **0.64 on AI4Privacy** and 0.87 on
+Nemotron-PII. The 0.64 was AI4Privacy's, not Nemotron's, and the precision
+figure was inferred from a recall number that does not exist. The card's own
+spread — 0.87 on its training distribution against 0.64–0.70 held out — is the
+generalisation gap this section is actually about, and it makes the point
+without an invented statistic.
+
+**Tier 2 model choice has since changed to `urchade/gliner_multi_pii-v1`**,
+which is not trained on Nemotron, so Phase 0–3 now yields a genuine held-out
+number rather than inheriting this ceiling. Reasoning in
+[tier2-detection-findings.md](tier2-detection-findings.md) §6.
 
 The conclusion drawn: the project is unlikely to win on detection accuracy —
 not against a purpose-built model on its home corpus, not on saturated
@@ -375,10 +428,28 @@ conditional Go rewrite of one consumer.
   broker behaviour.
 - ~~Kafka has no named volume~~ — **closed.** `kafkadata` added; verified that
   2,000 messages and their committed offsets survive `docker compose down`.
-- Topic retention is unconfigured; quarantine plausibly warrants longer
-  retention than clean, for compliance.
+- ~~Topic retention is unconfigured~~ — **closed, and it was a security item
+  rather than the ops one it was filed as.** `txn.quarantine` carries
+  *unredacted originals* by design (`processor.py` forwards `raw` so reviewers
+  see what arrived), and it was inheriting the broker's 168h default on a
+  PLAINTEXT broker with no ACLs. The risk profile was inverted: the PII-free
+  audit database had authentication and unlimited retention, while the
+  PII-bearing topics had neither. Now set explicitly in
+  `scripts/create_topics.py` — raw 24h, clean 168h, quarantine 72h — and
+  applied to existing clusters via `incremental_alter_configs`, since topic
+  creation no-ops once a topic exists. Quarantine retention doubles as the
+  reviewer SLA: past it, a record is dropped unreviewed. Transport security and
+  authorization remain unaddressed and are deployment concerns.
 - Quarantine is terminal — no reviewer workflow, and no distinction between a
-  record that failed once and one that fails permanently.
+  record that failed once and one that fails permanently. **The routing rule for
+  Tier 2 is now decided** (2026-08-06): no confidence band, because every graded
+  boundary was measured at 3–7% queue yield — positives are masked *more* than
+  negatives, so size cannot separate correct redaction from damage. Records are
+  **emitted and flagged**, not blocked (the data is already safe; diverting it
+  costs availability for no privacy gain), and the only flag is full
+  saturation — redaction left nothing at all. That is ~1% of records with no
+  false flags, and it knowingly leaves 64% of over-redaction invisible. See
+  [tier2-detection-findings.md](tier2-detection-findings.md) §10.
 - `schema_version` is validated and stored but nothing branches on it. Recorded
   as a deliberate forward-compatibility hook.
 - Sensitive-attribute PII (GDPR Article 9 categories — race, religion,
