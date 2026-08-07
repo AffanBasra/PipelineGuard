@@ -24,8 +24,10 @@ from build_address_corpus import (  # noqa: E402
     addr_tags,
     build,
     classify,
+    classify_kind,
     compose,
     normalise_city,
+    safe_meta,
 )
 
 
@@ -82,8 +84,62 @@ def test_build_output_carries_no_unexpected_keys():
         "name": "Private Residence", "phone": "03001234567",
     })])
     assert len(records) == 1
-    assert set(records[0]) == {"address", "city", "form", "has_housenumber"}
+    assert set(records[0]) == {
+        "address", "city", "form", "kind", "has_housenumber", "latin",
+    }
     assert "Private Residence" not in records[0]["address"]
+
+
+# --------------------------------------------------------------------------- #
+# The one deliberate exception to the whitelist
+# --------------------------------------------------------------------------- #
+def test_safe_meta_admits_building_and_nothing_else():
+    """`building` describes a structure, not a person, and it is what makes the
+    residential/commercial split reportable. It is the only exception, and it
+    lives outside addr_tags so the address whitelist stays a single rule."""
+    meta = safe_meta(node(**{
+        "building": "house",
+        "name": "Muhammad Ibrahim",
+        "phone": "03001234567",
+        "operator": "Someone",
+        "addr:street": "Mall Road",
+    }))
+    assert meta == {"building": "house"}
+
+
+def test_addr_tags_still_excludes_building():
+    """The exception must not leak back into the address whitelist."""
+    assert addr_tags(node(**{"building": "house", "addr:street": "X"})) == {
+        "street": "X"
+    }
+
+
+@pytest.mark.parametrize(
+    "tags, expected",
+    [
+        ({"building": "house"}, "residential"),
+        ({"building": "apartments"}, "residential"),
+        ({"building": "commercial"}, "commercial"),
+        ({"building": "hospital"}, "institutional"),
+        # A POI marker makes it a business even with no building type.
+        ({"shop": "bakery"}, "commercial"),
+        ({"amenity": "bank"}, "commercial"),
+        # 'yes' means "a building" and nothing more. Guessing would invent data.
+        ({"building": "yes"}, "unknown"),
+        ({}, "unknown"),
+    ],
+)
+def test_kind_classification(tags, expected):
+    assert classify_kind(node(**tags)) == expected
+
+
+def test_unknown_is_the_honest_majority():
+    """78.7% of the real corpus is unknown, because OSM contributors map the
+    outline and skip the type. Forcing those into a bucket would manufacture a
+    residential/commercial split that the data does not support."""
+    elements = [node(**{"addr:street": f"Road {i}", "building": "yes"})
+                for i in range(10)]
+    assert {r["kind"] for r in build(elements)} == {"unknown"}
 
 
 # --------------------------------------------------------------------------- #

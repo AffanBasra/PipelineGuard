@@ -36,8 +36,31 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 OUT_DIR = REPO / "data" / "osm-addresses"
 
-# The only keys ever read. Anything absent from this set cannot reach the output.
+# The only address keys ever read. Anything absent cannot reach the output.
 ADDR_PREFIX = "addr:"
+
+# The one deliberate exception, kept separate so it stays visible rather than
+# being absorbed into the address whitelist.
+#
+# `building` describes a structure -- house, commercial, mosque -- not a person.
+# It is not personal data under any reading, and it answers a question that
+# matters: a home address is PII, a shop's address largely is not, so the
+# evaluation has to be able to report them separately. Nothing else earns an
+# exception; `name`, `phone`, `operator` and the rest stay excluded.
+SAFE_META_KEYS = frozenset({"building"})
+
+RESIDENTIAL = frozenset({
+    "house", "residential", "apartments", "detached",
+    "semidetached_house", "terrace", "dormitory", "bungalow",
+})
+COMMERCIAL = frozenset({
+    "commercial", "retail", "office", "industrial",
+    "warehouse", "supermarket", "kiosk", "shop",
+})
+INSTITUTIONAL = frozenset({
+    "school", "hospital", "mosque", "university", "college",
+    "church", "government", "clinic", "public",
+})
 
 # Case and script variants seen in the Kaggle export: 'lahore', 'LAHORE',
 # 'لاہور'. Left unnormalised these split one city across four rows in the
@@ -63,6 +86,12 @@ SECTOR_CODE = re.compile(r"\b[A-Z]-\d+(/\d+)?\b")
 # export's 9,446 elements trips this.
 LONG_DIGIT_RUN = re.compile(r"\d{7,}")
 
+# A minority of street names are written in Urdu script ('17, اسٹریٹ 32'). They
+# are real, but script coverage is a different question from the one being
+# asked, and mixing them in confounds the residential/commercial comparison.
+# Flagged rather than dropped, so the probe can exclude them and say how many.
+LATIN_ONLY = re.compile(r"^[\x00-\x7FÀ-ɏ]*$")
+
 
 def load_elements(source: Path) -> list[dict]:
     """Elements from one Overpass JSON file, or every .json in a directory."""
@@ -86,6 +115,39 @@ def addr_tags(element: dict) -> dict[str, str]:
         for key, value in element.get("tags", {}).items()
         if key.startswith(ADDR_PREFIX) and isinstance(value, str) and value.strip()
     }
+
+
+def safe_meta(element: dict) -> dict[str, str]:
+    """The `building` exception. Kept apart from addr_tags so the whitelist for
+    address fields stays exactly one rule with no carve-outs inside it."""
+    return {
+        key: value
+        for key, value in element.get("tags", {}).items()
+        if key in SAFE_META_KEYS and isinstance(value, str)
+    }
+
+
+def classify_kind(element: dict) -> str:
+    """residential | commercial | institutional | unknown.
+
+    `building=yes` means "a building" and nothing more, so it is unknown rather
+    than a guess. Most of this corpus is unknown -- OSM contributors map the
+    outline and skip the type -- and reporting that honestly matters more than
+    forcing every row into a bucket.
+    """
+    building = safe_meta(element).get("building", "")
+    if building in RESIDENTIAL:
+        return "residential"
+    if building in COMMERCIAL:
+        return "commercial"
+    if building in INSTITUTIONAL:
+        return "institutional"
+    # amenity/shop/office are POI markers, not building types, and a node with
+    # one is a business even when its building tag is missing.
+    tags = element.get("tags", {})
+    if tags.get("shop") or tags.get("amenity") or tags.get("office"):
+        return "commercial"
+    return "unknown"
 
 
 def normalise_city(city: str) -> str:
@@ -147,7 +209,9 @@ def build(elements: list[dict]) -> list[dict]:
             "address": address,
             "city": normalise_city(tags.get("city", "")) or "(unknown)",
             "form": classify(address),
+            "kind": classify_kind(element),
             "has_housenumber": "housenumber" in tags,
+            "latin": bool(LATIN_ONLY.match(address)),
         })
     return records
 
@@ -165,16 +229,19 @@ def report(elements: list[dict], records: list[dict]) -> None:
     for form, n in Counter(r["form"] for r in records).most_common():
         print(f"  {form:<24} {n:>6,}  {n / len(records):>5.1%}")
 
-    with_num = sum(r["has_housenumber"] for r in records)
-    print(f"\nwith house number  : {with_num:,} ({with_num / len(records):.1%})")
+    print("\nby kind:")
+    for kind, n in Counter(r["kind"] for r in records).most_common():
+        print(f"  {kind:<24} {n:>6,}  {n / len(records):>5.1%}")
 
-    print("\nsamples:")
-    for form in ("sector_code", "block_phase", "plain_street"):
-        matches = [r["address"] for r in records if r["form"] == form][:3]
-        for address in matches:
-            print(f"  [{form:<12}] {address}")
-        if not matches:
-            print(f"  [{form:<12}] (none)")
+    with_num = sum(r["has_housenumber"] for r in records)
+    latin = sum(r["latin"] for r in records)
+    print(f"\nwith house number  : {with_num:,} ({with_num / len(records):.1%})")
+    print(f"latin script only  : {latin:,} ({latin / len(records):.1%})")
+
+    print("\nsamples by kind:")
+    for kind in ("residential", "commercial", "institutional"):
+        for record in [r for r in records if r["kind"] == kind][:3]:
+            print(f"  [{kind:<13}] {record['address']}")
 
 
 def main(argv: list[str] | None = None) -> int:
