@@ -1234,3 +1234,167 @@ concentrated in house numbers, which are the identifying part.
   real probabilities and do not respond to GLiNER's cutoffs.
 - Both `gliner_community` and `xlm-roberta` failed on first run with network
   errors, not model errors. Re-run before trusting any single number here.
+
+---
+
+## 15. A checkpoint swap beats fine-tuning, and §14 was measured on too little
+
+§14 scored four encoders on 7,371 Lahore addresses from a Kaggle export. This
+re-runs it on **91,663 addresses across eight cities**, fetched from Overpass
+directly, and adds the PERSON axis §14 never measured.
+
+Two of §14's claims do not survive. Both were mine.
+
+### 15.1 What changed about the corpus
+
+The Overpass fetcher failed three times in ways that returned **HTTP 200 with a
+plausible result** rather than an error:
+
+- `area["name"="Islamabad"]` matched nothing — Pakistani administrative
+  boundaries are named in Urdu script (`اسلام‌آباد`, `پنجاب`).
+- `area["name:en"=...]` resolved, but also matched three `Islomobod` hamlets in
+  Central Asia, and adding `["boundary"="administrative"]` matched nothing at
+  all, because Overpass areas do not carry that tag.
+- Scanning a resolved area for every `addr:street` node timed out with 504.
+
+Bounding boxes avoid area resolution entirely. But the first set was written
+**from memory, and six of eight clipped their city** — a failure that is
+invisible, because a small box returns fewer addresses rather than an error.
+Islamabad's 5,331 elements looked entirely reasonable. Boxes now come from
+Nominatim's administrative boundary, checked by `scripts/verify_bboxes.py`,
+which also rejects point results: Nominatim resolves Multan and Quetta to an
+office node and a railway station, and a point fits inside any box.
+
+| | §14 (Kaggle) | §15 (8 cities) |
+|---|---:|---:|
+| raw elements | 9,446 | **150,504** |
+| unique addresses | 7,371 | **91,663** |
+| residential | 840 | 30,325 |
+| commercial | 713 | 24,833 |
+| sector-code forms | **19** | **2,592** |
+
+### 15.2 A wiring bug that would have published a false result
+
+The first PERSON run reported urchade at **8.4%**, against the 99.4% §2
+measured. The tell was in the bucket names: it reported `kind:residential` and
+`form:sector_code` at n=3600. Those are *address* cases. The patch had switched
+the labels to PERSON and left the corpus on addresses, so it searched 3,600
+street addresses for people's names.
+
+Read at face value it says these models cannot find names. The probe now prints
+`entity=` and its bucket names on every run, so the mismatch announces itself.
+
+### 15.3 PERSON — 165 synthetic name cases
+
+| model | ALL | common | rare | ambiguous |
+|---|---:|---:|---:|---:|
+| **gliner-community/gliner_medium-v2.5** | **100.0%** | 100.0% | 100.0% | 100.0% |
+| urchade/gliner_multi_pii-v1 | 99.4% | 100.0% | 97.8% | 100.0% |
+| xlm-roberta-large-conll03 | 93.8% | 95.8% | **84.4%** | 99.8% |
+| nvidia/gliner-PII | 91.1% | 91.4% | 92.6% | 88.9% |
+
+Names stay synthetic on purpose. `decisions.md` §1 forbids processing real
+personal data, so unlike addresses there is no honest way to source these
+externally. **These numbers are comparable to §2, not independent of it**, and
+that is a real limit on what this table proves.
+
+### 15.4 ADDRESS — 91,663 real addresses
+
+| model | ALL | residential | commercial | sector_code | plain_street |
+|---|---:|---:|---:|---:|---:|
+| **gliner_medium-v2.5** | **86.5%** | 87.2% | 84.8% | **84.3%** | 86.8% |
+| urchade | 75.3% | 73.7% | 73.7% | 66.3% | 77.3% |
+| nvidia | 74.7% | 78.5% | 65.4% | **57.9%** | 82.4% |
+| xlmr_conll | 52.3% | 48.3% | 55.6% | 51.7% | 60.0% |
+
+### 15.5 §14.3 was wrong
+
+§14.3 said *"every model is worse on homes than on businesses"* and called it
+the finding that matters. On ten times the data it does not hold:
+
+| model | §14 gap | §15 gap |
+|---|---:|---:|
+| urchade | 12.4 | **−0.1** |
+| nvidia | 3.0 | **−13.0** |
+| gliner_community | 4.3 | **−2.4** |
+
+The gap vanishes for urchade and reverses for the other two. §14.3 was an
+artifact of an 840-address Lahore-only sample.
+
+**The replacement needs its own caveat.** The scored sample is 251 of 300 from
+Karachi, because Karachi is 75,693 of 91,663 addresses. So "residential is not
+harder" is a statement about Karachi, not Pakistan. Swapping one over-claim for
+another would repeat the mistake rather than fix it.
+
+What holds across *both* corpora is the **address-form penalty**, now measured
+on 2,592 real sector-code addresses rather than 19:
+
+```
+nvidia            plain 82.4%  ->  sector 57.9%   (-24.5)
+urchade           plain 77.3%  ->  sector 66.3%   (-11.0)
+gliner_community  plain 86.8%  ->  sector 84.3%   ( -2.5)
+```
+
+That is §3 and §6.2's finding, confirmed on addresses nobody here wrote.
+
+### 15.6 §6.2's style divergence replicates
+
+| model | english | codeswitch | roman_urdu |
+|---|---:|---:|---:|
+| gliner_community | 87.3% | 86.0% | 86.1% |
+| nvidia | 83.0% | 72.3% | **68.9%** |
+| urchade | **67.4%** | 77.0% | 81.6% |
+
+urchade rises 14.2 points into Roman Urdu; nvidia falls 14.1. §6.2 saw this,
+called urchade's direction "not explicable", and attributed it to noise at
+n=12. It replicates at n=1,200 on real addresses. The cross-model conclusion
+stands; the dismissal does not. I still have no explanation.
+
+`gliner_community` is flat across all three, which is its own kind of evidence.
+
+### 15.7 Cost
+
+Measured through `Tier2Detector.detect_batch` on the same GPU, PERSON labels
+only, interleaved medians over 5 runs:
+
+| model | ms/record | vs urchade |
+|---|---:|---:|
+| urchade | 6.6 | 1.00× |
+| gliner_medium-v2.5 | **7.3** | **1.11×** |
+
+**11% more expensive for +11 points of ADDRESS coverage and +0.6 on PERSON.**
+
+### 15.8 What this decides
+
+**Fine-tuning is not justified.** The question was whether the address gap
+warranted training a model. An off-the-shelf checkpoint nobody had tried
+reaches 100% on PERSON and 86.5% on ADDRESS for 11% more compute — no training,
+no synthetic-data pipeline, and none of the eval-set circularity that would
+make a fine-tuned result hard to trust.
+
+The honest reading of §14 and §15 together is that **the model selection in §6.1
+was made on the wrong axis** — PERSON coverage and cost, at a time when ADDRESS
+had been removed from the pipeline. It was not wrong; it was under-tested.
+
+Before switching `TIER2_MODEL`, two things are still unmeasured:
+
+- **Precision.** §8 measured over-redaction for urchade only. A model that
+  covers more characters may also destroy more clean text, and §8 is the
+  measurement that caught int8 doing exactly that.
+- **Threshold.** 0.25 was swept for urchade. §6.1 established thresholds do not
+  transfer between checkpoints, and `Tier2Detector.load()` now warns when the
+  model does not match the one the threshold was tuned for.
+
+### 15.9 Limits
+
+- **83% Karachi.** Every conclusion here is weighted toward one city's
+  conventions. Islamabad contributes 2,407 addresses and Multan, Peshawar and
+  Quetta under 300 combined.
+- PERSON is synthetic and shares its corpus with §2.
+- Sentence frames remain hand-written; only the addresses are independent.
+- `xlm-roberta-large-conll03` has no address class, so its ADDRESS numbers
+  measure a label mismatch rather than the model. Its **PERSON** number, where
+  `PER` is a genuine match, is the fair test of it — and 84.4% on rare names is
+  the weakest cell in that column.
+- Both non-baseline models failed on first run with network errors. Re-run
+  before trusting any single figure.

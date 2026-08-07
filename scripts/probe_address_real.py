@@ -208,17 +208,23 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", default="address_real_results.json")
     args = ap.parse_args(argv)
 
-    if not CORPUS.exists():
-        print(f"no corpus at {CORPUS}\nrun scripts/build_address_corpus.py first",
-              file=sys.stderr)
-        return 1
+    if args.entity == "person":
+        cases = build_person_cases()
+    else:
+        if not CORPUS.exists():
+            print(f"no corpus at {CORPUS}\n"
+                  f"run scripts/build_address_corpus.py first", file=sys.stderr)
+            return 1
+        cases = build_cases(load_corpus(args.sample))
 
-    records = load_corpus(args.sample)
-    cases = build_cases(records)
     by_kind = defaultdict(int)
-    for record in records:
-        by_kind[record["kind"]] += 1
-    print(f"{len(records)} addresses -> {len(cases)} cases  {dict(by_kind)}\n",
+    for case in cases:
+        by_kind[case[1]] += 1
+    # The bucket names are printed because they are the tell when entity and
+    # corpus disagree: a person run that reports 'residential' is scoring
+    # addresses with person labels, which looks like a terrible model rather
+    # than a wiring bug.
+    print(f"entity={args.entity}  {len(cases)} cases  {dict(by_kind)}\n",
           flush=True)
 
     results = {}
