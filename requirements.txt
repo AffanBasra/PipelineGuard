@@ -3,6 +3,9 @@ psycopg[binary]>=3.2
 faker>=26.0
 python-dotenv>=1.0
 tqdm>=4.66
+# Used directly by scripts/fetch_osm_addresses.py. Previously present only as a
+# transitive dependency of huggingface_hub, which made it work by accident.
+requests>=2.31
 
 # Tier 2 encoder. Plain install pulls the CPU build of torch; for GPU (measured
 # at 8.03 ms/record against 31.0 on CPU) install it from the CUDA index first:
