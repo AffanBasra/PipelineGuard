@@ -72,10 +72,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # the leading candidate on cost (20.7 ms/record vs 40.9), and it emits 24% more
 # spans per case than fp32, which is exactly the surplus that has to be shown
 # to be harmless here or the speedup is not real.
+#
+# gliner_community carries a wider threshold range because §6.1 established that
+# thresholds do not transfer between checkpoints, and this one has never been
+# swept. §15 found it covers 11 more points of ADDRESS than urchade; the whole
+# question here is whether it buys that by flagging more, which is exactly how
+# int8 looked good in §7 before §8 caught it.
 CONFIGS = [
     ("urchade_fp32", "urchade/gliner_multi_pii-v1", False, (0.25, 0.40, 0.55)),
     ("urchade_int8", "urchade/gliner_multi_pii-v1", True, (0.002, 0.005, 0.01)),
     ("nvidia_fp32", "nvidia/gliner-PII", False, (0.25, 0.40, 0.55)),
+    ("community_fp32", "gliner-community/gliner_medium-v2.5", False,
+     (0.25, 0.40, 0.55, 0.70, 0.85)),
 ]
 LABELS = {
     "PERSON": ["person", "first_name", "last_name"],

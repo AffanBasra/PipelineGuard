@@ -216,3 +216,68 @@ def test_unknown_cities_pass_through_unchanged():
 )
 def test_form_classification(address, form):
     assert classify(address) == form
+
+
+# --------------------------------------------------------------------------- #
+# Regressions found by code review
+# --------------------------------------------------------------------------- #
+def test_dedup_keeps_the_typed_duplicate_regardless_of_order():
+    """Overpass returns a node AND a way for the same building. The node
+    usually carries only addr:*, the way carries building=house. First-wins
+    threw the type away whenever the node arrived first, so the same address was
+    'unknown' or 'residential' depending on arrival order -- which biased the
+    residential/commercial split that sections 14 and 15 both turn on."""
+    plain = node(**{"addr:street": "Mall Road", "addr:housenumber": "12"})
+    typed = {"type": "way", "id": 2,
+             "tags": {"addr:street": "Mall Road", "addr:housenumber": "12",
+                      "building": "house"}}
+
+    for elements in ([plain, typed], [typed, plain]):
+        records = build(elements)
+        assert len(records) == 1
+        assert records[0]["kind"] == "residential"
+
+
+def test_a_later_untyped_duplicate_cannot_erase_a_type():
+    """The converse: replacing on every duplicate would let an untyped node
+    arriving third undo a good classification."""
+    typed = node(**{"addr:street": "X", "building": "commercial"})
+    plain = node(**{"addr:street": "X"})
+    assert build([typed, plain, plain])[0]["kind"] == "commercial"
+
+
+@pytest.mark.parametrize(
+    "address",
+    ["House 12, F-8/3 Islamabad", "house 12, f-8/3 islamabad",
+     "Street 16, G-9/1", "street 16, g-9/1"],
+)
+def test_sector_codes_match_in_any_case(address):
+    """OSM values are case-inconsistent -- the module's own alias table
+    documents lahore/LAHORE/Lahore. Without re.I the lowercase forms were filed
+    as plain_street, contaminating both cells of the sector-vs-plain
+    comparison."""
+    assert classify(address) == "sector_code"
+
+
+def test_city_survives_a_road_named_after_it():
+    """The duplicate-city guard was a substring test, so every address on a road
+    named after its own city lost the city entirely."""
+    assert compose({"street": "Multan Road", "city": "Multan"}) == \
+        "Multan Road, Multan"
+    assert compose({"street": "Mall Road", "city": "Lahore"}) == \
+        "Mall Road, Lahore"
+
+
+def test_trailing_city_is_still_not_duplicated():
+    """The original bug this guard was written for must stay fixed."""
+    address = compose({"street": "Sector F Dha Phase 1, Lahore", "city": "Lahore"})
+    assert address.lower().count("lahore") == 1
+
+
+def test_poi_tags_are_read_through_the_whitelist():
+    """classify_kind read shop/amenity/office straight off the element, which
+    contradicted the module's claim that the whitelist is the only way tags are
+    read. They are safe -- a shop category is not a person -- so they belong in
+    SAFE_META_KEYS rather than bypassing it."""
+    assert safe_meta(node(**{"shop": "bakery", "name": "Ali"})) == {"shop": "bakery"}
+    assert classify_kind(node(**{"shop": "bakery"})) == "commercial"

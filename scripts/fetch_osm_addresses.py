@@ -135,11 +135,26 @@ def fetch_city(city: str, timeout: float = 300.0) -> dict:
 
         if response is not None:
             if response.status_code == 200:
-                return response.json()
-            if response.status_code not in (429, 504, 502, 503):
-                response.raise_for_status()
-            print(f"    {mirror.split('/')[2]}: HTTP {response.status_code}",
-                  flush=True)
+                payload = response.json()
+                # A 200 is not success. Overpass reports a server-side timeout
+                # or out-of-memory in a `remark` field with a truncated or empty
+                # element list, and caching that would persist a half-fetched
+                # city that only --refresh would ever correct. Every earlier bug
+                # in this script had the same shape: HTTP 200, plausible result.
+                remark = payload.get("remark")
+                if remark:
+                    print(f"    {mirror.split('/')[2]}: remark: {remark[:70]}",
+                          flush=True)
+                elif not payload.get("elements"):
+                    print(f"    {mirror.split('/')[2]}: 200 but zero elements",
+                          flush=True)
+                else:
+                    return payload
+            else:
+                if response.status_code not in (429, 504, 502, 503):
+                    response.raise_for_status()
+                print(f"    {mirror.split('/')[2]}: HTTP {response.status_code}",
+                      flush=True)
 
         if attempt < MAX_ATTEMPTS:
             print(f"    retry {attempt + 1}/{MAX_ATTEMPTS} in {delay:.0f}s",
@@ -157,6 +172,14 @@ def main(argv: list[str] | None = None) -> int:
                     help="re-fetch even if a cache file exists")
     ap.add_argument("--cache-dir", default=str(CACHE_DIR))
     args = ap.parse_args(argv)
+
+    # Validated here rather than left to raise KeyError from inside the retry
+    # loop, where it reads as a network fault.
+    unknown = [c for c in args.cities if c not in CITY_BBOX]
+    if unknown:
+        print(f"unknown cities: {', '.join(unknown)}\n"
+              f"known: {', '.join(CITY_BBOX)}", file=sys.stderr)
+        return 1
 
     cache_dir = Path(args.cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)

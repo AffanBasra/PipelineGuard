@@ -74,23 +74,35 @@ THRESHOLDS = (0.25, 0.40, 0.55)
 KINDS = ("residential", "commercial", "unknown")
 
 
-def load_corpus(sample: int, seed: int = 20260807) -> list[dict]:
-    """Latin-script addresses only, balanced across kind where possible.
+def load_corpus(sample: int, stratify: str = "kind",
+                seed: int = 20260807) -> list[dict]:
+    """Latin-script addresses, balanced across `stratify` where possible.
 
-    Script coverage is a different question from the one being asked, and 51 of
-    7,371 addresses are Urdu-script, so mixing them in would confound the
-    residential/commercial comparison for no gain.
+    Stratifying by kind leaves rare FORMS badly under-sampled: sector_code is
+    2.8% of the corpus, so a kind-balanced sample of 300 held 13 of them. §15
+    then claimed the form penalty was "measured on 2,592 sector-code addresses",
+    which was the corpus count, not the scored count. Stratify by form to make
+    a claim about forms.
+
+    Script coverage is a different question from the one being asked, and the
+    Urdu-script addresses are a small minority, so mixing them in would confound
+    the comparison for no gain.
     """
     payload = json.loads(CORPUS.read_text(encoding="utf-8"))
     records = [r for r in payload["addresses"] if r["latin"]]
 
+    buckets = sorted({r[stratify] for r in records})
     rng = random.Random(seed)
-    per_kind = max(1, sample // len(KINDS))
+    per_bucket = max(1, sample // len(buckets))
     chosen = []
-    for kind in KINDS:
-        pool = [r for r in records if r["kind"] == kind]
+    for bucket in buckets:
+        pool = [r for r in records if r[stratify] == bucket]
         rng.shuffle(pool)
-        chosen.extend(pool[:per_kind])
+        take = pool[:per_bucket]
+        if len(take) < per_bucket:
+            print(f"  note: only {len(take)} addresses for {stratify}="
+                  f"{bucket}, wanted {per_bucket}", flush=True)
+        chosen.extend(take)
     return chosen
 
 
@@ -201,10 +213,17 @@ def score(predict, cases, threshold, batch_size=16) -> dict:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--sample", type=int, default=300,
-                    help="addresses per kind bucket (each is run through every frame)")
+                    help="TOTAL addresses, split evenly across the strata; "
+                         "each is then run through every sentence frame")
+    ap.add_argument("--stratify", choices=("kind", "form"), default="kind",
+                    help="balance the sample by building type or address form. "
+                         "Claims about forms need form stratification.")
     ap.add_argument("--only", nargs="*", default=None)
     ap.add_argument("--entity", choices=("address", "person"),
                     default="address")
+    ap.add_argument("--thresholds", nargs="*", type=float, default=None,
+                    help="override the GLiNER sweep; thresholds do not transfer "
+                         "between checkpoints (see findings 6.1)")
     ap.add_argument("--out", default="address_real_results.json")
     args = ap.parse_args(argv)
 
@@ -215,7 +234,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"no corpus at {CORPUS}\n"
                   f"run scripts/build_address_corpus.py first", file=sys.stderr)
             return 1
-        cases = build_cases(load_corpus(args.sample))
+        cases = build_cases(load_corpus(args.sample, args.stratify))
 
     by_kind = defaultdict(int)
     for case in cases:
@@ -242,7 +261,8 @@ def main(argv: list[str] | None = None) -> int:
 
         # A token classifier's score is a real probability and does not respond
         # to GLiNER's thresholds, so it is scored once.
-        thresholds = THRESHOLDS if kind == "gliner" else (0.5,)
+        thresholds = (tuple(args.thresholds) if args.thresholds
+                      else THRESHOLDS) if kind == "gliner" else (0.5,)
         entry = {"model_id": model_id, "kind": kind}
         for threshold in thresholds:
             t0 = time.perf_counter()
@@ -255,7 +275,18 @@ def main(argv: list[str] | None = None) -> int:
                   f"{buckets}  ({time.perf_counter() - t0:.0f}s)", flush=True)
         results[name] = entry
 
-    Path(args.out).write_text(json.dumps(results, indent=2), encoding="utf-8")
+    # Merge rather than overwrite. --only is the documented way to re-run a
+    # model that failed on a network error, and overwriting would destroy the
+    # results of the models that had succeeded.
+    out = Path(args.out)
+    if out.exists():
+        try:
+            merged = json.loads(out.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            merged = {}
+        merged.update(results)
+        results = merged
+    out.write_text(json.dumps(results, indent=2), encoding="utf-8")
     print(f"\nwrote {args.out}")
     return 0
 

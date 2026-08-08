@@ -32,7 +32,13 @@ USER_AGENT = (
 # Nominatim asks for at most one request per second.
 SLEEP = 1.2
 
-# Cities whose plain name resolves to a point rather than a boundary.
+# Cities whose plain name does not resolve to a usable boundary: Nominatim
+# returns a point for Multan and Quetta (an office node and a railway station),
+# and nothing in the top results for Lahore and Rawalpindi.
+#
+# These references are DISTRICTS, which are larger than the city a box targets.
+# So the check is containment of the city's core, not of the whole district --
+# demanding the latter would fail boxes that are correct for their purpose.
 DISTRICT_FALLBACK = {
     "Multan": "Multan District",
     "Quetta": "Quetta District",
@@ -40,6 +46,12 @@ DISTRICT_FALLBACK = {
     "Rawalpindi": "Rawalpindi District",
     "Islamabad": "Islamabad Capital Territory",
 }
+
+# Fraction of the reference box each side must cover. A district reference is
+# deliberately wider than the city, so requiring full containment would reject
+# correct boxes; requiring the centre plus most of the span catches the real
+# failure, which is a box centred wrong or far too small.
+MIN_OVERLAP = 0.55
 
 
 def nominatim_bbox(query: str) -> tuple[float, float, float, float] | None:
@@ -64,6 +76,7 @@ def nominatim_bbox(query: str) -> tuple[float, float, float, float] | None:
 
 def main() -> int:
     failures = 0
+    skipped = 0
     print(f"{'city':<13} {'ours (S,W,N,E)':<32} {'nominatim':<32} verdict")
     print("-" * 92)
 
@@ -73,25 +86,39 @@ def main() -> int:
         time.sleep(SLEEP)
 
         if reference is None:
+            skipped += 1
             print(f"{city:<13} {box:<32} {'no boundary found':<32} SKIP")
             continue
 
         s, w, n, e = ours
         rs, rw, rn, re_ = reference
-        covers = s <= rs + 0.02 and w <= rw + 0.02 and n >= rn - 0.02 and e >= re_ - 0.02
+
+        # Must contain the reference centre, and cover most of its span.
+        centre_lat, centre_lon = (rs + rn) / 2, (rw + re_) / 2
+        holds_centre = s <= centre_lat <= n and w <= centre_lon <= e
+        lat_overlap = max(0.0, min(n, rn) - max(s, rs)) / max(rn - rs, 1e-9)
+        lon_overlap = max(0.0, min(e, re_) - max(w, rw)) / max(re_ - rw, 1e-9)
+        covers = (holds_centre
+                  and lat_overlap >= MIN_OVERLAP and lon_overlap >= MIN_OVERLAP)
+
         failures += not covers
         mine = f"{s},{w},{n},{e}"
         ref = f"{rs:.2f},{rw:.2f},{rn:.2f},{re_:.2f}"
-        print(f"{city:<13} {mine:<32} {ref:<32} "
-              f"{'OK' if covers else 'CLIPS THE CITY'}")
+        note = "OK" if covers else (
+            "CENTRE OUTSIDE BOX" if not holds_centre
+            else f"COVERS {min(lat_overlap, lon_overlap):.0%} OF SPAN")
+        print(f"{city:<13} {mine:<32} {ref:<32} {note}")
 
+    checked = len(CITY_BBOX) - skipped
     print()
+    print(f"checked {checked} of {len(CITY_BBOX)}; {failures} failed, "
+          f"{skipped} unverified")
     if failures:
-        print(f"{failures} box(es) clip their city -- widen them in "
-              f"fetch_osm_addresses.py and re-fetch with --refresh")
-    else:
-        print("all boxes contain their city")
-    return 1 if failures else 0
+        print("widen the failing boxes in fetch_osm_addresses.py, "
+              "then re-fetch with --refresh")
+    # A skip is not a pass. Exiting 0 with three of eight verified would make
+    # this script's endorsement worthless, and section 15.1 leans on it.
+    return 1 if (failures or skipped) else 0
 
 
 if __name__ == "__main__":

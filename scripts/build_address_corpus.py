@@ -42,12 +42,12 @@ ADDR_PREFIX = "addr:"
 # The one deliberate exception, kept separate so it stays visible rather than
 # being absorbed into the address whitelist.
 #
-# `building` describes a structure -- house, commercial, mosque -- not a person.
-# It is not personal data under any reading, and it answers a question that
-# matters: a home address is PII, a shop's address largely is not, so the
-# evaluation has to be able to report them separately. Nothing else earns an
-# exception; `name`, `phone`, `operator` and the rest stay excluded.
-SAFE_META_KEYS = frozenset({"building"})
+# These describe a structure or a business category -- house, commercial,
+# mosque, bakery -- never a person. They are not personal data under any
+# reading, and they answer a question that matters: a home address is PII, a
+# shop's address largely is not, so the evaluation has to report them
+# separately. `name`, `phone`, `operator` and the rest stay excluded.
+SAFE_META_KEYS = frozenset({"building", "shop", "amenity", "office"})
 
 RESIDENTIAL = frozenset({
     "house", "residential", "apartments", "detached",
@@ -92,7 +92,10 @@ CITY_PREFIXES = (
 BLOCK_FORM = re.compile(
     r"\b(block|blk|phase|ph|sector|sec|society|colony|town|scheme)\b", re.I
 )
-SECTOR_CODE = re.compile(r"\b[A-Z]-\d+(/\d+)?\b")
+# re.I to match BLOCK_FORM above. Without it 'f-8/3' was filed as plain_street
+# while 'F-8/3' was sector_code, contaminating both cells of the comparison --
+# and OSM values are case-inconsistent, as CITY_ALIASES already documents.
+SECTOR_CODE = re.compile(r"\b[A-Z]-\d+(/\d+)?\b", re.I)
 
 # A digit run this long in an address field is a phone number or an ID that
 # slipped into the wrong tag, not a house number. Exactly one of the Kaggle
@@ -131,8 +134,8 @@ def addr_tags(element: dict) -> dict[str, str]:
 
 
 def safe_meta(element: dict) -> dict[str, str]:
-    """The `building` exception. Kept apart from addr_tags so the whitelist for
-    address fields stays exactly one rule with no carve-outs inside it."""
+    """The non-address exceptions. Kept apart from addr_tags so the whitelist
+    for address fields stays exactly one rule with no carve-outs inside it."""
     return {
         key: value
         for key, value in element.get("tags", {}).items()
@@ -148,17 +151,18 @@ def classify_kind(element: dict) -> str:
     outline and skip the type -- and reporting that honestly matters more than
     forcing every row into a bucket.
     """
-    building = safe_meta(element).get("building", "")
+    meta = safe_meta(element)
+    building = meta.get("building", "")
     if building in RESIDENTIAL:
         return "residential"
     if building in COMMERCIAL:
         return "commercial"
     if building in INSTITUTIONAL:
         return "institutional"
-    # amenity/shop/office are POI markers, not building types, and a node with
-    # one is a business even when its building tag is missing.
-    tags = element.get("tags", {})
-    if tags.get("shop") or tags.get("amenity") or tags.get("office"):
+    # POI markers, not building types: a node with one is a business even when
+    # its building tag is missing. Read through safe_meta rather than straight
+    # off the element, so the whitelist remains the only way tags are read.
+    if meta.get("shop") or meta.get("amenity") or meta.get("office"):
         return "commercial"
     return "unknown"
 
@@ -197,7 +201,13 @@ def compose(tags: dict[str, str]) -> str | None:
     # and would have been scored as one.
     city = normalise_city(tags.get("city", ""))
     joined = ", ".join(parts)
-    if city and city.lower() not in joined.lower():
+    # Present as its own comma-delimited component, not merely as a substring.
+    # 'Sector F Dha Phase 1, Lahore, Pakistan' already names Lahore and must not
+    # gain a second one; 'Multan Road' only contains 'Multan' inside a road name
+    # and still needs its city. A substring test failed the first case, an
+    # endswith test failed the second.
+    components = {p.strip().lower() for p in joined.split(",")}
+    if city and city.lower() not in components:
         parts.append(city)
 
     address = ", ".join(parts)
@@ -214,27 +224,37 @@ def classify(address: str) -> str:
 
 
 def build(elements: list[dict]) -> list[dict]:
-    """Deduplicated address records, each with its city and form."""
-    seen: set[str] = set()
-    records = []
+    """Deduplicated address records, each with its city, form and kind.
+
+    Deduplication keeps the BEST-TYPED duplicate, not the first one. Overpass
+    returns a node and a way for the same building: the node usually carries
+    only addr:* tags, while the building outline carries `building=house`.
+    First-wins therefore threw away the building type whenever the node arrived
+    first -- the same address classified 'unknown' or 'residential' depending on
+    arrival order. That inflated the unknown share and biased the
+    residential/commercial split that §14 and §15 both turn on.
+    """
+    best: dict[str, dict] = {}
     for element in elements:
         tags = addr_tags(element)
         address = compose(tags)
-        # Overpass returns a node AND a way for the same building, and the
-        # Kaggle export repeats 'Model Town Block G' six times. Without this the
-        # evaluation silently weights toward whatever repeats most.
-        if not address or address in seen:
+        if not address:
             continue
-        seen.add(address)
-        records.append({
+        kind = classify_kind(element)
+        existing = best.get(address)
+        # Only replace an existing record when this one is actually classified;
+        # otherwise a later untyped duplicate would undo a good classification.
+        if existing is not None and (kind == "unknown" or existing["kind"] != "unknown"):
+            continue
+        best[address] = {
             "address": address,
             "city": normalise_city(tags.get("city", "")) or "(unknown)",
             "form": classify(address),
-            "kind": classify_kind(element),
+            "kind": kind,
             "has_housenumber": "housenumber" in tags,
             "latin": bool(LATIN_ONLY.match(address)),
-        })
-    return records
+        }
+    return list(best.values())
 
 
 def report(elements: list[dict], records: list[dict]) -> None:
