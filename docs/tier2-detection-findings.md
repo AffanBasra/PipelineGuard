@@ -1398,3 +1398,154 @@ Before switching `TIER2_MODEL`, two things are still unmeasured:
   the weakest cell in that column.
 - Both non-baseline models failed on first run with network errors. Re-run
   before trusting any single figure.
+
+---
+
+## 16. The decision: swap the checkpoint, do not fine-tune
+
+§15 recommended `gliner-community/gliner_medium-v2.5` on coverage alone. Two
+things then changed that recommendation's basis: a precision probe, and a code
+review that invalidated one of §15's claims outright.
+
+### 16.1 §15's sector-code claim is withdrawn
+
+§15.5 said the form penalty was *"now measured on 2,592 real sector-code
+addresses rather than 19"*. **That is false and is withdrawn.** The corpus holds
+2,627 sector-code addresses; the scored sample held **13**. `load_corpus`
+stratifies by `kind`, so a form at 2.9% prevalence was barely sampled.
+
+This is the same error §14.3 was corrected for — a headline resting on a sample
+too small to carry it — committed one section later, in the correction itself.
+`--stratify form` now exists so a claim about forms is measured on forms.
+
+Four other defects were fixed in the same pass, three of which were silently
+distorting these tables:
+
+- **Deduplication kept the first duplicate, not the best-typed one.** Overpass
+  returns a node and a way for the same building; the node carries only
+  `addr:*`, the way carries `building=house`. The same address classified
+  `unknown` or `residential` by arrival order. 528 records reclassified.
+- **`SECTOR_CODE` lacked `re.I`** while `BLOCK_FORM` had it, so `f-8/3` was
+  filed as `plain_street` — contaminating both cells of the comparison it feeds.
+- **The duplicate-city guard was a substring test**, so `Multan Road` + city
+  `Multan` yielded an address with no city.
+- **The fetcher treated every HTTP 200 as success.** Overpass reports a
+  server-side timeout in a `remark` field with a truncated element list. §15.1
+  names this exact failure shape as the one that cost three iterations; this was
+  a fourth instance, in the same file.
+
+### 16.2 Precision, which reverses §15 at its own threshold
+
+At 0.25 — urchade's operating point — `gliner_community` is **worse**, not
+better. Over 25 clean Pakistani memos containing no PII:
+
+| model | thr | fires | over-redaction |
+|---|---:|---:|---:|
+| urchade | 0.25 | 40% | 21% |
+| **gliner_community** | **0.25** | **76%** | **32%** |
+| gliner_community | 0.40 | 36% | 11% |
+| **gliner_community** | **0.55** | **20%** | **6%** |
+| gliner_community | 0.70 | 4% | 1% |
+
+§15's 11-point coverage advantage at 0.25 was bought by flagging nearly
+everything — the §7→§8 int8 pattern exactly. Recommending the swap on §15's
+numbers alone would have shipped a worse model.
+
+The thresholds do not transfer (§6.1), and that is the whole point: at **0.55**,
+where this checkpoint actually operates, it dominates instead.
+
+### 16.3 The comparison at each model's own operating point
+
+Form-stratified, 100 addresses per form, 1,200 cases per bucket:
+
+| | urchade @ 0.25 | gliner_community @ 0.55 |
+|---|---:|---:|
+| ADDRESS coverage | 74.0% | **79.0%** |
+| PERSON coverage | 99.4% | 99.4% |
+| sector-form penalty | 11.2 pts | **1.5 pts** (at 0.25) |
+| fires on clean PK memos | 40% | **20%** |
+| over-redaction | 21% | **6%** |
+| cost | 6.6 ms/record | 7.3 ms/record |
+
+**Better coverage, equal on names, half the false positives, one third the
+over-redaction, for 11% more compute.** That is a Pareto improvement, not a
+trade.
+
+Form-stratified coverage at 0.25, which is where the form penalty is clearest:
+
+| model | ALL | sector | block | plain | penalty |
+|---|---:|---:|---:|---:|---:|
+| **gliner_community** | **85.3%** | **84.2%** | 86.0% | 85.7% | **+1.5** |
+| nvidia | 75.5% | 63.7% | 75.8% | 86.9% | +23.2 |
+| urchade | 74.0% | 66.5% | 77.6% | 77.7% | +11.2 |
+| xlmr_conll (0.5) | 52.6% | 51.5% | 48.4% | 57.7% | +6.2 |
+
+`gliner_community` is the only model without a meaningful form penalty. Against
+nvidia's 23.2 points that is a sharper claim than "it scores higher", and it is
+what would matter for Islamabad sector addresses.
+
+Also corrected: urchade at 0.55 collapses to **39.2%** on a form-balanced
+sample, not the 42.0% §15 reported from a kind-balanced one.
+
+### 16.4 Arguments for fine-tuning
+
+Recorded because the case is not empty, and a decision that only lists one side
+is not a decision.
+
+- **79% is not 99%.** PERSON sits at 99.4%; ADDRESS at 79.0% is twenty points
+  worse on an entity type that is equally identifying.
+- **The residual is concentrated in the identifying part.** §14.4 measured
+  any-hit at ~99% against coverage at ~85%: the models nearly always find the
+  city and miss the house number. A partially-redacted address looks redacted
+  and is not.
+- **A training corpus now exists.** 91,675 real addresses with independent
+  provenance, and gold spans that need no alignment because the harness inserts
+  them. The circularity objection that blocked this in §13 is answered.
+- **Sector forms remain the weak cell** even for the best model — 74.0% at
+  threshold 0.55 against 82.0% on plain streets.
+- **Nobody else has this.** A Pakistani-locale address model is the one thing
+  in this project that cannot be obtained by picking a better checkpoint.
+
+### 16.5 Arguments against, which currently win
+
+- **A checkpoint swap already recovers most of the gap**, today, for 11% more
+  compute and zero training.
+- **The eval set would have to be split.** Training and evaluating on the same
+  91,675 addresses proves nothing. Held-out Islamabad-only evaluation is
+  possible but leaves ~2,400 sector addresses to both train and test on.
+- **83% of the corpus is Karachi.** A model fine-tuned on it would learn
+  Karachi conventions and be evaluated on them. That is the §14.3 mistake with
+  a training loop attached.
+- **The generator still contains no addresses.** §13 removed ADDRESS from Tier 2
+  because nothing in the pipeline has one. Fine-tuning an address model before
+  the pipeline carries addresses is building a capability with no field.
+- **Precision is unmeasured for a fine-tuned model** and is where the last three
+  reversals came from — int8 in §8, gliner_community at 0.25 in §16.2.
+- **Cost is not free.** Tier 2 is already the dominant per-record cost at
+  7.3 ms against Tier 1's 0.69.
+
+**Verdict: do not fine-tune yet.** Take the checkpoint swap. Revisit if
+addresses enter the pipeline as a real field, and only with a genuinely held-out
+evaluation set — ideally a city the model never trained on.
+
+### 16.6 What changed in the code
+
+`config.py` now defaults to `gliner-community/gliner_medium-v2.5` at threshold
+**0.55**, and `_TUNED_FOR` in `tier2_encoder.py` moves with it so the
+mismatch warning stays truthful. Both remain overridable by environment
+variable, and §6.1's rule holds: changing `TIER2_MODEL` without re-sweeping the
+threshold produces results that are not comparable.
+
+### 16.7 Limits
+
+- **Over-redaction rests on 25 hand-written memos** — the §8 corpus, in which §9
+  found two vocabulary defects. It is the weakest evidence in this section and
+  it is carrying the threshold choice.
+- **83% Karachi.** Every address number here is weighted toward one city.
+- **PERSON is synthetic** and shares its corpus with §2, so those numbers are
+  comparable to §2 rather than independent of it.
+- **0.55 is a judgement, not an optimum.** 0.70 gives 4% fire and 1%
+  over-redaction for 68.6% coverage. If over-redaction matters more than address
+  completeness, that is the better point.
+- ADDRESS remains **out of Tier 2** (§13). This section changes which checkpoint
+  runs, not which entity types it looks for.

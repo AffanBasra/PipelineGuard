@@ -22,12 +22,18 @@ class Settings:
     topic_txn_quarantine: str = os.getenv("TOPIC_TXN_QUARANTINE", "txn.quarantine")
     consumer_group: str = os.getenv("CONSUMER_GROUP", "pipelineguard-processor")
 
-    # Tier 2. Threshold 0.25 is where this model operates best, not a default:
-    # see tier2-detection-findings.md §6.1. Device falls back to CPU when CUDA
-    # is unavailable. Batch 8 saturates throughput; larger only costs VRAM.
+    # Tier 2. The model and threshold are a PAIR -- 0.55 is where this
+    # checkpoint operates, and it does not transfer (findings §6.1, §16.2).
+    # At urchade's 0.25 this model fires on 76% of clean Pakistani memos; at
+    # 0.55 it fires on 20%, against urchade's 40% at its own best point.
+    # Changing one without re-sweeping the other produces worse results than
+    # either default. Device falls back to CPU when CUDA is unavailable, and
+    # batch 8 saturates throughput.
     tier2_enabled: bool = os.getenv("TIER2_ENABLED", "false").lower() == "true"
-    tier2_model: str = os.getenv("TIER2_MODEL", "urchade/gliner_multi_pii-v1")
-    tier2_threshold: float = float(os.getenv("TIER2_THRESHOLD", "0.25"))
+    tier2_model: str = os.getenv(
+        "TIER2_MODEL", "gliner-community/gliner_medium-v2.5"
+    )
+    tier2_threshold: float = float(os.getenv("TIER2_THRESHOLD", "0.55"))
     tier2_device: str = os.getenv("TIER2_DEVICE", "auto")
     tier2_batch_size: int = int(os.getenv("TIER2_BATCH_SIZE", "8"))
 
