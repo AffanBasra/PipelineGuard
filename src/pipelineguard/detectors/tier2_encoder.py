@@ -116,7 +116,17 @@ def extend_address_span(text: str, start: int, end: int) -> tuple[int, int]:
     return start, end
 
 # The checkpoint the default threshold was swept against (findings §6.1, §16.2).
+# The revision is half of that identity, not decoration: a HuggingFace model repo
+# is a git repo, and this one gained fp16/bf16 variants on 2026-04-28 without its
+# name changing. A name-only check cannot see that, so anyone tracking `main`
+# would silently get different weights under an unchanged threshold.
+#
+# The pin is NOT total, and saying so matters more than the pin does. GLiNER
+# resolves its base tokenizer from microsoft/deberta-v3-base at `main`, a
+# different repo this revision cannot reach. Pinning here fixes the weights;
+# only a warm cache plus HF_HUB_OFFLINE=1 fixes everything (see docker-compose).
 _TUNED_FOR = "gliner-community/gliner_medium-v2.5"
+_TUNED_FOR_REVISION = "88c3b98b57ad5e7d66fb209ed61c53f4b1fd05da"
 
 
 def resolve_device(requested: str) -> str:
@@ -142,8 +152,10 @@ class Tier2Detector:
     def __init__(self, model_id: str, threshold: float = 0.25,
                  device: str = "auto", batch_size: int = 8,
                  label_groups: dict[str, list[str]] | None = None,
-                 extend_addresses: bool = True) -> None:
+                 extend_addresses: bool = True,
+                 revision: str | None = None) -> None:
         self.model_id = model_id
+        self.revision = revision
         self.threshold = threshold
         self.requested_device = device
         self.batch_size = max(1, batch_size)
@@ -162,24 +174,58 @@ class Tier2Detector:
         from gliner import GLiNER
 
         self.device = resolve_device(self.requested_device)
-        log.info("loading %s on %s", self.model_id, self.device)
-        self._model = GLiNER.from_pretrained(self.model_id, map_location=self.device)
+        revision = self.resolved_revision()
+        log.info("loading %s@%s on %s", self.model_id, revision or "main", self.device)
+        self._model = GLiNER.from_pretrained(
+            self.model_id, revision=revision, map_location=self.device
+        )
         self._model.eval()
         self._predict([_WARMUP_TEXT] * self.batch_size)
-        # Model and threshold are logged together on purpose. The threshold is an
-        # uncalibrated sigmoid cutoff, not a probability, so it does not transfer
-        # between checkpoints -- nvidia/gliner-PII at this model's 0.25 fires on
-        # 68% of clean Pakistani text. Swapping the model means re-running
-        # scripts/probe_ner_sweep.py, not reusing this number.
-        log.info("tier 2 ready: model=%s threshold=%.2f labels=%s batch=%d device=%s",
-                 self.model_id, self.threshold, list(self.label_groups),
-                 self.batch_size, self.device)
+        # Model, revision and threshold are logged together on purpose. The
+        # threshold is an uncalibrated sigmoid cutoff, not a probability, so it
+        # does not transfer between checkpoints -- nvidia/gliner-PII at this
+        # model's 0.25 fires on 68% of clean Pakistani text. Swapping either the
+        # model or its revision means re-running scripts/probe_ner_sweep.py, not
+        # reusing this number.
+        log.info(
+            "tier 2 ready: model=%s revision=%s threshold=%.2f labels=%s "
+            "batch=%d device=%s",
+            self.model_id, revision or "main (UNPINNED)", self.threshold,
+            list(self.label_groups), self.batch_size, self.device,
+        )
         if self.model_id != _TUNED_FOR:
             log.warning(
                 "threshold %.2f was tuned for %s, not %s -- re-run "
                 "scripts/probe_ner_sweep.py or results will not be comparable",
                 self.threshold, _TUNED_FOR, self.model_id,
             )
+        elif revision != _TUNED_FOR_REVISION:
+            log.warning(
+                "threshold %.2f was tuned for %s@%s, not @%s -- a model repo is "
+                "a git repo and its weights can change under an unchanged name",
+                self.threshold, _TUNED_FOR, _TUNED_FOR_REVISION,
+                revision or "main (UNPINNED)",
+            )
+
+    def resolved_revision(self) -> str | None:
+        """The revision actually passed to the hub, or None to track the branch.
+
+        A commit hash belongs to ONE repo. Carrying the default pin over to a
+        different model would ask the hub for a commit that does not exist there
+        and fail the load outright -- so an explicitly chosen model drops the pin
+        and says so, rather than crashing on a config the operator never set.
+        """
+        if self.revision and self.model_id != _TUNED_FOR:
+            if self.revision == _TUNED_FOR_REVISION:
+                log.warning(
+                    "revision %s belongs to %s, not %s -- loading unpinned; set "
+                    "TIER2_MODEL_REVISION to a commit in the model you chose",
+                    self.revision, _TUNED_FOR, self.model_id,
+                )
+                return None
+        # "main" is a branch, not a pin. Passed through as None so the log line
+        # can say UNPINNED rather than implying a fixed checkpoint.
+        return None if self.revision in ("", "main", None) else self.revision
 
     def _predict(self, texts: list[str]) -> list[list[tuple[dict, str]]]:
         """One batched pass per label group, zipped back per text."""

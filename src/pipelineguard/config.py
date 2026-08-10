@@ -33,6 +33,15 @@ class Settings:
     tier2_model: str = os.getenv(
         "TIER2_MODEL", "gliner-community/gliner_medium-v2.5"
     )
+    # The exact commit every number in tier2-detection-findings.md §14-§19 was
+    # measured against. Without it "we chose this checkpoint" is an intention,
+    # not a fact: HuggingFace can republish weights under the same name, and
+    # §6.1's rule is that a threshold does not survive a checkpoint change. The
+    # name would not change, so nothing would warn us. Set to "main" to track
+    # the branch instead, and re-sweep the threshold if you do.
+    tier2_model_revision: str = os.getenv(
+        "TIER2_MODEL_REVISION", "88c3b98b57ad5e7d66fb209ed61c53f4b1fd05da"
+    )
     tier2_threshold: float = float(os.getenv("TIER2_THRESHOLD", "0.55"))
     tier2_device: str = os.getenv("TIER2_DEVICE", "auto")
     tier2_batch_size: int = int(os.getenv("TIER2_BATCH_SIZE", "8"))

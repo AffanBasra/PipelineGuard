@@ -15,6 +15,8 @@ from __future__ import annotations
 import pytest
 
 from pipelineguard.detectors.tier2_encoder import (
+    _TUNED_FOR,
+    _TUNED_FOR_REVISION,
     LABEL_GROUPS,
     Tier2Detector,
     extend_address_span,
@@ -213,6 +215,49 @@ def test_extension_applies_only_to_address_findings(detector):
     finding = detector.detect(text, "memo")[0]
     assert finding.entity_type == "PERSON_NAME"
     assert text[finding.span_start:finding.span_end] == "Ayesha"
+
+
+# --------------------------------------------------------------------------- #
+# Checkpoint pinning (§20)
+#
+# A HuggingFace model repo is a git repo, and this one gained fp16/bf16 variants
+# on 2026-04-28 with no name change. The 0.55 threshold is only valid for one
+# set of weights (§6.1), and a name-only check cannot see weights move.
+# --------------------------------------------------------------------------- #
+def test_the_pinned_revision_is_the_one_the_threshold_was_swept_against():
+    """config.py and tier2_encoder.py each carry the hash. If they drift, the
+    warning below fires on a correct deployment and stops being read."""
+    from pipelineguard.config import settings
+
+    assert settings.tier2_model_revision == _TUNED_FOR_REVISION
+    assert settings.tier2_model == _TUNED_FOR
+
+
+def test_the_pin_is_passed_through_to_the_hub():
+    detector = Tier2Detector(_TUNED_FOR, revision=_TUNED_FOR_REVISION)
+    assert detector.resolved_revision() == _TUNED_FOR_REVISION
+
+
+@pytest.mark.parametrize("revision", ["main", "", None])
+def test_branch_and_empty_mean_unpinned(revision):
+    """'main' is a moving pointer, not a pin. It is passed as None so the ready
+    log can say UNPINNED rather than implying a fixed checkpoint."""
+    assert Tier2Detector(_TUNED_FOR, revision=revision).resolved_revision() is None
+
+
+def test_the_default_pin_is_dropped_for_a_different_model():
+    """A commit hash belongs to ONE repo. Carrying this project's pin over to
+    nvidia/gliner-PII would ask the hub for a commit that does not exist there
+    and fail the load outright — on a config the operator never set."""
+    detector = Tier2Detector("nvidia/gliner-PII", revision=_TUNED_FOR_REVISION)
+    assert detector.resolved_revision() is None
+
+
+def test_an_explicit_revision_survives_a_model_change():
+    """Dropping the DEFAULT pin must not drop a hash the operator chose. That
+    would silently unpin a deployment that had been pinned on purpose."""
+    detector = Tier2Detector("nvidia/gliner-PII", revision="abc123")
+    assert detector.resolved_revision() == "abc123"
 
 
 def test_extension_can_be_switched_off(detector):

@@ -11,9 +11,29 @@
 x-app-env: &app-env
   KAFKA_BOOTSTRAP: kafka:19092
   POSTGRES_DSN: postgresql://pipelineguard:pipelineguard@postgres:5432/pipelineguard
+  # Off by default, matching config.py. Turning it on needs an image built with
+  # INSTALL_TIER2=true; the processor now says so instead of failing on an
+  # import three frames deep.
+  TIER2_ENABLED: ${TIER2_ENABLED:-false}
+  # Pinned to the commit every number in tier2-detection-findings.md was
+  # measured against. A HuggingFace model repo is a git repo: this one changed
+  # on 2026-04-28 without its name changing, and the 0.55 threshold is only
+  # valid for one set of weights (§6.1).
+  TIER2_MODEL_REVISION: ${TIER2_MODEL_REVISION:-88c3b98b57ad5e7d66fb209ed61c53f4b1fd05da}
+  # The revision above pins the GLiNER weights but not GLiNER's base tokenizer,
+  # which it resolves from microsoft/deberta-v3-base at `main`. Once the models
+  # volume is warm, set HF_HUB_OFFLINE=1 to freeze everything and drop the
+  # boot-time dependency on HuggingFace entirely. Leave it unset for the first
+  # run, which has to download.
+  HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-}
 
 x-app-image: &app-image
-  build: .
+  build:
+    context: .
+    args:
+      # Tier 2 is opt-in at build time: torch and gliner add ~1 GB. Set
+      # INSTALL_TIER2=true in .env to build an image that can run it.
+      INSTALL_TIER2: ${INSTALL_TIER2:-false}
   image: pipelineguard:local
 
 services:
@@ -99,6 +119,11 @@ services:
     # restart replays from the last committed offset, and the idempotent
     # audit upsert makes the repeat harmless.
     restart: unless-stopped
+    # Model weights survive the container. Without this, every restart re-fetches
+    # ~1.7 GB from HuggingFace -- and the restart policy above would turn one
+    # network outage into a download loop.
+    volumes:
+      - models:/models
 
   # ---------------------------------------------------------------------- #
   # On-demand tools. The `tools` profile keeps them out of `docker compose
@@ -135,3 +160,7 @@ volumes:
   # benchmarking, incoherent for a pipeline whose at-least-once argument
   # rests on the log surviving a restart.
   kafkadata:
+  # The Tier 2 model cache (HF_HOME). Keeps the pinned checkpoint on disk
+  # across restarts, so the processor does not depend on HuggingFace being
+  # reachable at boot.
+  models:

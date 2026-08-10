@@ -1506,8 +1506,8 @@ is not a decision.
 - **A training corpus now exists.** 91,675 real addresses with independent
   provenance, and gold spans that need no alignment because the harness inserts
   them. The circularity objection that blocked this in §13 is answered.
-- **Sector forms remain the weak cell** even for the best model — 74.0% at
-  threshold 0.55 against 82.0% on plain streets.
+- **Karachi plot numbers are the weak cell** — 83.4% against 92.7% on Karachi
+  plain streets. The Islamabad sector convention is 94.4% (§19.3).
 - **Nobody else has this.** A Pakistani-locale address model is the one thing
   in this project that cannot be obtained by picking a better checkpoint.
 
@@ -1777,3 +1777,181 @@ because the corpus cannot support the experiment that would prove it closed.
   stands: the hand-written precision corpus is the weakest evidence here.
 - **The interior residual is unaddressed** and this section does not pretend
   otherwise.
+
+---
+
+## 19. The sector-code weakness was Karachi plot numbers
+
+§15.5, §16.4 and the Monday recap all carried a version of the same claim:
+sector-code addresses are the form encoders handle worst. §16.4 used it as an
+argument for fine-tuning — *"sector forms stay weakest even for the best model,
+74.0% at 0.55 against 82.0% on plain streets."*
+
+The claim was measured on a bucket holding two structurally different things.
+
+### 19.1 One regex, two conventions
+
+`SECTOR_CODE` matches `[A-Z]-\d+(/\d+)?`. In this corpus that catches:
+
+```
+plot_number   'A-103, Block S North Nazimabad Town, Karachi'
+sector_code   '14, Hill Road, F-6/3, Islamabad'
+```
+
+The first is a plot or flat designator in the leading component. The second is
+the Islamabad sector convention in a later one. 45% of the old bucket was the
+first kind, and by city it was 1,910 Karachi against 548 Islamabad.
+
+`classify()` now splits them by **position**. The corpus gains a `plot_number`
+form; `block_phase` and `plain_street` are untouched, so every number §15 and
+§16 reported for those still compares.
+
+### 19.2 Position is not convention, so the probe reports city as well
+
+Splitting by position does not by itself separate the conventions, and the
+letters say why:
+
+```
+mid-string codes, Islamabad   F 275   I 161   G 66   H 10   E 3
+mid-string codes, Karachi     A 112   B 106   G 70   D 52   R 44   C 44   F 28
+```
+
+Islamabad's mid-string codes are the sector alphabet. Karachi's are spread
+across the alphabet and are flat or shop designators — but Karachi *also* uses
+G, F and E, so no letter rule separates them either. Only city does, which is
+why `probe_address_residual.py` now reports city and form together rather than
+trusting `classify()` to carry the distinction alone.
+
+### 19.3 The finding reverses
+
+800 addresses, form-stratified, 9,600 cases, `gliner_medium-v2.5` at 0.55.
+Effective coverage (§17.1), no extension rule:
+
+| cell | n | raw | **effective** |
+|---|---:|---:|---:|
+| **Islamabad / sector_code** | 1,200 | 80.7% | **94.4%** |
+| Karachi / plain_street | 1,824 | 81.1% | 92.7% |
+| Karachi / block_phase | 2,112 | 80.8% | 91.6% |
+| Karachi / plot_number | 2,100 | 73.9% | 83.4% |
+| Karachi / sector_code | 1,128 | 71.6% | 81.9% |
+| *the old mixed bucket* | — | *74.6%* | *85.9%* |
+
+**The Islamabad sector form is among the strongest cells measured.** It is the
+form §3 built the entire address finding on, and the weakness attributed to it
+belongs to Karachi's plot and flat designators.
+
+With the span-extension rule applied, by form:
+
+| form | raw | effective |
+|---|---:|---:|
+| plain_street | 91.5% | 95.7% |
+| block_phase | 89.5% | 93.1% |
+| sector_code | 82.1% | 87.4% |
+| plot_number | 79.4% | 85.3% |
+
+Aggregate: 89.4% effective, 73.0% of addresses fully redacted. **Those
+aggregates are not comparable to §18.4's**, because the sample now spans four
+buckets rather than three and the new bucket is the weakest; the per-cell
+numbers are the ones that carry.
+
+### 19.4 What is withdrawn
+
+- §15.5's and §16.4's "sector forms stay weakest" — withdrawn. It measured
+  Karachi plot numbers.
+- The Monday recap's fine-tuning argument built on it — withdrawn with it.
+- §16.7's "83% Karachi" limit is *reinforced*: the mixed bucket was a case of
+  Karachi's composition being read as a property of a form.
+
+This is the fourth result in this project reversed by measuring the same thing a
+second way, and the second where the first measurement was mine.
+
+### 19.5 A defect that destroyed the corpus twice
+
+`build_address_corpus.py` prints Urdu-script sample addresses at the end of its
+report, which raises `UnicodeEncodeError` on a cp1252 console — and `report()`
+ran **before** the file was written, so the whole build was discarded each time.
+
+It happened twice before being noticed. The first traceback scrolled past under
+a `head` pipe; the stale corpus on disk looked current, and a full probe ran
+against it and produced a three-bucket result that was read as real.
+
+The write now happens first and stdout is reconfigured to UTF-8. The file is the
+deliverable; the report is a convenience.
+
+---
+
+## 20. Pinning the checkpoint, and making Tier 2 deployable
+
+§6.1 established that a threshold does not transfer between checkpoints, and
+§16 chose `gliner-community/gliner_medium-v2.5` at 0.55 on that basis. Neither
+section noticed that the checkpoint was never actually fixed.
+
+### 20.1 A model repo is a git repo
+
+`GLiNER.from_pretrained(model_id)` with no `revision` resolves `main`. That is a
+moving pointer:
+
+```
+88c3b98b57ad  2026-04-28  add fp16 and bf16 variants
+ed16f26c9374  2024-06-18  Update README.md
+```
+
+The weights changed in April. The name `gliner-community/gliner_medium-v2.5` did
+not. `_TUNED_FOR` compares the **name**, so it would have stayed silent: the
+pipeline would run an uncalibrated cutoff against weights nobody swept it
+against, and the audit would look normal.
+
+`TIER2_MODEL_REVISION` now pins `88c3b98b57ad5e7d66fb209ed61c53f4b1fd05da` — the
+commit every number in §14–§19 was measured against. The repo carries no tags,
+so a commit hash is the only immutable identifier available.
+
+Verified end to end: the pinned SHA returns `200` from the hub, and a
+non-existent one raises `RevisionNotFoundError` rather than silently loading
+`main`. A pin that is not enforced is worse than none.
+
+`resolved_revision()` drops the default pin when a different model is chosen — a
+commit hash belongs to one repo, and carrying it across would fail the load on
+a config the operator never set. An explicitly supplied revision is always kept.
+
+### 20.2 The pin is not total
+
+GLiNER resolves its base tokenizer from `microsoft/deberta-v3-base` at `main`,
+a different repo the revision above cannot reach. Pinning fixes the weights, not
+every byte the load touches.
+
+Only a warm cache plus `HF_HUB_OFFLINE=1` closes that, and compose documents it.
+Verified: with the volume warm, the container loads and detects with
+`HF_HUB_OFFLINE=1` set, in **10 seconds and zero network calls**.
+
+Stating the gap is worth more than the pin: a pin believed to be total is how a
+silent change gets attributed to something else.
+
+### 20.3 Tier 2 could not run in Docker at all
+
+`torch` and `gliner` lived only in `requirements.txt`, which the Dockerfile
+never reads — it runs `pip install .` from `pyproject.toml`. The image had no
+encoder. It started only because `TIER2_ENABLED` defaults to false; setting it
+true died on an import three frames deep.
+
+| | |
+|---|---|
+| `[tier2]` extra | `pip install '.[tier2]'` |
+| Build arg | `--build-arg INSTALL_TIER2=true`, default false |
+| torch source | the CPU index explicitly — pip's default serves a multi-gigabyte CUDA build this image has no GPU for |
+| Image size | 257 MB base, **1.81 GB** with Tier 2 |
+| Cache | `HF_HOME=/models` on a named volume — 1.6 GB, so a restart does not re-fetch |
+| Warm start | 10 s, offline-capable, against ~14 min cold |
+| Failure mode | asking for Tier 2 without the extra now names the fix |
+
+The cache volume matters more than it looks. `restart: unless-stopped` is what
+makes the crash-and-replay design real; without a warm cache, one network
+outage turns that restart policy into a download loop.
+
+### 20.4 Limits
+
+- **The image is 7x larger with Tier 2**, which is why it is opt-in rather than
+  default. A GPU image would be larger again and is not built here.
+- **`HF_HUB_OFFLINE=1` is documented, not default.** The first run must
+  download, so defaulting it on would break a clean start.
+- **Nothing verifies the weights against a checksum after download.** The
+  revision is the hub's guarantee, and this project takes it on trust.

@@ -176,8 +176,8 @@ moved with it so the mismatch warning stays truthful.
 - **A training corpus now exists** — 91,675 real addresses, independent
   provenance, gold spans that need no alignment. The circularity objection is
   answered.
-- **Sector forms stay weakest** even for the best model: 74.0% at 0.55 against
-  82.0% on plain streets.
+- **Karachi plot numbers are the weak cell**: 83.4% against 92.7% on Karachi
+  plain streets. The Islamabad sector convention is 94.4% (findings §19.3).
 - **It is the one thing a checkpoint swap cannot buy.** A Pakistani-locale
   address model does not exist off the shelf.
 
