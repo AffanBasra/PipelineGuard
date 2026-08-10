@@ -107,14 +107,21 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--threshold", type=float, default=0.55)
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--batch-size", type=int, default=16)
+    ap.add_argument("--extend", action="store_true",
+                    help="apply tier2_encoder.extend_address_span to every span "
+                         "before scoring, to measure what the rule recovers")
     ap.add_argument("--out", default="address_residual.json")
     args = ap.parse_args(argv)
 
     from gliner import GLiNER
     import torch
 
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+    from pipelineguard.detectors.tier2_encoder import extend_address_span
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"model={args.model} thr={args.threshold} device={device}", flush=True)
+    print(f"model={args.model} thr={args.threshold} device={device} "
+          f"extend={args.extend}", flush=True)
     model = GLiNER.from_pretrained(args.model, map_location=device)
     model.eval()
 
@@ -138,6 +145,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         for (_style, _kind, form, addr, text, gs, ge), ents in zip(chunk, batch):
             spans = [(e["start"], e["end"], "") for e in ents]
+            if args.extend:
+                spans = [(*extend_address_span(text, s, e), label)
+                         for s, e, label in spans]
             row = residual(text, gs, ge, spans)
             totals.update(row)
             by_form[form].update(row)

@@ -14,7 +14,11 @@ from __future__ import annotations
 
 import pytest
 
-from pipelineguard.detectors.tier2_encoder import LABEL_GROUPS, Tier2Detector
+from pipelineguard.detectors.tier2_encoder import (
+    LABEL_GROUPS,
+    Tier2Detector,
+    extend_address_span,
+)
 from pipelineguard.models import Tier
 
 
@@ -60,20 +64,24 @@ def test_requires_load_before_use():
 
 def test_maps_labels_to_entity_types(detector):
     findings = detector.detect("Ayesha went to Islamabad", "memo")
-    assert {f.entity_type for f in findings} == {"PERSON_NAME"}
+    assert {f.entity_type for f in findings} == {"PERSON_NAME", "ADDRESS"}
     assert all(f.tier == Tier.ENCODER for f in findings)
     assert all(f.field == "memo" for f in findings)
     assert all(0.0 < f.confidence <= 1.0 for f in findings)
 
 
-def test_address_labels_are_never_requested(detector):
-    """No memo template produces an address and there is no address field, so
-    this pass could only ever be wrong — measured at a 30% false-positive rate
-    over 200 generated memos, mostly re-tagging names it had already found. It
-    was half of Tier 2's cost, so pin the removal rather than trust it."""
+def test_address_labels_are_requested(detector):
+    """Restored in §18, replacing the assertion that they never are.
+
+    §13 dropped them because nothing in the stream contained an address, which
+    made the pass pure cost. generator/addresses.py ended that, and the measured
+    price of restoring them is one extra forward pass and — because every span
+    they claim on an address-free memo overlaps one PERSON already claimed —
+    exactly zero additional redaction.
+    """
     detector.detect_batch({0: {"memo": "Ayesha went to Islamabad"}})
     requested = {label for _n, labels in detector._model.calls for label in labels}
-    assert requested.isdisjoint({"address", "street_address", "location"})
+    assert {"address", "street_address", "location"} <= requested
 
 
 def test_spans_point_at_the_right_characters(detector):
@@ -83,8 +91,10 @@ def test_spans_point_at_the_right_characters(detector):
 
 
 def test_one_pass_per_label_group(detector):
-    """Groups are run separately on purpose: a single combined pass drops
-i    PERSON coverage 99.4% -> 90.9%, because labels compete for the same spans."""
+    """Groups are run separately on purpose, because labels compete for the same
+    spans when combined. §13 measured that as PERSON 99.4% -> 90.9%; at the
+    current checkpoint §18 measured only 100.0% -> 98.4%, for 45% less compute.
+    The split still ships: PERSON is the entity this pipeline exists for."""
     detector.detect_batch({0: {"memo": "Ayesha"}})
     assert len(detector._model.calls) == len(LABEL_GROUPS)
     assert {c[1] for c in detector._model.calls} == {
@@ -109,8 +119,8 @@ def test_results_land_on_the_right_message(detector):
         9: {"memo": "Islamabad only"},
     })
     assert 7 not in out                      # no findings -> key omitted
-    assert 9 not in out                      # ADDRESS labels are not requested
     assert {f.entity_type for f in out[8]["memo"]} == {"PERSON_NAME"}
+    assert {f.entity_type for f in out[9]["memo"]} == {"ADDRESS"}
     assert out[8]["memo"][0].span_start == 0
 
 
@@ -124,3 +134,96 @@ def test_multiple_fields_per_message(detector):
     out = detector.detect_batch({0: {"memo": "Ayesha here", "note": "Ayesha there"}})
     assert set(out[0]) == {"memo", "note"}
     assert out[0]["note"][0].field == "note"
+
+
+# --------------------------------------------------------------------------- #
+# Span extension for ADDRESS findings (§17, §18)
+#
+# The encoder finds the street and drops the house number. That is a redaction
+# that LOOKS complete and is not, which is the worst failure a firewall has, and
+# §17 measured it as 26.8% of all missed identifying characters.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    "text, found, expected",
+    [
+        # The house number, in the shapes the corpus actually writes it.
+        ("14, Hill Road, F-6/3", "Hill Road, F-6/3", "14, Hill Road, F-6/3"),
+        ("R1525, FB Area Block 3", "FB Area Block 3", "R1525, FB Area Block 3"),
+        ("D 5, Block 10-A", "Block 10-A", "D 5, Block 10-A"),
+        ("94-Q, Model Town", "Model Town", "94-Q, Model Town"),
+        ("64N, PECHS Block 2", "PECHS Block 2", "64N, PECHS Block 2"),
+        # A dwelling word in front of the number goes too, English or Urdu.
+        ("Cheque posted to House 12, Street 4",
+         "Street 4", "House 12, Street 4"),
+        ("Pata: Ghar 87, Gali 4", "Gali 4", "Ghar 87, Gali 4"),
+        ("Makan No. 221, Sector G-9/1", "Sector G-9/1", "Makan No. 221, Sector G-9/1"),
+        # OSM writes doubled separators, and a single-comma anchor could not
+        # reach back over them.
+        ("V2HP+3PP, , Imam Khumani Library Rd", "Imam Khumani Library Rd",
+         "V2HP+3PP, , Imam Khumani Library Rd"),
+        # The trailing city.
+        ("A352, Gulistan e Jauhar Block 7, Karachi", "Gulistan e Jauhar Block 7",
+         "A352, Gulistan e Jauhar Block 7, Karachi"),
+    ],
+)
+def test_extension_recovers_the_house_number_and_city(text, found, expected):
+    start = text.index(found)
+    new_start, new_end = extend_address_span(text, start, start + len(found))
+    assert text[new_start:new_end] == expected
+
+
+@pytest.mark.parametrize(
+    "text, found",
+    [
+        # No digit, so not a house number. 'Qadri Manzil' is a building name and
+        # could be a person's; leaving it is the conservative failure.
+        ("qadri manzil, House 87 Street 4", "House 87 Street 4"),
+        # Ordinary prose must never be swallowed.
+        ("Cheque posted to Model Town", "Model Town"),
+        ("Customer resides at Gulberg III", "Gulberg III"),
+        # An invoice number is comma-adjacent in exactly the same shape as a
+        # house number, and is the one case the digit rule alone gets wrong.
+        ("Payment against order #4821, Model Town", "Model Town"),
+        # A city that is not the one trailing this address stays put.
+        ("Model Town, Sialkot Road", "Model Town"),
+    ],
+)
+def test_extension_leaves_everything_else_alone(text, found):
+    start = text.index(found)
+    assert extend_address_span(text, start, start + len(found)) == (
+        start, start + len(found)
+    )
+
+
+def test_extension_never_leaves_the_text():
+    """An off-by-one here would raise IndexError inside redact() on live
+    traffic, below the fail-closed boundary."""
+    for text in ("12, Mall Road", "Mall Road", "", "1"):
+        for start in range(len(text) + 1):
+            for end in range(start, len(text) + 1):
+                new_start, new_end = extend_address_span(text, start, end)
+                assert 0 <= new_start <= new_end <= len(text)
+
+
+def test_extension_applies_only_to_address_findings(detector):
+    """A PERSON span must not be widened. 'Paid 12, Ayesha' would otherwise
+    redact the amount along with the name — over-redaction of exactly the kind
+    §16.2 measures."""
+    text = "Paid 12, Ayesha today"
+    finding = detector.detect(text, "memo")[0]
+    assert finding.entity_type == "PERSON_NAME"
+    assert text[finding.span_start:finding.span_end] == "Ayesha"
+
+
+def test_extension_can_be_switched_off(detector):
+    """The before/after measurement in probe_address_residual.py runs the same
+    detector twice. If the flag did nothing, that comparison would report a
+    delta of zero and the rule would look worthless."""
+    detector.extend_addresses = False
+    text = "Statement to 14, Islamabad"
+    finding = detector.detect(text, "memo")[0]
+    assert text[finding.span_start:finding.span_end] == "Islamabad"
+
+    detector.extend_addresses = True
+    finding = detector.detect(text, "memo")[0]
+    assert text[finding.span_start:finding.span_end] == "14, Islamabad"

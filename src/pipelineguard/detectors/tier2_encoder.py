@@ -10,6 +10,7 @@ costs nothing and the processor still starts when Tier 2 is disabled.
 from __future__ import annotations
 
 import logging
+import re
 
 from pipelineguard.models import Finding, Tier
 
@@ -19,21 +20,100 @@ log = logging.getLogger("pipelineguard.tier2")
 # PERSON_NAME matches what the schema rule emits, so the two arms of the
 # dispatch stay comparable in the audit.
 #
-# One forward pass PER GROUP, never one pass over all labels at once: combining
-# them halves the cost but drops PERSON coverage 99.4% -> 90.9%, because the
-# labels compete for the same spans.
+# One forward pass PER GROUP. ADDRESS was absent between §13 and §18 because no
+# memo produced an address; generator/addresses.py ended that, and §18 measured
+# what restoring it costs on the shipped path:
 #
-# ADDRESS labels (address, street_address, location) are deliberately absent.
-# No memo template produces an address and there is no address field, so on this
-# stream the pass could only ever be wrong -- measured at 30% false-positive
-# rate over 200 generated memos, mostly re-tagging names it had already found.
-# See tier2-detection-findings.md §13. Restoring it is one line, plus a corpus
-# that actually contains addresses.
+#                       ADDRESS   PERSON   incremental over-redaction   cost
+#   PERSON only           24.1%    99.2%                            -   8.1 ms
+#   + ADDRESS group       98.5%   100.0%                         0.0%  16.2 ms
+#   all labels, one pass  98.0%    98.4%                         0.0%   8.9 ms
+#
+# §13.2's "30% false-positive rate" is withdrawn as a reason to leave it out.
+# The ADDRESS labels do fire on half of all address-free memos, but every
+# character they claim was already claimed by PERSON or is intended PII, so
+# merge_spans() unions them and the redacted output is byte-identical. A false
+# positive that changes no output is not a cost.
+#
+# The third row is the cheap option and it is NOT what ships. §13 recorded
+# combining as dropping PERSON to 90.9%; at this checkpoint it only drops to
+# 98.4%, so the old number does not replicate -- but PERSON is the entity this
+# pipeline exists for, and 1.6 points of it is not worth 7 ms.
 LABEL_GROUPS = {
     "PERSON_NAME": ["person", "first_name", "last_name"],
+    "ADDRESS": ["address", "street_address", "location"],
 }
 
 _WARMUP_TEXT = "Transfer to Ayesha Malik, House 12, Street 4, F-8/3 Islamabad"
+
+# --------------------------------------------------------------------------- #
+# Span extension for ADDRESS findings
+#
+# §17 measured where the encoder's missed characters sit. Of the identifying
+# characters it drops from an address, 26.8% are LEADING -- the house or plot
+# number, which is the single most identifying part of an address and the part
+# whose loss turns '[ADDRESS], Karachi' into a redaction that looks complete and
+# is not. A further 2.0% are the trailing city.
+#
+# Those two are recoverable without a model, because they are positional. The
+# remaining 68% are interior and no extension rule can reach them; that residual
+# is the honest case for fine-tuning and this does not pretend to address it.
+# --------------------------------------------------------------------------- #
+
+# A house or plot number immediately before a detected address, optionally
+# introduced by a dwelling word. The digit requirement is what keeps this from
+# eating prose: 'Cheque posted to' has no digit, 'R1525' does. Anchored to the
+# end of the text preceding the span.
+# The leading lookbehind is load-bearing. Without it the optional [A-Za-z]
+# (which exists for 'R1525' and 'D 5') matched the LAST LETTER of the preceding
+# word: 'Statement to 14, Islamabad' extended over 'o 14, '. The token has to
+# begin at a word boundary, not merely somewhere before a digit.
+#
+# The trailing [,\s]* rather than ,?\s* is load-bearing on real data too: OSM
+# addresses carry doubled separators ('V2HP+3PP, , Imam Khumani Library Rd'),
+# and a single-comma anchor could not reach back over them.
+_LEADING_NUMBER = re.compile(
+    r"(?:^|(?<=[\s,(]))"
+    r"(?:(?:House|Flat|Plot|Shop|Ghar|Makan)\s*(?:No\.?\s*)?)?"
+    r"[A-Za-z]?[-\s]?\d[\w/+-]*[,\s]*$"
+)
+
+# Cities the corpus and the generator use. Locale knowledge, the same kind Tier 1
+# already encodes in its CNIC province digits and PK bank codes. A trailing city
+# is only ever extended over when the encoder already found the address in front
+# of it, so this cannot fire on a bare city name in ordinary prose.
+CITIES = frozenset({
+    "Karachi", "Lahore", "Islamabad", "Rawalpindi", "Faisalabad",
+    "Multan", "Peshawar", "Quetta", "Hyderabad", "Sialkot", "Gujranwala",
+})
+#
+# The city must be the WHOLE trailing component, not a prefix of one. A bare
+# word boundary extended 'Model Town, Sialkot Road' over 'Sialkot', because a
+# city name is also a road name in Pakistan more often than not.
+_TRAILING_CITY = re.compile(
+    rf"^,?\s*({'|'.join(sorted(CITIES))})(?=$|[,.;])"
+)
+
+
+def extend_address_span(text: str, start: int, end: int) -> tuple[int, int]:
+    """Widen one ADDRESS span over its house number and trailing city.
+
+    Deliberately extends by at most one token on each side. An unbounded walk
+    left would swallow the whole memo on 'Payment against order #4821, House 12,
+    Model Town, Lahore', where the invoice number is comma-adjacent too.
+    """
+    prefix = text[:start]
+    match = _LEADING_NUMBER.search(prefix)
+    # '#4821' is an invoice number, not a house number, and it is the one shape
+    # that reaches here looking like both. rstrip() because '# 4821' is written
+    # both ways and only the spaced form survives the lookbehind above.
+    if match and not prefix[:match.start()].rstrip().endswith("#"):
+        start = match.start()
+
+    match = _TRAILING_CITY.match(text[end:])
+    if match:
+        end += match.end()
+    return start, end
 
 # The checkpoint the default threshold was swept against (findings §6.1, §16.2).
 _TUNED_FOR = "gliner-community/gliner_medium-v2.5"
@@ -61,12 +141,17 @@ class Tier2Detector:
 
     def __init__(self, model_id: str, threshold: float = 0.25,
                  device: str = "auto", batch_size: int = 8,
-                 label_groups: dict[str, list[str]] | None = None) -> None:
+                 label_groups: dict[str, list[str]] | None = None,
+                 extend_addresses: bool = True) -> None:
         self.model_id = model_id
         self.threshold = threshold
         self.requested_device = device
         self.batch_size = max(1, batch_size)
         self.label_groups = label_groups or LABEL_GROUPS
+        # Off only for the before/after measurement in probe_address_residual.py.
+        # A rule measured against itself proves nothing, so the comparison has to
+        # run the same detector twice rather than a copy of the logic.
+        self.extend_addresses = extend_addresses
         self.device = "cpu"
         self._model = None
 
@@ -107,18 +192,23 @@ class Tier2Detector:
                 per_text[i].extend((e, entity_type) for e in entities)
         return per_text
 
-    def _to_findings(self, entities, field: str) -> list[Finding]:
-        return [
-            Finding(
-                entity_type=entity_type,
-                field=field,
-                span_start=e["start"],
-                span_end=e["end"],
-                tier=Tier.ENCODER,
-                confidence=float(e["score"]),
+    def _to_findings(self, entities, field: str, text: str) -> list[Finding]:
+        findings = []
+        for entity, entity_type in entities:
+            start, end = entity["start"], entity["end"]
+            if entity_type == "ADDRESS" and self.extend_addresses:
+                start, end = extend_address_span(text, start, end)
+            findings.append(
+                Finding(
+                    entity_type=entity_type,
+                    field=field,
+                    span_start=start,
+                    span_end=end,
+                    tier=Tier.ENCODER,
+                    confidence=float(entity["score"]),
+                )
             )
-            for e, entity_type in entities
-        ]
+        return findings
 
     def detect_batch(
         self, inputs: dict[int, dict[str, str]]
@@ -141,8 +231,8 @@ class Tier2Detector:
         for start in range(0, len(items), self.batch_size):
             chunk = items[start:start + self.batch_size]
             batch = self._predict([text for _, _, text in chunk])
-            for (key, field, _text), entities in zip(chunk, batch):
-                findings = self._to_findings(entities, field)
+            for (key, field, text), entities in zip(chunk, batch):
+                findings = self._to_findings(entities, field, text)
                 if findings:
                     results.setdefault(key, {})[field] = findings
         return results
