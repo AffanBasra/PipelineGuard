@@ -216,8 +216,35 @@ def compose(tags: dict[str, str]) -> str | None:
 
 
 def classify(address: str) -> str:
-    if SECTOR_CODE.search(address):
-        return "sector_code"     # F-8/3, G-9/1 -- the Islamabad convention
+    """sector_code | plot_number | block_phase | plain_street.
+
+    SECTOR_CODE matches two structurally different things, and §15 and §16 both
+    reported them as one bucket:
+
+        plot_number   'A-103, Block S North Nazimabad Town, Karachi'
+        sector_code   '14, Hill Road, F-6/3, Islamabad'
+
+    The first is a plot or house designator that happens to look like a sector
+    code. The second is the Islamabad convention -- the form §3 built the whole
+    address finding on. They are told apart by POSITION: a designator sits in
+    the leading component, a sector code in a later one.
+
+    POSITION IS NOT CONVENTION, and the split does not claim to be. Mid-string
+    codes in Islamabad are F/I/G/H/E ('F-6/3', 'I-14') and are the convention;
+    mid-string codes in Karachi are spread across A/B/D/R/C ('A-3', 'D-12') and
+    are flat or shop designators. Karachi also uses G, F and E, so no letter
+    rule separates them either. CITY does, which is why §19 reports city and
+    form together rather than trusting this function to carry the distinction
+    alone.
+
+    Only the old sector_code bucket splits. block_phase and plain_street are
+    untouched, so every number §15 and §16 reported for those still compares.
+    """
+    matches = list(SECTOR_CODE.finditer(address))
+    if matches:
+        head = address.split(",")[0]
+        beyond_head = any(m.start() >= len(head) for m in matches)
+        return "sector_code" if beyond_head else "plot_number"
     if BLOCK_FORM.search(address):
         return "block_phase"     # Model Town, DHA Phase 3, Johar Town
     return "plain_street"
@@ -292,6 +319,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", default=str(OUT_DIR / "addresses.json"))
     args = ap.parse_args(argv)
 
+    # A minority of addresses are Urdu script, and the report prints samples of
+    # them. On a cp1252 console that raised UnicodeEncodeError -- which, with
+    # the report running before the write below, destroyed the corpus every
+    # time. Twice, silently, because the traceback scrolled past under a pipe.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
     source = Path(args.source)
     if not source.exists():
         print(f"no such source: {source}", file=sys.stderr)
@@ -304,8 +340,9 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 1
 
-    report(elements, records)
-
+    # Written BEFORE the report, deliberately. The file is the deliverable and
+    # the report is a convenience; ordering them the other way makes a printing
+    # failure lose an hour of Overpass fetching.
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps({
@@ -315,7 +352,9 @@ def main(argv: list[str] | None = None) -> int:
         "count": len(records),
         "addresses": records,
     }, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"\nwrote {out}")
+    print(f"wrote {out}\n")
+
+    report(elements, records)
     return 0
 
 

@@ -131,6 +131,7 @@ def main(argv: list[str] | None = None) -> int:
 
     totals = Counter()
     by_form = defaultdict(Counter)
+    by_cityform = defaultdict(Counter)
     # Kept for the writeup: a rule argued from aggregate percentages and no
     # examples is how §15's sector-code claim got published wrong. One example
     # per distinct address, because each address runs through 12 sentence frames
@@ -143,7 +144,7 @@ def main(argv: list[str] | None = None) -> int:
         batch = model.batch_predict_entities(
             [c[4] for c in chunk], LABELS, threshold=args.threshold
         )
-        for (_style, _kind, form, addr, text, gs, ge), ents in zip(chunk, batch):
+        for (_style, _kind, form, addr, text, gs, ge, city), ents in zip(chunk, batch):
             spans = [(e["start"], e["end"], "") for e in ents]
             if args.extend:
                 spans = [(*extend_address_span(text, s, e), label)
@@ -151,6 +152,7 @@ def main(argv: list[str] | None = None) -> int:
             row = residual(text, gs, ge, spans)
             totals.update(row)
             by_form[form].update(row)
+            by_cityform[f"{city}/{form}"].update(row)
 
             for part in ("leading", "trailing", "interior"):
                 if row[part] and (part, addr) not in seen and len(examples[part]) < 6:
@@ -198,6 +200,20 @@ def main(argv: list[str] | None = None) -> int:
               f"{c['leading'] / miss:>8.1%}{c['trailing'] / miss:>8.1%}"
               f"{c['interior'] / miss:>8.1%}{c['not_found'] / miss:>8.1%}")
 
+    # City x form, which is the only view that separates the Islamabad sector
+    # convention from Karachi's flat designators -- classify() splits by
+    # position and position is not convention (§19).
+    print("\nby city and form (cells with at least 200 cases):")
+    print(f"  {'cell':<30}{'n':>7}{'raw':>8}{'eff':>8}{'lead':>8}{'inner':>8}")
+    for cell, c in sorted(by_cityform.items(),
+                          key=lambda kv: -kv[1]["covered_ident"] / kv[1]["gold_ident"]):
+        if c["n"] < 200:
+            continue
+        miss = c["gold_ident"] - c["covered_ident"] or 1
+        print(f"  {cell:<30}{c['n']:>7,}{c['covered'] / c['gold']:>8.1%}"
+              f"{c['covered_ident'] / c['gold_ident']:>8.1%}"
+              f"{c['leading'] / miss:>8.1%}{c['interior'] / miss:>8.1%}")
+
     for part in ("leading", "trailing", "interior"):
         if examples[part]:
             print(f"\n{part} examples ('·' = redacted, anything else survives):")
@@ -213,6 +229,7 @@ def main(argv: list[str] | None = None) -> int:
         "interior": totals["interior"], "not_found": totals["not_found"],
         "extension_ceiling": ceiling,
         "by_form": {f: dict(c) for f, c in by_form.items()},
+        "by_cityform": {k: dict(c) for k, c in by_cityform.items()},
     }, indent=2), encoding="utf-8")
     print(f"\nwrote {args.out}")
     return 0
