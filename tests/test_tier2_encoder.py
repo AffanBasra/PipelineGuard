@@ -18,6 +18,7 @@ from pipelineguard.detectors.tier2_encoder import (
     _TUNED_FOR,
     _TUNED_FOR_REVISION,
     LABEL_GROUPS,
+    _MAX_EXTENSIONS,
     Tier2Detector,
     extend_address_span,
 )
@@ -195,6 +196,46 @@ def test_extension_leaves_everything_else_alone(text, found):
     assert extend_address_span(text, start, start + len(found)) == (
         start, start + len(found)
     )
+
+
+@pytest.mark.parametrize(
+    "text, found, expected",
+    [
+        # The shape §21.2 found behind every worst-scoring well-formed address:
+        # the plot number sits TWO components out, behind a structural one that
+        # carries no digit, so a single-step rule never reached it.
+        ("C-21, Block J North Nazimabad Town, Karachi", "North Nazimabad Town",
+         "C-21, Block J North Nazimabad Town, Karachi"),
+        ("B-14, Block D North Nazimabad Town, Karachi", "North Nazimabad Town",
+         "B-14, Block D North Nazimabad Town, Karachi"),
+        ("R-47, Sector 16/A Bufferzone, Karachi", "Bufferzone",
+         "R-47, Sector 16/A Bufferzone, Karachi"),
+        ("94-Q, Phase 3, Model Town", "Model Town", "94-Q, Phase 3, Model Town"),
+    ],
+)
+def test_extension_steps_over_a_structural_component(text, found, expected):
+    start = text.index(found)
+    new_start, new_end = extend_address_span(text, start, start + len(found))
+    assert text[new_start:new_end] == expected
+
+
+def test_the_walk_is_bounded():
+    """The walk is a loop now. Unbounded, a memo made of comma-separated
+    fragments would let it cross the sentence and redact the narration."""
+    text = "Block 1, Block 2, Block 3, Block 4, Block 5, Model Town"
+    start = text.index("Model Town")
+    new_start, _ = extend_address_span(text, start, start + len("Model Town"))
+    assert new_start > 0, "the walk consumed the whole string"
+    assert text[new_start:].count("Block") <= _MAX_EXTENSIONS
+
+
+def test_the_wider_walk_still_refuses_the_invoice_number():
+    """The one false positive the digit rule cannot tell from a house number.
+    Stepping over structural components must not open a path back to it."""
+    text = "Payment against order #4821, Block J, Model Town"
+    start = text.index("Model Town")
+    new_start, _ = extend_address_span(text, start, start + len("Model Town"))
+    assert "4821" not in text[new_start:]
 
 
 def test_extension_never_leaves_the_text():

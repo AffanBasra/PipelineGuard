@@ -1955,3 +1955,188 @@ outage turns that restart policy into a download loop.
   download, so defaulting it on would break a clean start.
 - **Nothing verifies the weights against a checksum after download.** The
   revision is the hub's guarantee, and this project takes it on trust.
+
+---
+
+## 21. Fine-tuning: the decision, with the evidence that decides it
+
+§16.5 recommended against fine-tuning on five grounds. §18.5 noted one had
+disappeared and two had strengthened. §19 then removed the strongest remaining
+argument for it. This settles the question with four new measurements.
+
+### 21.1 Two thirds of the residual is malformed OSM data
+
+800 addresses, `gliner_medium-v2.5` at 0.55 with the span rule, classified by
+whether the record is something a person would write. A record is malformed if
+it has an empty comma component, runs past 80 characters, repeats a two-word
+phrase, or shouts in capitals.
+
+| | addresses | coverage | share of all missed characters |
+|---|---:|---:|---:|
+| malformed records | 202 | 83.9% | **63.3%** |
+| well-formed records | 598 | **93.3%** | 36.7% |
+
+```
+empty-component   119     'D-57,, Block H North Nazimabad Town'
+over-80-chars     105     'V28C+4M, SHOP NO G-12 GROUND FLOOR THE CENTRAL MALL ...'
+repeated-phrase    29     'Block 5-E Block 5 E Block 5 Nazimabad'
+shouting            8
+```
+
+This matters more than the aggregate. **On addresses a person would actually
+write, the shipped configuration is at 93.3%, not 90.5%.** The aggregate is
+dragged down by OSM data-entry errors, and a model fine-tuned on this corpus
+would spend most of its capacity learning to parse them.
+
+That is not a hypothetical objection. 63.3% of the training signal available
+here is signal about malformed records.
+
+### 21.2 The worst well-formed cases were one fixable shape
+
+Ranking well-formed addresses by coverage, the bottom of the list was almost
+entirely one pattern:
+
+```
+31.6%   C-21, Block J North Nazimabad Town, Karachi
+31.6%   C-11, Block I North Nazimabad Town, Karachi
+32.4%   C-18, Block J North Nazimabad Town, Karachi
+50.0%   B-14, Block D North Nazimabad Town, Karachi
+```
+
+The encoder finds `North Nazimabad Town`. The plot number sits **two** components
+out, behind `Block J` — which carries no digit, so the single-step rule of §18.4
+stopped there and never reached it.
+
+Extending the walk to step over a structural component and try again:
+
+| | effective coverage | over-redaction |
+|---|---:|---:|
+| §18.4 rule | 89.4% | 0.0% |
+| **stepping rule** | **90.5%** | **0.0%** |
+
+By form: `plot_number` 85.3% → **86.9%**, `sector_code` 87.4% → **88.2%**,
+`block_phase` 93.1% → **94.3%**, `plain_street` 95.7% → **96.5%**. Addresses
+redacted *completely* rise from 74.3% to **77.1%**.
+
+Over-redaction on 400 address-free memos is **0.0% of memos and 0.00% of
+characters** — identical to the narrower rule. The gain is free.
+
+**This is the second time a residual attributed to model weakness turned out to
+be a span-boundary problem a regex could reach.** That is the pattern the
+fine-tuning decision has to weigh.
+
+### 21.3 Full fine-tuning does not fit the hardware
+
+Not an argument about value — an argument about possibility, measured rather
+than estimated:
+
+```
+parameters                     208.6 M (all trainable)
+weights on GPU                 0.84 GB
+weights + gradients + Adam     4.18 GB
+GPU total                      4.29 GB  (RTX 3050 Ti Laptop)
+```
+
+**4.18 of 4.29 GB before a single activation**, on a card that also drives a
+display. Full fine-tuning cannot run on this machine.
+
+It is not impossible in general — LoRA trains ~1% of the parameters, 8-bit Adam
+quarters the optimizer state, and a rented GPU sidesteps both. But every one of
+those is real work or real money, and that cost belongs in the comparison
+against a regex that gained 1.1 points for nothing.
+
+### 21.4 The arguments, current state
+
+**For, and what remains of each:**
+
+| §16.4 argument | state |
+|---|---|
+| "79% is not 99%" | **weakened.** 93.3% on well-formed addresses, against 100% for PERSON |
+| "sector forms stay weakest" | **withdrawn** (§19.3). It was Karachi plot numbers |
+| "the residual is the identifying part" | **partly addressed.** 77.1% of addresses now leave with nothing readable, up from 62.4% |
+| "a training corpus now exists" | **true, and thinner than it looks.** 17,177 distinct street-tails, 83% Karachi, 63% of the residual malformed |
+| "no Pakistani-locale address model off the shelf" | **still true.** The one thing a checkpoint cannot buy |
+| *new:* "ADDRESS has a field now" | **true.** §13's objection is gone |
+
+**Against:**
+
+- **The weak cell is a span problem, not a language problem.** Karachi plot
+  numbers at 86.9%, and 30.2% of that residual is still leading characters —
+  the shape rules have twice proven able to reach.
+- **PERSON is at 100% and there is nothing to protect it with.** Fine-tuning on
+  ADDRESS risks catastrophic forgetting on the entity this pipeline exists for,
+  and `decisions.md` §1 forbids a real-name corpus to train against. The only
+  PERSON data is synthetic and already scores 100%, so it can detect damage but
+  cannot prevent it.
+- **Testable, but only just.** Grouped splitting by street-tail gives an honest
+  evaluation — a plain record split leaks, because `PECHS Block 2, Karachi`
+  appears 2,655 times with different numbers. But the Islamabad sector cell has
+  **134 distinct street contexts**, so that cell cannot be evaluated with
+  confidence whatever the split.
+- **It does not fit the hardware** (§21.3).
+- **Tier 2 already costs ~2x** since ADDRESS returned. Fine-tuning does not
+  reduce that.
+
+### 21.5 Decision
+
+**Do not fine-tune. Ship the pinned checkpoint plus the span rules.**
+
+The reasoning has changed since §16.5, and the change matters more than the
+verdict. §16 said don't, mostly because ADDRESS had no consumer and the
+evaluation would be circular. Both of those are now fixed — and the answer is
+still don't, for a better reason:
+
+> Every time this project has attributed an address failure to the model, and
+> then measured where the failure actually was, it turned out to be somewhere a
+> rule could reach. §17 found separators. §18 found the house number. §21.2
+> found the component behind the structural word. Three for three.
+
+The remaining residual is 63% malformed records and 27.8% leading characters.
+Neither is a language-understanding problem. Before spending a rented GPU on
+208M parameters, the cheaper question is how much of the last 6.7% on
+well-formed addresses is still positional.
+
+### 21.6 What would change this
+
+Concrete, so the decision can be revisited on evidence rather than mood:
+
+1. **The residual stops being positional.** If a further span rule gains under
+   0.3 points, the easy ground is gone and the rest is genuinely the model.
+2. **Addresses become a primary entity.** ADDRESS is a secondary field in a
+   memo. If a `beneficiary_address` column appears, 93.3% is no longer good
+   enough and the calculus changes.
+3. **A second city arrives with real sector density.** 134 Islamabad street
+   contexts cannot support a claim either way. More Islamabad and Rawalpindi
+   data is a prerequisite, not an optimisation.
+4. **PERSON gets a corpus that can prove it survived training.** Without one,
+   any fine-tune is a bet on the entity that matters most.
+
+### 21.7 If it is done anyway, the design
+
+Recorded now so it cannot be improvised later:
+
+- **Group by street-tail.** Never split one street across train and test. 17,177
+  groups.
+- **Stratify the test set by city × form**, so no cell is reported as an average
+  of Karachi.
+- **Exclude malformed records from training**, or measure with and without. 63%
+  of the signal is otherwise about data-entry errors.
+- **Pre-declare the PERSON floor.** Run the §2 probe before and after; any drop
+  below 99% fails the experiment regardless of the ADDRESS result.
+- **Pre-declare the ADDRESS bar.** Not clearly above 93.3% on well-formed
+  addresses means the checkpoint won.
+- **Report the Islamabad sector cell separately**, labelled underpowered at
+  n≈134 contexts.
+- **LoRA or a rented GPU.** Full fine-tuning does not fit locally.
+
+### 21.8 Limits
+
+- **"Malformed" is a heuristic**, not ground truth. It uses four structural
+  rules and no human review. The 63.3% is indicative.
+- **The stepping rule is tuned on this corpus.** It was designed after looking
+  at the failures it fixes, which is exactly the loop §5 warns about — the
+  0.0% over-redaction figure is the guard, and it is measured on generated
+  memos, not real ones.
+- **No fine-tune was actually run.** This argues from the structure of the
+  residual and the cost of the alternative, not from a trained model. A
+  contrary result from an actual run would beat this reasoning.

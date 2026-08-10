@@ -94,21 +94,50 @@ _TRAILING_CITY = re.compile(
     rf"^,?\s*({'|'.join(sorted(CITIES))})(?=$|[,.;])"
 )
 
+# One structural component: 'Block J', 'Sector 16/A', 'Phase 1', 'Blk 4-A'.
+#
+# §21 found the residual's worst well-formed cases all share one shape --
+# 'C-21, Block J North Nazimabad Town, Karachi'. The encoder finds the town, and
+# a single-step rule stops at 'Block J' because it carries no digit, so the plot
+# number two components out is never reached. Stepping over the structural
+# component and trying the number again recovers it.
+_STRUCTURAL = re.compile(
+    r"(?:^|(?<=[\s,(]))(?:Block|Blk|Sector|Sec|Phase|Ph)"
+    r"\s*[-\s]?[A-Za-z0-9/-]{1,6}[,\s]*$",
+    re.I,
+)
+
+# Bounded because the walk is now a loop. Three is what the corpus needs
+# ('C-21, Block J, <town>' is two); an unbounded walk would cross the sentence
+# into 'Deliver statement to' given enough comma-separated fragments.
+_MAX_EXTENSIONS = 3
+
 
 def extend_address_span(text: str, start: int, end: int) -> tuple[int, int]:
     """Widen one ADDRESS span over its house number and trailing city.
 
-    Deliberately extends by at most one token on each side. An unbounded walk
-    left would swallow the whole memo on 'Payment against order #4821, House 12,
-    Model Town, Lahore', where the invoice number is comma-adjacent too.
+    Walks left at most _MAX_EXTENSIONS components, taking a house or plot number
+    where it finds one and stepping over a structural component ('Block J') to
+    look behind it. Bounded on purpose: an unbounded walk would cross into
+    'Payment against order #4821, House 12, Model Town, Lahore' and swallow the
+    invoice number, which is comma-adjacent in exactly the same shape.
+
+    Measured at 0.0% over-redaction on 400 address-free memos (§21.3).
     """
-    prefix = text[:start]
-    match = _LEADING_NUMBER.search(prefix)
-    # '#4821' is an invoice number, not a house number, and it is the one shape
-    # that reaches here looking like both. rstrip() because '# 4821' is written
-    # both ways and only the spaced form survives the lookbehind above.
-    if match and not prefix[:match.start()].rstrip().endswith("#"):
-        start = match.start()
+    for _ in range(_MAX_EXTENSIONS):
+        prefix = text[:start]
+        match = _LEADING_NUMBER.search(prefix)
+        # '#4821' is an invoice number, not a house number, and it is the one
+        # shape that reaches here looking like both. rstrip() because '# 4821'
+        # is written both ways and only the spaced form survives the lookbehind.
+        if match and not prefix[:match.start()].rstrip().endswith("#"):
+            start = match.start()
+            continue
+        match = _STRUCTURAL.search(prefix)
+        if match:
+            start = match.start()
+            continue
+        break
 
     match = _TRAILING_CITY.match(text[end:])
     if match:
