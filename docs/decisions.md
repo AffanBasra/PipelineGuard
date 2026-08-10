@@ -769,9 +769,12 @@ reasoning is available if the scope is ever revisited.
 - **Integration tests** against a live stack: not attempted.
 - **Tier 2** — base model, name-substitution training data, disjoint train/eval
   name split, where weights live.
-- **Tier 3** — the confidence band that triggers escalation, and instrumenting
-  how often it fires. If it exceeds ~1–2% of messages the cost argument for
-  tiering collapses.
+- ~~**Tier 3** — the confidence band that triggers escalation.~~ **Closed by
+  measurement** (tier2-detection-findings.md §22). The predicted failure
+  condition fired: the cheapest trigger escalates 35.6% of the stream, eighteen
+  times the ~2% budget, to reach two of three leaking records. Only 0.25% of
+  records leak after both tiers, and all of those are positional boundary
+  errors a span rule already reaches. Recorded as a measured non-goal.
 - **Topic retention** — quarantine plausibly wants longer retention than clean,
   for compliance.
 - **Quarantine has no resolution path.** It is terminal; there is no reviewer

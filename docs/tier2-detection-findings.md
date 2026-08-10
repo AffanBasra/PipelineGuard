@@ -2140,3 +2140,151 @@ Recorded now so it cannot be improvised later:
 - **No fine-tune was actually run.** This argues from the structure of the
   residual and the cost of the alternative, not from a trained model. A
   contrary result from an actual run would beat this reasoning.
+
+---
+
+## 22. Tier 3 has nothing to escalate on
+
+`decisions.md` §11 settles Tier 3's shape — genuine escalation, same span,
+promoted on uncertainty — and §12 pre-registers its failure condition: *"if it
+exceeds ~1-2% of messages the cost argument for tiering collapses."*
+
+Both assume an uncertainty signal exists. §10.1 already tested one and found it
+backwards. This tests the only remaining candidate, the encoder's own confidence
+score, over 1,200 generated memos: 600 address-bearing, 600 address-free.
+
+### 22.1 Confidence is weakly predictive, and not monotonic
+
+| band | spans | precision |
+|---|---:|---:|
+| 0.55–0.65 | 525 | 76.6% |
+| 0.65–0.75 | 668 | 85.8% |
+| 0.75–0.85 | 899 | **99.3%** |
+| 0.85–0.95 | 1,441 | 95.4% |
+| 0.95–1.00 | 188 | 100.0% |
+| **all** | **3,721** | **92.2%** |
+
+Mean confidence is 0.811 on correct spans and 0.690 on wrong ones. So the signal
+is real — unlike §10.1's masked fraction, this is not backwards.
+
+It is also **not monotonic**: the 0.75–0.85 band is more precise than 0.85–0.95.
+A threshold drawn anywhere on this curve is drawn through noise as well as
+signal.
+
+### 22.2 The population it would fix is 0.25% of records
+
+Counting a leak as identifying characters surviving **both** tiers:
+
+```
+records leaking after Tier 1 + Tier 2 : 3 of 1,200  (0.25%)
+```
+
+All three are address boundary errors:
+
+```
+'Delivery to Bilal Raza, Flat G-790, Vehari Road, Multan, contact ...'
+   leaks: 'Vehari Road'
+'Delivery to Muhammad Iqbal, House No. 38-N, Chaman Housing Scheme, Quetta, ...'
+   leaks: 'Chaman Housing Scheme'
+'Statement Plot 12B, Street 14, PECHS Block 2, Karachi par bhej dein'
+   leaks: 'Karachi'
+```
+
+Not one is a missed entity. All three are the same positional class §17, §18 and
+§21 have now reached three times with regexes.
+
+**A correction to this section's own first run.** It scored Tier 2 in isolation
+and reported 6.1% of records leaking, with half invisible to any confidence
+rule. Production runs Tier 1 on the same memo, and once the rules are included
+the figure is 0.25% and nothing is invisible. The phones, CNICs and emails the
+rules already remove were being counted as Tier 2's misses. Fifth reversal in
+this project, and the third caused by measuring one component as though it were
+the system.
+
+### 22.3 The trigger costs a third of the stream to reach two records
+
+| escalate if any span below | catches | escalates |
+|---|---:|---:|
+| 0.65 | 66.7% of leaks (2 of 3) | **35.6% of the stream** |
+| 0.75 | 66.7% | 61.8% |
+| 0.85 | 66.7% | 74.7% |
+
+To adjudicate 2 leaking records, 427 records go to an LLM. **213 to 1.**
+
+Against §12's budget:
+
+| threshold | records escalated | §12 verdict |
+|---|---:|---|
+| < 0.60 | 20.5% | collapses |
+| < 0.65 | 35.6% | collapses |
+| < 0.70 | 49.2% | collapses |
+| < 0.75 | 61.8% | collapses |
+
+There is no threshold under 2%. The lowest band that exists at all starts at
+0.55, because that *is* the shipped threshold — everything below it was already
+discarded. The confidence scores that survive into production are, by
+construction, the ones the model was most sure of.
+
+### 22.4 Cost, if it were built anyway
+
+At ~800 ms per LLM call, amortised over the whole stream:
+
+| escalation rate | added ms/record | throughput ceiling |
+|---:|---:|---:|
+| 1% | ~8 ms | ~125 /s |
+| 20.5% (the best measured) | ~164 ms | **~6 /s** |
+
+Current throughput is ~160 /s. The measured escalation rate would cut it by
+96%.
+
+Local inference does not rescue this. The GPU holds 4.29 GB and GLiNER already
+occupies 0.84 GB during inference, leaving room for roughly a 3B model at 4-bit
+— and a 3B model adjudicating Pakistani-locale PII is not obviously better than
+the encoder it is adjudicating.
+
+### 22.5 Decision
+
+**Tier 3 is not built. Recorded as a measured non-goal, not an unfinished item.**
+
+The three-tier architecture in the README and `decisions.md` describes an
+escalation Tier 3 that this measurement shows cannot exist as specified:
+
+1. The error population is **0.25% of records**.
+2. Every one of those errors is **positional**, and rules have reached that class
+   three times.
+3. The cheapest trigger that finds two thirds of them **escalates 35.6% of the
+   stream** — eighteen times §12's budget.
+4. It would cost **96% of throughput**.
+
+This is the second uncertainty signal this project has tested and the second to
+fail, and the reason is the same both times. §10 stated it plainly: *"at runtime
+there is no ground truth. The processor cannot know whether a masked span was a
+real name or a false positive; if it could, it would not need the model."*
+Confidence is a weaker restatement of the model's own opinion, not an
+independent check on it.
+
+### 22.6 What would change this
+
+- **A different error population.** If contextual PII enters the stream —
+  identity inferable across a sentence rather than located in a span — Tier 3
+  stops being escalation and becomes a capability argument, which is how Tier 2
+  earned its place. That needs a corpus demonstrating the gap, which does not
+  exist.
+- **An independent signal.** Disagreement between two cheap detectors is a real
+  uncertainty measure in a way one model's own score is not. Two encoders cost
+  2x, not 100x, and that is measurable.
+- **A materially higher leak rate.** 0.25% leaves nothing to buy. If a field
+  arrives where Tier 2 performs far worse, the arithmetic changes.
+
+### 22.7 Limits
+
+- **Measured on generated memos**, whose addresses §21.8 records as easier than
+  real OSM ones. The true leak rate on messier text is higher than 0.25%, and
+  the 3-record population is too small to characterise.
+- **`decisions.md` §11's design is not disproven in general** — only shown to
+  have no viable trigger on this stream, with this detector.
+- **No LLM was benchmarked.** The 800 ms figure is an assumption; the argument
+  does not turn on it, because the escalation rate fails at any latency.
+- **The generous span-correctness rule** (a span is correct if it touches gold
+  at all) flatters precision. A stricter rule would lower every band and would
+  not change the escalation rates, which depend only on scores.

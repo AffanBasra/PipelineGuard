@@ -72,10 +72,12 @@ span, promoted on uncertainty.
 - [x] Dockerfile + processor service, so `docker compose up` runs the pipeline
 - [x] Schema-based redaction of declared PII fields (`account_holder`)
 - [x] Tier 2: encoder NER over free text, batched, GPU-optional
-- [ ] Tier 2 locale fine-tune (needs an evaluation set of independent provenance)
+- [~] Tier 2 locale fine-tune -- **measured and declined** (findings §21): the
+      residual is positional, not semantic, and a span rule closed most of it
 - [ ] Flagging records whose redaction left nothing
 - [ ] End-to-end latency measurement (current figures are detection-only)
-- [ ] Tier 3: pluggable LLM escalation (Gemini, Ollama)
+- [~] Tier 3: LLM escalation -- **measured and declined** (findings §22): 0.25%
+      of records leak, and the cheapest trigger escalates 35.6% of the stream
 - [ ] Support-chat free-text topic
 - [ ] Airflow batch-scan mode
 
@@ -236,8 +238,10 @@ them. Flagging fully-saturated redactions is the open mitigation.
 
 **Tiered detection under a latency budget.** Tier 1 (compiled regex +
 checksum validation, µs) handles structured PII; Tier 2 (fine-tuned encoder,
-ms) handles names and contextual PII in free text; Tier 3 (LLM) is invoked
-only for spans where Tier 2 confidence falls in an uncertainty band. The
+ms) handles names and contextual PII in free text. A third LLM tier was
+specified and then **declined on measurement** -- 0.25% of records leak after
+both tiers, and the cheapest confidence trigger escalates 35.6% of the stream
+to reach them (findings §22). The
 tiering is a throughput/cost tradeoff, not just an accuracy ladder — the
 benchmark table [below](#benchmarks) quantifies it — and shows detection is
 currently only ~15% of per-record cost, so the plumbing dominates the rules.
