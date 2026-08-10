@@ -101,3 +101,23 @@ def test_every_entity_type_the_detector_emits_is_classified(detector, pii_payloa
     }
     assert emitted, "fixture produced no findings; the guard would pass vacuously"
     assert compliance.unclassified(sorted(emitted)) == []
+
+
+def test_every_tier_2_entity_type_is_classified() -> None:
+    """The same guard for the encoder, which the test above cannot reach.
+
+    It only exercises the Tier 1 detector, so restoring ADDRESS to LABEL_GROUPS
+    added an entity type that reached the audit and the governance report while
+    being unclassified -- and nothing failed. Read from LABEL_GROUPS rather than
+    from a hardcoded list, so adding a third group fails here too.
+    """
+    from pipelineguard.detectors.tier2_encoder import LABEL_GROUPS
+
+    assert compliance.unclassified(sorted(LABEL_GROUPS)) == []
+
+
+def test_schema_declared_entity_types_are_classified() -> None:
+    """And the third detector. All three write to the same findings table."""
+    from pipelineguard.detectors.schema_rules import DECLARED_PII
+
+    assert compliance.unclassified(sorted(set(DECLARED_PII.values()))) == []

@@ -1013,6 +1013,11 @@ ONNX fp32's 31.0 ms is ~62 ms for a production pass.
 
 ## 13. ADDRESS dropped from Tier 2 — a capability with no field
 
+> **Superseded by §18.** The generator now emits addresses, so the premise below
+> no longer holds, and §18.2 found the 30% false-positive rate in §13.2 changes
+> no redacted output. ADDRESS is back in `LABEL_GROUPS`. Kept as written because
+> the reasoning was right for the state of the pipeline at the time.
+
 §3 and §6.2 established the address-form penalty as the strongest finding on
 this branch: −21 points for Urdu-form addresses on urchade, −18 on nvidia, two
 independent models agreeing. It is also the only place the Pakistani-locale
@@ -1548,4 +1553,227 @@ threshold produces results that are not comparable.
   over-redaction for 68.6% coverage. If over-redaction matters more than address
   completeness, that is the better point.
 - ADDRESS remains **out of Tier 2** (§13). This section changes which checkpoint
-  runs, not which entity types it looks for.
+  runs, not which entity types it looks for. **Superseded by §18.2**, which
+  restores it after finding that its false positives change no output.
+- **The coverage numbers above are raw**, and §17.1 shows the raw metric counts
+  separators between adjacent spans as leaks. Effective coverage is ~10 points
+  higher for every model here.
+
+---
+
+## 17. Separators are not leaks, and the residual is interior
+
+§14.4 recorded the shape of the address problem — any-hit ~99% against coverage
+~85% — and left the question that decides what to do about it unanswered: *where
+inside the address are the missed characters?* Leading and trailing characters
+are recoverable by a rule. Interior ones are not, and are the honest case for
+fine-tuning.
+
+`scripts/probe_address_residual.py` measures the split. It was written and run
+**before** the rule in §18.4, deliberately: a rule designed against an assumed
+failure mode measures its own assumption.
+
+3,600 cases — 300 OSM addresses, form-stratified, each through 12 sentence
+frames — against `gliner-community/gliner_medium-v2.5` at 0.55.
+
+### 17.1 A metric defect that runs through §3, §6.2, §14, §15 and §16
+
+When the encoder returns two adjacent spans for one address, `char_coverage`
+scores the `', '` between them as missed. Redaction then emits
+`[ADDRESS], [ADDRESS]`. A comma survives. Nothing identifying does.
+
+Measured: **53% of interior misses are punctuation and whitespace alone**, and
+21,430 separator characters in this run were scored as leaks.
+
+| metric | coverage |
+|---|---:|
+| raw — every gold character, the §14–§16 metric | 77.7% |
+| **effective — alphanumeric characters only** | **88.3%** |
+
+Every coverage number in §14, §15 and §16 is a raw number and understates the
+models by roughly ten points. The **rankings** between models mostly survive —
+all four pay the same penalty — but the distance to 100% does not, and that
+distance is what §16.4's first argument for fine-tuning was built on.
+
+This is the third measurement in this project reversed by measuring the same
+thing a second way.
+
+### 17.2 The residual is interior
+
+Of the missed *identifying* characters, 14,810 of 126,312:
+
+| where | chars | share |
+|---|---:|---:|
+| leading — the house or plot number | 3,972 | 26.8% |
+| trailing — the city | 294 | 2.0% |
+| **interior — a gap in the middle** | **10,073** | **68.0%** |
+| never found at all | 471 | 3.2% |
+
+So a span-extension rule has a **ceiling of 28.8%** of the residual: it could
+take effective coverage from 88.3% to at most 91.7%. My hypothesis going in —
+that the residual was mostly the dropped house number — was wrong in aggregate.
+
+It is not wrong everywhere. By form:
+
+| form | effective | leading | trailing | interior |
+|---|---:|---:|---:|---:|
+| plain_street | 93.5% | **64.1%** | 0.9% | 28.0% |
+| block_phase | 89.9% | 18.7% | 6.1% | 73.3% |
+| sector_code | 84.7% | 23.0% | 0.3% | 73.6% |
+
+On plain streets the residual **is** the house number, and a rule reaches most
+of it.
+
+### 17.3 The 26.8% is the most identifying 26.8%
+
+Aggregate share is the wrong way to weigh this. What survives, verbatim
+(`·` = redacted):
+
+```
+'R1525, FB Area Block 3, Karachi'   ->  R1525, ·······················
+'68, Model Town Block G, Lahore'    ->  68, ··························
+'D 5, Block 10-A, ...'              ->  D 5, ·························
+```
+
+The street and city are redacted; the plot number is not. `FB Area Block 3` is a
+district of some 40,000 people. `R1525` selects one house in it. A partly
+redacted address looks redacted and is not, and the part that survives here is
+the part that identifies.
+
+Interior gaps are a different failure and mostly land on degenerate OSM records
+— `'Block 5-E Block 5 E Block 5 Nazimabad'` is malformed data, not an address
+anyone wrote.
+
+---
+
+## 18. ADDRESS returns to Tier 2, with a rule for the house number
+
+### 18.1 The generator now emits addresses
+
+§13 removed ADDRESS because nothing in the stream contained one. That made the
+capability untestable end to end and the fine-tuning question unanswerable, so
+`generator/addresses.py` closes the premise rather than arguing with it.
+
+Place names are real, from the OSM corpus. **House and plot numbers are always
+random.** That split is the whole privacy argument and it is asserted in tests:
+a place name is geography, the number attached to it is what identifies a
+dwelling, and `decisions.md` §1 requires the generator to generate rather than
+replay. Hand-writing a fresh set would have rebuilt §5's circularity one layer
+down.
+
+`ADDRESS_MEMO_RATE = 0.30` of non-blank memos, so the default mix is 40% blank,
+18% address-bearing, 42% other narration.
+
+### 18.2 §13.2's false-positive rate is withdrawn
+
+Measured on the shipped path — `Tier2Detector`, not a reimplementation — over
+400 address-bearing and 400 address-free memos:
+
+| | ADDRESS | PERSON | incremental over-redaction | cost |
+|---|---:|---:|---:|---:|
+| PERSON labels only | 24.1% | 99.2% | — | 1.00x |
+| **+ ADDRESS group** | **98.5%** | **100.0%** | **0.0%** | ~2x |
+| all labels, one pass | 98.0% | 98.4% | 0.0% | 1.10x |
+
+The ADDRESS labels **do** fire on ~50% of address-free memos, which is roughly
+what §13.2 reported. But every character they claim was already claimed by
+PERSON or is intended PII, so `merge_spans()` unions them and the redacted
+output is **byte-identical**. §13.2 counted the firing and not the effect.
+
+*A false positive that changes no output is not a cost.* The only real price is
+one extra forward pass.
+
+### 18.3 One pass or two
+
+§13 recorded combining all labels into one pass as dropping PERSON 99.4% → 90.9%.
+**That does not replicate here**: 100.0% → 98.4%, for 45% less compute — another
+instance of §6.1's rule that nothing transfers between checkpoints.
+
+Two passes still ship. PERSON is the entity this pipeline exists for, and 1.6
+points of it is not worth ~7 ms. **This is a live trade to revisit if throughput
+binds** — it is the cheapest 2x available.
+
+### 18.4 The span-extension rule
+
+`extend_address_span()` widens an ADDRESS finding over its leading house number
+and its trailing city — the two positional components §17.2 identified.
+
+| | before | after |
+|---|---:|---:|
+| OSM corpus, effective coverage | 88.3% | **90.0%** |
+| OSM corpus, addresses **fully** redacted | 62.4% | **74.3%** |
+| generated stream, ADDRESS coverage | 98.5% | **99.9%** |
+| incremental over-redaction, address-free memos | — | **0.0%** |
+
+The second row matters most for a firewall: the share of addresses leaving with
+*nothing* identifying intact rises by twelve points.
+
+By form, effective coverage: plain_street 93.5% → **96.3%**, block_phase 89.9% →
+**91.4%**, sector_code 84.7% → **86.2%**. It delivered 1.7 of the 3.4 points
+§17.2 said were available, and the shortfall is deliberate conservatism.
+
+The rule requires a digit, so `'qadri manzil'` is left alone rather than guessed
+at — a building name can carry a person. It extends one token per side, because
+an unbounded walk swallows the invoice number in `'Payment against order #4821,
+House 12, Model Town'`.
+
+Three defects the tests caught in the rule as first written:
+
+- a bare word boundary let the trailing-city match eat `Sialkot` out of
+  `'Model Town, Sialkot Road'` — in Pakistan a city name is a road name more
+  often than not
+- the optional letter prefix, which exists for `R1525` and `D 5`, had no left
+  boundary and matched the final `o` of `'Statement to 14, Islamabad'`
+- a single-comma anchor could not reach back over OSM's doubled separators
+
+### 18.5 What this does to the fine-tuning question
+
+§16.5 recommended against fine-tuning. That holds, and two of its reasons are
+now stronger while one is gone.
+
+**Gone:** "the generator contains no addresses, so fine-tuning would build a
+capability with no field." It has a field now.
+
+**Stronger:** §16.4's lead argument was "79% is not 99%". At the corrected metric
+with the rule applied it is **90.0% against 100.0%** — the same gap, ten points
+narrower, closed without training anything.
+
+**Stronger:** the corpus is thinner than 91,675 suggests. It holds **17,177
+distinct street-tails**, of which Karachi contributes 15,236; `'PECHS Block 2,
+Karachi'` appears 2,655 times with a different number in front. As an evaluation
+set 91,675 is honest. As a training set it is ~17k contexts, 83% one city.
+
+**And the sector-code finding needs qualifying again.** The `sector_code` bucket
+mixes two unrelated patterns: 55% match mid-string (the Islamabad `F-6/3`
+convention) and 45% at position 0 (Karachi plot numbers — `A-50`, `R-31`,
+`C-34`). By city it is 1,910 Karachi against 548 Islamabad. Every claim in §15
+and §16 about sector codes being weakest is measured on a bucket that is mostly
+Karachi plot numbers. Splitting the bucket is the next measurement, not a
+conclusion.
+
+The residual remaining after §18.4 is **74.6% interior**. That is the part no
+rule reaches and the only honest argument left for fine-tuning — and it cannot
+be tested, because the only city with the Islamabad convention in any volume is
+Islamabad itself (548 addresses). Hold it out and you train with almost no
+examples of the form you want to fix; keep it in and there is no held-out
+evaluation. Lahore has 12 such addresses and Rawalpindi 11.
+
+**Verdict unchanged: do not fine-tune.** Not because the gap is closed, but
+because the corpus cannot support the experiment that would prove it closed.
+
+### 18.6 Limits
+
+- **The generated addresses are easier than real ones.** 99.9% coverage on the
+  stream against 90.0% on OSM. The generator does not reproduce OSM's doubled
+  commas, repeated block names or ALL-CAPS shop descriptions, so the stream
+  number is an upper bound and the corpus number is the one to trust.
+- **`CITIES` is a fixed list of eleven.** An address in a city not on it loses
+  the trailing-city extension silently. It is locale knowledge of the same kind
+  Tier 1 already encodes, and it degrades toward under-extension rather than
+  over-redaction.
+- **Cost figures fluctuate ±15% between runs** on this GPU. Treat the ~2x
+  multiplier as the result, not the millisecond values.
+- **Over-redaction is still measured on generated memos**, and §16.7's warning
+  stands: the hand-written precision corpus is the weakest evidence here.
+- **The interior residual is unaddressed** and this section does not pretend
+  otherwise.
