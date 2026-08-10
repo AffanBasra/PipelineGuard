@@ -35,8 +35,8 @@ LABEL_GROUPS = {
 
 _WARMUP_TEXT = "Transfer to Ayesha Malik, House 12, Street 4, F-8/3 Islamabad"
 
-# The checkpoint the default threshold was swept against (findings §6.1).
-_TUNED_FOR = "urchade/gliner_multi_pii-v1"
+# The checkpoint the default threshold was swept against (findings §6.1, §16.2).
+_TUNED_FOR = "gliner-community/gliner_medium-v2.5"
 
 
 def resolve_device(requested: str) -> str:

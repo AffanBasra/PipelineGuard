@@ -20,3 +20,7 @@ build/
 dist/
 
 data/nemotron-pii/
+# OSM address data: ODbL-licensed, and the raw responses carry name and phone
+# tags that docs/decisions.md section 1 forbids storing. Regenerate with
+# scripts/fetch_osm_addresses.py.
+data/osm-addresses/
