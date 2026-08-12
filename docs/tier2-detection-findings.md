@@ -2025,10 +2025,12 @@ characters** — identical to the narrower rule. The gain is free.
 be a span-boundary problem a regex could reach.** That is the pattern the
 fine-tuning decision has to weigh.
 
-### 21.3 Full fine-tuning does not fit the hardware
+### 21.3 Full fine-tuning does not fit the *local* hardware
 
-Not an argument about value — an argument about possibility, measured rather
-than estimated:
+~~Not an argument about value — an argument about possibility~~ **Withdrawn as
+an argument against fine-tuning.** The measurement below stands; the conclusion
+drawn from it does not. Kaggle (T4 16 GB, 30 h/week) and Colab are available, so
+the constraint is local only.
 
 ```
 parameters                     208.6 M (all trainable)
@@ -2038,12 +2040,11 @@ GPU total                      4.29 GB  (RTX 3050 Ti Laptop)
 ```
 
 **4.18 of 4.29 GB before a single activation**, on a card that also drives a
-display. Full fine-tuning cannot run on this machine.
+display. Full fine-tuning cannot run on *this* machine — but 4.18 GB fits a
+16 GB T4 roughly four times over, so LoRA and 8-bit Adam are not needed either.
 
-It is not impossible in general — LoRA trains ~1% of the parameters, 8-bit Adam
-quarters the optimizer state, and a rented GPU sidesteps both. But every one of
-those is real work or real money, and that cost belongs in the comparison
-against a regex that gained 1.1 points for nothing.
+This removes one of the five arguments in §21.4, and it was the one explicitly
+labelled as not being about value. §21.5 does not turn on it.
 
 ### 21.4 The arguments, current state
 
@@ -2051,7 +2052,7 @@ against a regex that gained 1.1 points for nothing.
 
 | §16.4 argument | state |
 |---|---|
-| "79% is not 99%" | **weakened.** 93.3% on well-formed addresses, against 100% for PERSON |
+| "79% is not 99%" | **weakened further.** 96.0% on well-formed addresses after §23, against 100% for PERSON |
 | "sector forms stay weakest" | **withdrawn** (§19.3). It was Karachi plot numbers |
 | "the residual is the identifying part" | **partly addressed.** 77.1% of addresses now leave with nothing readable, up from 62.4% |
 | "a training corpus now exists" | **true, and thinner than it looks.** 17,177 distinct street-tails, 83% Karachi, 63% of the residual malformed |
@@ -2073,7 +2074,8 @@ against a regex that gained 1.1 points for nothing.
   appears 2,655 times with different numbers. But the Islamabad sector cell has
   **134 distinct street contexts**, so that cell cannot be evaluated with
   confidence whatever the split.
-- **It does not fit the hardware** (§21.3).
+- ~~**It does not fit the hardware** (§21.3).~~ Withdrawn — free Kaggle/Colab
+  GPUs are available, and 208M params fit a T4 without LoRA.
 - **Tier 2 already costs ~2x** since ADDRESS returned. Fine-tuning does not
   reduce that.
 
@@ -2102,6 +2104,7 @@ Concrete, so the decision can be revisited on evidence rather than mood:
 
 1. **The residual stops being positional.** If a further span rule gains under
    0.3 points, the easy ground is gone and the rest is genuinely the model.
+   *Tested in §23: the bridging rule gained 2.6 points. This did not fire.*
 2. **Addresses become a primary entity.** ADDRESS is a secondary field in a
    memo. If a `beneficiary_address` column appears, 93.3% is no longer good
    enough and the calculus changes.
@@ -2123,11 +2126,15 @@ Recorded now so it cannot be improvised later:
   of the signal is otherwise about data-entry errors.
 - **Pre-declare the PERSON floor.** Run the §2 probe before and after; any drop
   below 99% fails the experiment regardless of the ADDRESS result.
-- **Pre-declare the ADDRESS bar.** Not clearly above 93.3% on well-formed
-  addresses means the checkpoint won.
+- **Pre-declare the ADDRESS bar.** Not clearly above ~~93.3%~~ **96.0%** (§23.4)
+  on well-formed addresses means the checkpoint won.
 - **Report the Islamabad sector cell separately**, labelled underpowered at
   n≈134 contexts.
-- **LoRA or a rented GPU.** Full fine-tuning does not fit locally.
+- **Run it on Kaggle or Colab.** Full fine-tuning does not fit locally, but
+  4.18 GB fits a 16 GB T4 with room to spare — no LoRA, no 8-bit Adam.
+- **Upload nothing that §1 forbids.** The corpus is public OSM address data and
+  synthetic names, so a hosted notebook is within the privacy line. That has to
+  stay true of anything added to it later.
 
 ### 21.8 Limits
 
@@ -2178,6 +2185,10 @@ Counting a leak as identifying characters surviving **both** tiers:
 ```
 records leaking after Tier 1 + Tier 2 : 3 of 1,200  (0.25%)
 ```
+
+**§23 has since cut this to 1 of 1,200 (0.08%)** by closing two of the three.
+Every figure below is the pre-§23 measurement; the decision only hardens, since
+a smaller population buys less.
 
 All three are address boundary errors:
 
@@ -2288,3 +2299,142 @@ independent check on it.
 - **The generous span-correctness rule** (a span is correct if it touches gold
   at all) flatters precision. A stricter rule would lower every band and would
   not change the escalation rates, which depend only on scores.
+
+---
+
+## 23. The residual was a hole, not a boundary
+
+§21.6 pre-registered the condition that would end the span-rule programme:
+*"if a further span rule gains under 0.3 points, the easy ground is gone and the
+rest is genuinely the model."* This tests it. The rule gains **2.6 points**, so
+the condition does not fire.
+
+### 23.1 The encoder was not missing the address — it was splitting it
+
+Dumping every identifying run the extension rules still leave behind, over 2,786
+well-formed OSM addresses, the residual is **not** where §17 and §18 found it.
+Leading runs: 104. **Interior runs: 263.** The single largest shape:
+
+```
+48 runs   'Gulistan e Jauhar Block #'
+15 runs   'Block <letter> North Nazimabad Town'
+ 5 runs   'Federal B Area Block'
+ 3 runs   'Bahria Town Main Boulevard'
+```
+
+Inspecting the spans behind them shows why no outward walk could reach them:
+
+```
+'Deliver to C-21, Block J North Nazimabad Town, Karachi'
+   0.77 'C-21'
+   0.89 'Karachi'          <- the locality between them: no span at all
+
+'Transfer to 706, Federal B Area Azizabad Block 8 Gulberg Town'
+   0.63 '706'
+   0.87 'Federal B Area'
+   0.91 'Gulberg Town'     <- 'Azizabad Block 8' falls in the hole
+```
+
+The encoder returns the plot number *and* the city and drops the locality
+between them. `extend_address_span()` walks outward from a span; an interior gap
+has no outer edge to walk from. **This is a different failure mode from §17 and
+§18, and it was hidden inside the word "interior" in §17's breakdown.**
+
+### 23.2 Joining spans, and where to stop
+
+`bridge_address_spans()` joins two ADDRESS spans separated by at most
+`_MAX_BRIDGE` characters. Sweeping the window on the same 2,786 addresses,
+against over-redaction on 400 address-free memos:
+
+| max gap | coverage | fully redacted | memos hurt | extra chars |
+|---:|---:|---:|---:|---:|
+| 0 (shipped before) | 93.4% | 88.1% | 0.0% | 0.00% |
+| 8 | 93.7% | 89.7% | 0.0% | 0.00% |
+| 16 | 94.2% | 91.0% | 1.5% | 0.38% |
+| 24 | 94.9% | 92.4% | 1.5% | 0.38% |
+| **32** | **96.0%** | **93.5%** | **1.5%** | **0.38%** |
+| 48 | 96.6% | 94.1% | 1.5% | 0.38% |
+| 64 | 96.7% | 94.2% | 1.5% | 0.38% |
+
+**32 ships.** The cost is flat from 16 upward, so the window is not chosen to
+control cost — it is chosen to bound the blast radius on text shapes this corpus
+does not contain. 48 and 64 buy 0.6 and 0.7 points for the right to join spans
+half a line apart, and a memo carrying an amount or a reference number between
+two locations is exactly the shape not sampled here.
+
+### 23.3 The cost is one stopword
+
+Every over-redacted character, at every window from 16 to 64, is the same thing:
+
+```
+'Rent payment from Hussain Syed, contact 03033547159'
+   newly redacted: ', contact '
+```
+
+The name and the phone number either side are both PII and both already
+redacted. Bridging joins them and takes the word `contact` with it. That is the
+whole of the 0.38%: no amount, no reference, no business fact — one stopword
+between two spans that were being masked anyway.
+
+### 23.4 Results on the shipped path
+
+Measured through `Tier2Detector` and `RulesDetector` as `processor.py` wires
+them, not a reimplementation:
+
+| | before | after |
+|---|---:|---:|
+| OSM well-formed, coverage | 93.4% | **96.0%** |
+| OSM well-formed, fully redacted | 88.1% | **93.5%** |
+| generated stream, ADDRESS | 99.9% | **100.0%** |
+| generated stream, PERSON | 100.0% | **100.0%** |
+| **records leaking after both tiers** | **3 of 1,200** | **1 of 1,200** |
+
+By cell, the gain lands on the weakest ones — the cell §19 identified and §21
+proposed to fine-tune:
+
+| cell | before | after | |
+|---|---:|---:|---:|
+| **Karachi / plot_number** | 86.5% | **95.2%** | **+8.7** |
+| Islamabad / block_phase | 90.7% | 96.9% | +6.2 |
+| Karachi / sector_code | 89.9% | 96.0% | +6.1 |
+| Peshawar / plain_street | 85.9% | 89.0% | +3.0 |
+| Karachi / block_phase | 95.6% | 97.9% | +2.3 |
+
+The two leaks it closes are `'Vehari Road'` and `'Chaman Housing Scheme'` — two
+of the three §22 found. The survivor is `'Karachi'` in
+`'Statement Plot 12B, Street 14, PECHS Block 2, Karachi par bhej dein'`.
+
+### 23.5 What this does to the fine-tuning decision
+
+**It strengthens §21.5 rather than reopening it.** §21.6's stopping condition was
+written to be falsifiable and it did not fire: the rule gained 2.6 points where
+0.3 would have ended the argument.
+
+> §17 found separators. §18 found the house number. §21.2 found the component
+> behind the structural word. §23 found the hole between two spans. **Four for
+> four**, every address failure this project has attributed to the model has
+> turned out to be somewhere a rule could reach.
+
+Two consequences for §21.7, which stay pre-declared:
+
+- **The ADDRESS bar moves from 93.3% to 96.0%** on well-formed addresses. A
+  fine-tune now has to clear a materially higher number to win.
+- **The proposed anchors were not the target.** `Plot\s*\d+` and `KDA Scheme` were
+  proposed as the Karachi fix; measurement shows the encoder already finds
+  `'Plot NO 13A'` (0.81), `'Plot# 5-11'` (0.86) and `'KDA Scheme No 1'` (0.81).
+  Adding those anchors would have gained nothing, because the failure was never
+  the prefix.
+
+### 23.6 Limits
+
+- **`_MAX_BRIDGE` is tuned on this corpus**, the loop §5 warns about. The 400
+  address-free memos are the guard, and they are generated, not real.
+- **Bridging cannot separate two genuinely different addresses** in one memo if
+  they sit within 32 characters. No case appeared in 400 memos; the shape is
+  plausible in real remittance narration and is not covered by any test.
+- **One leak survives** and it is a trailing city after a Roman-Urdu tail
+  (`', Karachi par bhej dein'`). A trailing-city rule already exists; it did not
+  fire here because the encoder's span ended before the comma.
+- **The over-redaction sample is one template family.** All six damaged memos are
+  `'Rent payment from <name>, contact <phone>'`, so 0.38% is a measurement of one
+  shape, not a general rate.

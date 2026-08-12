@@ -18,8 +18,10 @@ from pipelineguard.detectors.tier2_encoder import (
     _TUNED_FOR,
     _TUNED_FOR_REVISION,
     LABEL_GROUPS,
+    _MAX_BRIDGE,
     _MAX_EXTENSIONS,
     Tier2Detector,
+    bridge_address_spans,
     extend_address_span,
 )
 from pipelineguard.models import Tier
@@ -299,6 +301,75 @@ def test_an_explicit_revision_survives_a_model_change():
     would silently unpin a deployment that had been pinned on purpose."""
     detector = Tier2Detector("nvidia/gliner-PII", revision="abc123")
     assert detector.resolved_revision() == "abc123"
+
+
+# --------------------------------------------------------------------------- #
+# Span bridging (§23)
+#
+# The residual left by the extension rules is mostly not a boundary. The encoder
+# returns 'C-21' and 'Karachi' and drops the locality between them, and no
+# outward walk can reach an interior gap.
+# --------------------------------------------------------------------------- #
+def test_bridge_joins_spans_separated_by_a_small_gap():
+    joined = bridge_address_spans([(0, 4, 0.7), (4 + _MAX_BRIDGE, 60, 0.6)])
+    assert joined == [(0, 60, 0.7)]
+
+
+def test_bridge_leaves_a_wide_gap_alone():
+    """One memo can carry two unrelated addresses, and the text between them is
+    ordinary narration. An unbounded join would redact the whole memo."""
+    apart = [(0, 4, 0.7), (5 + _MAX_BRIDGE, 60, 0.6)]
+    assert bridge_address_spans(apart) == apart
+
+
+def test_bridge_keeps_the_best_score_of_the_group():
+    """The group is one address, so the confidence that matters is the best
+    evidence for it. Taking the lower score would push a joined span under a
+    downstream confidence filter."""
+    assert bridge_address_spans([(0, 4, 0.58), (10, 20, 0.94)]) == [(0, 20, 0.94)]
+
+
+def test_bridge_sorts_before_joining():
+    """Label groups are queried separately, so spans do not arrive in positional
+    order. Trusting the input order would leave the first span unmerged."""
+    assert bridge_address_spans([(10, 20, 0.6), (0, 4, 0.9)]) == [(0, 20, 0.9)]
+
+
+@pytest.mark.parametrize("spans", [[], [(3, 9, 0.8)]])
+def test_bridge_passes_through_empty_and_single(spans):
+    assert bridge_address_spans(spans) == spans
+
+
+def test_an_interior_hole_between_two_address_spans_is_closed(detector):
+    """The §23 shape, and the reason bridging exists. The encoder finds the plot
+    number and the city and drops the locality between them, which is the most
+    identifying part of the address."""
+    text = "Deliver to C-21, Block J North Nazimabad Town, Karachi"
+    detector._model.TRIGGERS = {"C-21": "location", "Karachi": "location"}
+    findings = detector.detect(text, "memo")
+    assert len(findings) == 1
+    assert text[findings[0].span_start:findings[0].span_end] == (
+        "C-21, Block J North Nazimabad Town, Karachi"
+    )
+
+
+def test_bridging_does_not_join_person_spans(detector):
+    """Two names either side of an amount must not swallow the amount. ADDRESS
+    is the only entity a positional rule is allowed to widen."""
+    text = "Ayesha sent 45,000 to Bilal"
+    detector._model.TRIGGERS = {"Ayesha": "person", "Bilal": "person"}
+    findings = detector.detect(text, "memo")
+    assert {text[f.span_start:f.span_end] for f in findings} == {"Ayesha", "Bilal"}
+
+
+def test_bridging_is_off_when_extension_is_off(detector):
+    """§23's before/after measurement runs the same detector twice, so the flag
+    has to reach bridging as well as extension."""
+    text = "Deliver to C-21, Block J North Nazimabad Town, Karachi"
+    detector._model.TRIGGERS = {"C-21": "location", "Karachi": "location"}
+    detector.extend_addresses = False
+    spans = {text[f.span_start:f.span_end] for f in detector.detect(text, "memo")}
+    assert spans == {"C-21", "Karachi"}
 
 
 def test_extension_can_be_switched_off(detector):

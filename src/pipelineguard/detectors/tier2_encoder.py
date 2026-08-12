@@ -112,6 +112,36 @@ _STRUCTURAL = re.compile(
 # into 'Deliver statement to' given enough comma-separated fragments.
 _MAX_EXTENSIONS = 3
 
+# Two ADDRESS spans this close together are one address with a hole in it.
+#
+# §23 measured the residual left by the extension rules and found it is mostly
+# not a boundary at all: the encoder returns 'C-21' and 'Karachi' and drops the
+# locality between them. No outward walk can reach an interior gap; joining the
+# spans can. 32 is where the gain flattens -- see §23.2 for the sweep.
+_MAX_BRIDGE = 32
+
+
+def bridge_address_spans(
+    spans: list[tuple[int, int, float]]
+) -> list[tuple[int, int, float]]:
+    """Join ADDRESS spans separated by at most _MAX_BRIDGE characters.
+
+    Takes and returns (start, end, score); a joined span carries the highest
+    score of its members, because the group is one address and the confidence
+    that matters is the best evidence for it.
+    """
+    if not spans:
+        return []
+    ordered = sorted(spans)
+    merged = [list(ordered[0])]
+    for start, end, score in ordered[1:]:
+        if start - merged[-1][1] <= _MAX_BRIDGE:
+            merged[-1][1] = max(merged[-1][1], end)
+            merged[-1][2] = max(merged[-1][2], score)
+        else:
+            merged.append([start, end, score])
+    return [(s, e, c) for s, e, c in merged]
+
 
 def extend_address_span(text: str, start: int, end: int) -> tuple[int, int]:
     """Widen one ADDRESS span over its house number and trailing city.
@@ -122,7 +152,9 @@ def extend_address_span(text: str, start: int, end: int) -> tuple[int, int]:
     'Payment against order #4821, House 12, Model Town, Lahore' and swallow the
     invoice number, which is comma-adjacent in exactly the same shape.
 
-    Measured at 0.0% over-redaction on 400 address-free memos (§21.3).
+    Measured at 0.0% over-redaction on 400 address-free memos on its own; 0.2%
+    of characters once bridging is applied on top (§23.3, and all of it is the
+    word 'contact' between a name and a phone number).
     """
     for _ in range(_MAX_EXTENSIONS):
         prefix = text[:start]
@@ -269,10 +301,15 @@ class Tier2Detector:
 
     def _to_findings(self, entities, field: str, text: str) -> list[Finding]:
         findings = []
+        # Held back rather than emitted in place: bridging is a decision about
+        # the whole set of ADDRESS spans in this field, not about one span.
+        addresses: list[tuple[int, int, float]] = []
         for entity, entity_type in entities:
             start, end = entity["start"], entity["end"]
+            score = float(entity["score"])
             if entity_type == "ADDRESS" and self.extend_addresses:
-                start, end = extend_address_span(text, start, end)
+                addresses.append((*extend_address_span(text, start, end), score))
+                continue
             findings.append(
                 Finding(
                     entity_type=entity_type,
@@ -280,7 +317,18 @@ class Tier2Detector:
                     span_start=start,
                     span_end=end,
                     tier=Tier.ENCODER,
-                    confidence=float(entity["score"]),
+                    confidence=score,
+                )
+            )
+        for start, end, score in bridge_address_spans(addresses):
+            findings.append(
+                Finding(
+                    entity_type="ADDRESS",
+                    field=field,
+                    span_start=start,
+                    span_end=end,
+                    tier=Tier.ENCODER,
+                    confidence=score,
                 )
             )
         return findings
