@@ -90,8 +90,19 @@ CITIES = frozenset({
 # The city must be the WHOLE trailing component, not a prefix of one. A bare
 # word boundary extended 'Model Town, Sialkot Road' over 'Sialkot', because a
 # city name is also a road name in Pakistan more often than not.
+#
+# But requiring end-of-string or punctuation after the city was too strict, and
+# a live Kafka run found what it costs (§24): Roman-Urdu memos continue past the
+# city -- 'PECHS Block 2, Karachi par bhej dein' -- so the city was left in the
+# clear. The test is not "is anything after it" but "is what follows a ROAD
+# word", which is the only thing the original guard was protecting against.
+_ROAD_WORD = (
+    r"Road|Rd|Street|St|Highway|Motorway|Expressway|Bypass|Chowk|Colony|"
+    r"Town|Bazaar|Market|Cantt|Cantonment"
+)
 _TRAILING_CITY = re.compile(
-    rf"^,?\s*({'|'.join(sorted(CITIES))})(?=$|[,.;])"
+    rf"^,?\s*({'|'.join(sorted(CITIES))})"
+    rf"(?=$|[,.;]|\s+(?!(?i:{_ROAD_WORD})\b))"
 )
 
 # One structural component: 'Block J', 'Sector 16/A', 'Phase 1', 'Blk 4-A'.

@@ -2432,9 +2432,133 @@ Two consequences for §21.7, which stay pre-declared:
 - **Bridging cannot separate two genuinely different addresses** in one memo if
   they sit within 32 characters. No case appeared in 400 memos; the shape is
   plausible in real remittance narration and is not covered by any test.
-- **One leak survives** and it is a trailing city after a Roman-Urdu tail
-  (`', Karachi par bhej dein'`). A trailing-city rule already exists; it did not
-  fire here because the encoder's span ended before the comma.
+- ~~**One leak survives** and it is a trailing city after a Roman-Urdu tail.~~
+  **Closed in §24.** The cause was not the encoder's span but the trailing-city
+  rule's lookahead, which required the sentence to end after the city. Found by
+  a live broker run, not by any probe here.
 - **The over-redaction sample is one template family.** All six damaged memos are
   `'Rent payment from <name>, contact <phone>'`, so 0.38% is a measurement of one
   shape, not a general rate.
+
+---
+
+## 24. A live broker found what no offline probe did
+
+Every number in §14–§23 came from a probe calling the detectors directly. This
+runs the actual pipeline: Kafka 3.8 (KRaft), Postgres 16, and the processor in
+its own container with `INSTALL_TIER2=true`, consuming `txn.raw` and writing
+`txn.clean` plus the audit.
+
+It found a defect that eleven sections of offline measurement did not.
+
+### 24.1 The defect: the city rule assumed the sentence ended
+
+§18.4's trailing-city rule required end-of-string or punctuation after the city:
+
+```python
+_TRAILING_CITY = re.compile(rf"^,?\s*({cities})(?=$|[,.;])")
+```
+
+That guard exists for a real reason — `'Model Town, Sialkot Road'` must not lose
+`Sialkot`, because in Pakistan a city name is a road name more often than not.
+But it is too strong, and **Roman-Urdu memos continue past the city**:
+
+```
+RAW  : Statement Plot E-379, Airport Road, Quetta par bhej dein
+CLEAN: Statement [ADDRESS], Quetta par bhej dein          <- leaked
+```
+
+The lookahead sees ` par`, not `$` or punctuation, so the rule declines and the
+city ships in the clear. **This is the leak §22.2 recorded and §23.4 could not
+close** — the survivor was `'Karachi'` in
+`'... PECHS Block 2, Karachi par bhej dein'`, the identical shape.
+
+The corrected test is not "is anything after the city" but "is what follows a
+ROAD word", which is all the original guard was ever protecting against:
+
+```python
+(?=$|[,.;]|\s+(?!(?i:Road|Rd|Street|St|Highway|...|Cantt)\b))
+```
+
+| tail | before | after |
+|---|---|---|
+| `, Quetta par bhej dein` | no match | **`, Quetta`** |
+| `, Multan hai` | no match | **`, Multan`** |
+| `, Sialkot Road` | no match | no match |
+| `, Sialkot road` | no match | no match |
+| ` Karachi Cantt` | no match | no match |
+| `, Quetta.` | `, Quetta` | `, Quetta` |
+
+### 24.2 Proof on the live stream
+
+Same broker, same topics, processor rebuilt and restarted mid-run:
+
+| | memos | city left in the clear |
+|---|---:|---:|
+| processed **before** the fix | 3,984 | **2** |
+| processed **after** the fix | 1,147 | **0** |
+
+141 of the post-fix memos carried a redacted address. No city survived any of
+them.
+
+### 24.3 Why the probes missed it
+
+The offline probes build their cases as `TEMPLATE.format(a=address)` where the
+address is at or near the end of the string. `probe_address_residual.py` uses
+six templates and only one puts narration after the address. The generator's
+`ADDRESS_MEMO_TEMPLATES` do — `'Statement {} par bhej dein'` — but
+`probe_address_in_stream.py` scored ADDRESS coverage at 99.9% because it
+measured *identifying characters covered*, and a missed city is 7 characters
+against an address of 40.
+
+**The aggregate hid it. The stream did not.** A leak is a property of a record,
+not of a character count, and only the end-to-end run scored records.
+
+### 24.4 What else the run confirmed
+
+- **Tier 2 loads in a container from the warm volume**, at the pinned revision,
+  and logs it: `revision=88c3b98b... threshold=0.55 labels=['PERSON_NAME',
+  'ADDRESS'] batch=8 device=cpu`.
+- **The pin's known gap is visible in the logs.** The run still fetches
+  `microsoft/deberta-v3-base` at `main` for the tokenizer — exactly what §20
+  documents the revision pin does *not* cover.
+- **Both tiers write to the audit**: 21,678 Tier 1 findings and 2,609 Tier 2
+  (1,957 PERSON_NAME, 652 ADDRESS) over the run.
+- **CPU throughput is ~13 records/s**, p50 112–128 ms, against ~160/s rules-only.
+  That is the honest cost of Tier 2 without a GPU, and the Dockerfile installs
+  the CPU wheels deliberately.
+- **The integration tests ran for the first time.** With Postgres up, the 13
+  tests that always skip executed and passed.
+
+### 24.5 An observation the run surfaced, not yet acted on
+
+The encoder labels address fragments as people:
+
+```
+'Deliver to C-21, Block J, Karachi'
+   PERSON_NAME  'C-21'      conf=0.81
+   ADDRESS      'C-21, Block J, Karachi'  conf=0.84
+   PERSON_NAME  'Block J'   conf=0.70
+```
+
+The redaction is correct — `merge_spans()` unions them and the output is
+`[ADDRESS+PERSON_NAME]`, nothing leaks. But **the audit records two PERSON_NAME
+findings that are not people**, and the governance report counts entity types
+from that table. §18.2 established that a false positive changing no output is
+not a cost; that argument holds for redaction and does not hold for the audit.
+
+Not fixed here. Recorded because the compliance report is the one consumer for
+which entity_type accuracy, not span coverage, is the product.
+
+### 24.6 Limits
+
+- **One broker, one partition assignment, one consumer.** Rebalancing under
+  `--scale processor=3` with Tier 2 loaded is still untested, and model load
+  takes ~20 s per replica, which is inside the rebalance window.
+- **CPU only.** The container installs CPU torch. No GPU container was built,
+  so the ~16 ms/record GPU figure is still probe-measured, not stream-measured.
+- **The fix is measured on 1,147 records.** The shape it corrects is common in
+  this generator; its frequency in real remittance narration is unknown.
+- **`_ROAD_WORD` is a list, and lists are incomplete.** `Chowk`, `Cantt` and
+  `Bypass` are in it because they appeared; a city followed by an unlisted road
+  word will still be over-extended.

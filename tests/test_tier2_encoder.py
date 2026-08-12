@@ -191,6 +191,10 @@ def test_extension_recovers_the_house_number_and_city(text, found, expected):
         ("Payment against order #4821, Model Town", "Model Town"),
         # A city that is not the one trailing this address stays put.
         ("Model Town, Sialkot Road", "Model Town"),
+        # Case-insensitively, and for every road word the §24 rule lists.
+        ("Model Town, Sialkot road", "Model Town"),
+        ("Gulberg, Hyderabad Bypass", "Gulberg"),
+        ("Saddar, Multan Cantt", "Saddar"),
     ],
 )
 def test_extension_leaves_everything_else_alone(text, found):
@@ -216,6 +220,26 @@ def test_extension_leaves_everything_else_alone(text, found):
     ],
 )
 def test_extension_steps_over_a_structural_component(text, found, expected):
+    start = text.index(found)
+    new_start, new_end = extend_address_span(text, start, start + len(found))
+    assert text[new_start:new_end] == expected
+
+
+@pytest.mark.parametrize(
+    "text, found, expected",
+    [
+        # Found by a live Kafka run (§24), not by any offline probe. Roman-Urdu
+        # memos continue PAST the city, so requiring end-of-string or
+        # punctuation after it left the city in the clear on the shipped path.
+        ("Statement Plot E-379, Airport Road, Quetta par bhej dein",
+         "Airport Road", "Plot E-379, Airport Road, Quetta"),
+        ("Statement Plot 12B, PECHS Block 2, Karachi par bhej dein",
+         "PECHS Block 2", "Plot 12B, PECHS Block 2, Karachi"),
+        ("Ghar ka pata House 5, Model Town, Lahore hai",
+         "Model Town", "House 5, Model Town, Lahore"),
+    ],
+)
+def test_trailing_city_is_taken_when_narration_continues(text, found, expected):
     start = text.index(found)
     new_start, new_end = extend_address_span(text, start, start + len(found))
     assert text[new_start:new_end] == expected
