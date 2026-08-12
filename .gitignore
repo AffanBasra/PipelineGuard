@@ -24,3 +24,9 @@ data/nemotron-pii/
 # tags that docs/decisions.md section 1 forbids storing. Regenerate with
 # scripts/fetch_osm_addresses.py.
 data/osm-addresses/
+
+# Probe outputs. Written next to the repo root by scripts/probe_*.py --out;
+# the numbers belong in docs/tier2-detection-findings.md, not in git.
+address_in_stream.json
+address_residual.json
+tier3_trigger.json
