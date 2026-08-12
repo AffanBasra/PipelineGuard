@@ -361,6 +361,21 @@ def _load_tier2():
     """Build and warm the encoder. Imported here rather than at module scope so
     the processor starts without torch when Tier 2 is off, and separated from
     main() so the batch-loop tests can substitute a fake."""
+    try:
+        import gliner  # noqa: F401
+    except ImportError as exc:
+        # The base install deliberately omits torch and gliner: they are ~1 GB
+        # and the processor runs without them when Tier 2 is off. Asking for
+        # Tier 2 without them is a deployment mistake, and a bare
+        # ModuleNotFoundError three frames deep does not say so.
+        raise RuntimeError(
+            "TIER2_ENABLED=true but the encoder dependencies are missing. "
+            "Install them with `pip install '.[tier2]'`, or build the image "
+            "with `--build-arg INSTALL_TIER2=true` (docker compose: set "
+            "INSTALL_TIER2=true in .env). Set TIER2_ENABLED=false to run "
+            "rules-only."
+        ) from exc
+
     from pipelineguard.detectors.tier2_encoder import Tier2Detector
 
     tier2 = Tier2Detector(
@@ -368,6 +383,7 @@ def _load_tier2():
         threshold=settings.tier2_threshold,
         device=settings.tier2_device,
         batch_size=settings.tier2_batch_size,
+        revision=settings.tier2_model_revision,
     )
     tier2.load()
     return tier2

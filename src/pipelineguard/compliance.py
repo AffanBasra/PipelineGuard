@@ -167,6 +167,28 @@ CLASSIFICATIONS: dict[str, Classification] = {
             "identified natural person."
         ),
     ),
+    "ADDRESS": Classification(
+        data_category="Residential or business address",
+        pk_basis=(
+            "Like a name, an address is not an identifier issued by any "
+            "authority, and no Pakistan-specific instrument attaches to it "
+            "directly. It is personal data under the draft Personal Data "
+            "Protection Bill's definition. Its significance here is that it "
+            "is a LOCATION: a name beside an account number identifies a "
+            "person, while an address beside either says where to find them, "
+            "which is a different order of harm and the reason a partial "
+            "redaction of one is worse than none. It is also the only entity "
+            "type in this pipeline whose redaction is routinely incomplete "
+            "rather than binary -- see docs/tier2-detection-findings.md "
+            "sections 17 and 18."
+        ),
+        gdpr_basis=(
+            "Personal data under Art. 4(1) where it relates to an identified "
+            "or identifiable natural person. A business address on its own "
+            "generally does not; a home address does, and this pipeline "
+            "cannot tell them apart at detection time."
+        ),
+    ),
 }
 
 # Entity types found by more than one detector, and what that means for a

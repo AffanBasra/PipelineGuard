@@ -4,12 +4,19 @@ All PII is synthetic (Faker + hand-rolled locale formats). CNICs are generated
 with valid structure but random digits — they do not correspond to real people.
 The free-text `memo` field intermittently embeds PII in natural language so the
 stream also exercises Tier 2+ later, not just structured-field regex.
+
+Memos also carry addresses (see addresses.py, which explains what in them is
+real and what is not). Until that existed, §13's reason for dropping ADDRESS
+from Tier 2 — that nothing in the stream contains one — was true by construction
+and made the capability impossible to test end to end.
 """
 from __future__ import annotations
 
 import random
 
 from faker import Faker
+
+from pipelineguard.generator.addresses import make_address
 
 fake = Faker()
 
@@ -43,6 +50,30 @@ MEMO_TEMPLATES = [
     "Eidi for {name}",
     "Loan installment",
     "Payment against order #{inv}, contact {phone}",
+]
+
+# Narrations carrying an address. Kept as their own list rather than merged into
+# MEMO_TEMPLATES so the address share of the stream is one named constant
+# (ADDRESS_MEMO_RATE) instead of an accident of how many templates each list
+# happens to hold.
+#
+# Three sentence styles, matching probe_ner_locale.ADDRESS_TEMPLATES: an address
+# in an English frame is a different detection problem from the same address in
+# a Roman-Urdu one, and §3 measured the gap. Some templates also carry a name,
+# because a real narration does and because it is the case §13.2 found the
+# encoder failing on -- re-tagging a name it had already found as part of the
+# address.
+ADDRESS_MEMO_TEMPLATES = [
+    "Deliver statement to {address}",
+    "Address on file: {address}",
+    "Cheque posted to {address}",
+    "Customer resides at {address}",
+    "Rent for {name}, {address}",
+    "Statement {address} par bhej dein",
+    "Address update kar diya: {address}",
+    "Pata: {address}",
+    "{name} ka naya pata {address} hai",
+    "Delivery to {name}, {address}, contact {phone}",
 ]
 
 
@@ -101,23 +132,37 @@ def make_name() -> str:
 # conditional on it, and sweep it rather than trusting the single number.
 BLANK_MEMO_RATE = 0.40
 
+# Share of NON-BLANK memos carrying an address. Applies after the blank draw, so
+# the default mix is 40% blank, 18% address-bearing, 42% other narration.
+#
+# UNVALIDATED, like BLANK_MEMO_RATE above, and load-bearing for a different
+# reason: an address is the only entity in the stream that Tier 2 cannot get
+# from a rule and cannot get right from a single span (§17), so this sets how
+# much of the traffic exercises the hardest case the firewall has.
+ADDRESS_MEMO_RATE = 0.30
 
-def make_memo(blank_rate: float = BLANK_MEMO_RATE) -> str:
+
+def make_memo(blank_rate: float = BLANK_MEMO_RATE,
+              address_rate: float = ADDRESS_MEMO_RATE) -> str:
     """A narration, or "" for a transaction that carries none."""
     if random.random() < blank_rate:
         return ""
-    return random.choice(MEMO_TEMPLATES).format(
+    address_bearing = random.random() < address_rate
+    templates = ADDRESS_MEMO_TEMPLATES if address_bearing else MEMO_TEMPLATES
+    return random.choice(templates).format(
         name=make_name(),
         phone=make_phone(),
         cnic=make_cnic(),
         email=fake.email(),
         inv=random.randint(1000, 99999),
+        address=make_address() if address_bearing else "",
     )
 
 
-def make_transaction(blank_memo_rate: float = BLANK_MEMO_RATE) -> dict:
+def make_transaction(blank_memo_rate: float = BLANK_MEMO_RATE,
+                     address_memo_rate: float = ADDRESS_MEMO_RATE) -> dict:
     name = make_name()
-    memo = make_memo(blank_memo_rate)
+    memo = make_memo(blank_memo_rate, address_memo_rate)
     return {
         "account_holder": name,
         "cnic": make_cnic(),

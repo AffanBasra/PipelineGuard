@@ -218,6 +218,42 @@ def test_form_classification(address, form):
     assert classify(address) == form
 
 
+@pytest.mark.parametrize(
+    "address, form",
+    [
+        # Leading designator: a plot or flat number that merely looks like a
+        # sector code. 90% of these are Karachi.
+        ("A-103, Block S North Nazimabad Town, Karachi", "plot_number"),
+        ("R-31, Sector 15-A Buffer Zone, Karachi", "plot_number"),
+        ("D-9/1 Block 13 Gulshan-e-Iqbal, Karachi", "plot_number"),
+        ("G-8, KDA Overseas Bungalows Block 16 A, Karachi", "plot_number"),
+        # Mid-string: the Islamabad sector convention.
+        ("14, Hill Road, F-6/3, Islamabad", "sector_code"),
+        ("345, Gali 123, G-9/3, Islamabad", "sector_code"),
+        ("163, Main Road I-14, Islamabad", "sector_code"),
+        # Both present: the sector code wins, because it is the rarer and more
+        # distinctive form and is what the bucket exists to measure.
+        ("A-310, Street 4, F-8/3, Islamabad", "sector_code"),
+    ],
+)
+def test_plot_numbers_split_out_of_the_sector_bucket(address, form):
+    """§15 and §16 reported one 'sector_code' bucket that was 45% Karachi plot
+    numbers, so every claim about sector codes being weakest was measured on a
+    mixture. Position separates them: a designator sits in the leading
+    component, a sector code in a later one."""
+    assert classify(address) == form
+
+
+def test_splitting_the_sector_bucket_left_the_other_two_alone():
+    """The split must be confined to the old sector_code bucket. If it moved
+    anything out of block_phase or plain_street, §15's and §16's numbers for
+    those would stop comparing and the split would cost more than it bought."""
+    assert classify("94-Q, Model Town, Lahore") == "block_phase"
+    assert classify("St 29 Sec W Ph 3, Lahore") == "block_phase"
+    assert classify("Noor Jahan Road, Lahore") == "plain_street"
+    assert classify("Mansoor Akhtar Road, Karachi") == "plain_street"
+
+
 # --------------------------------------------------------------------------- #
 # Regressions found by code review
 # --------------------------------------------------------------------------- #

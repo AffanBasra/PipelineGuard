@@ -18,19 +18,45 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
+# Tier 2 is opt-in at BUILD time, because torch and gliner add roughly a
+# gigabyte and the processor runs rules-only without them. Build with
+#   docker build --build-arg INSTALL_TIER2=true .
+# or set INSTALL_TIER2=true in .env for docker compose.
+#
+# Setting TIER2_ENABLED=true at RUN time on an image built without this now
+# fails with an instruction rather than a bare ModuleNotFoundError -- see
+# processor._load_tier2.
+ARG INSTALL_TIER2=false
+
 # Dependency metadata and sources are copied before the rest so that editing
 # a script or a SQL file does not invalidate the pip layer.
 COPY pyproject.toml ./
 COPY src/ ./src/
-RUN pip install --no-cache-dir .
+# torch comes from the CPU index explicitly. pip's default index serves the
+# CUDA build on Linux, which is several gigabytes of driver payload this image
+# can never use -- there is no GPU in it.
+RUN if [ "$INSTALL_TIER2" = "true" ]; then \
+        pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu \
+            "torch>=2.13" && \
+        pip install --no-cache-dir ".[tier2]"; \
+    else \
+        pip install --no-cache-dir .; \
+    fi
 
 COPY scripts/ ./scripts/
 COPY db/ ./db/
 
-# Non-root. Nothing here writes to the filesystem in normal operation --
-# the audit trail is in Postgres and the report goes to stdout -- so there is
-# no reason to run as root.
+# Non-root. The audit trail is in Postgres and the report goes to stdout, so
+# the only thing that ever writes to disk is the model cache below.
 RUN useradd --create-home --uid 1000 app && chown -R app:app /app
+
+# Weights land here, and HF_HOME points at it so the location is one the
+# compose file can mount a volume over. Without a volume the container
+# re-downloads ~1.7 GB on every start, which turns `restart: unless-stopped`
+# plus a network blip into a crash loop.
+ENV HF_HOME=/models
+RUN mkdir -p /models && chown app:app /models
+
 USER app
 
 # Overridden by the topics-init, producer and report services in compose.

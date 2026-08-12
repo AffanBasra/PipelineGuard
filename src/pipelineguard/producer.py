@@ -18,7 +18,11 @@ from faker import Faker
 from tqdm import tqdm
 
 from pipelineguard.config import settings
-from pipelineguard.generator.transactions import BLANK_MEMO_RATE, make_transaction
+from pipelineguard.generator.transactions import (
+    ADDRESS_MEMO_RATE,
+    BLANK_MEMO_RATE,
+    make_transaction,
+)
 from pipelineguard.models import Envelope
 from pipelineguard.observability import setup_logging
 
@@ -55,6 +59,12 @@ def main() -> None:
              "sets how much of the stream reaches Tier 2",
     )
     ap.add_argument(
+        "--address-memo-rate", type=float, default=ADDRESS_MEMO_RATE,
+        help=f"share of NON-BLANK memos carrying an address (default "
+             f"{ADDRESS_MEMO_RATE}); sets how much of the stream exercises "
+             "Tier 2's hardest entity",
+    )
+    ap.add_argument(
         "--seed", type=int, default=None,
         help="RNG seed (default: random, and logged so any run can be replayed)",
     )
@@ -69,7 +79,8 @@ def main() -> None:
     seed = args.seed if args.seed is not None else random.randrange(2**32)
     random.seed(seed)
     Faker.seed(seed)
-    log.info("generator seed=%d blank_memo_rate=%.2f", seed, args.blank_memo_rate)
+    log.info("generator seed=%d blank_memo_rate=%.2f address_memo_rate=%.2f",
+             seed, args.blank_memo_rate, args.address_memo_rate)
 
     producer = Producer(
         {
@@ -86,7 +97,8 @@ def main() -> None:
         counter = DeliveryCounter(bar)
         blank = 0
         for _ in range(args.count):
-            payload = make_transaction(args.blank_memo_rate)
+            payload = make_transaction(args.blank_memo_rate,
+                                       args.address_memo_rate)
             blank += not payload["memo"]
             env = Envelope(payload=payload)
             # Key by message_id: even distribution now, stable partitioning later.

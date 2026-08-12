@@ -1013,6 +1013,11 @@ ONNX fp32's 31.0 ms is ~62 ms for a production pass.
 
 ## 13. ADDRESS dropped from Tier 2 — a capability with no field
 
+> **Superseded by §18.** The generator now emits addresses, so the premise below
+> no longer holds, and §18.2 found the 30% false-positive rate in §13.2 changes
+> no redacted output. ADDRESS is back in `LABEL_GROUPS`. Kept as written because
+> the reasoning was right for the state of the pipeline at the time.
+
 §3 and §6.2 established the address-form penalty as the strongest finding on
 this branch: −21 points for Urdu-form addresses on urchade, −18 on nvidia, two
 independent models agreeing. It is also the only place the Pakistani-locale
@@ -1501,8 +1506,8 @@ is not a decision.
 - **A training corpus now exists.** 91,675 real addresses with independent
   provenance, and gold spans that need no alignment because the harness inserts
   them. The circularity objection that blocked this in §13 is answered.
-- **Sector forms remain the weak cell** even for the best model — 74.0% at
-  threshold 0.55 against 82.0% on plain streets.
+- **Karachi plot numbers are the weak cell** — 83.4% against 92.7% on Karachi
+  plain streets. The Islamabad sector convention is 94.4% (§19.3).
 - **Nobody else has this.** A Pakistani-locale address model is the one thing
   in this project that cannot be obtained by picking a better checkpoint.
 
@@ -1548,4 +1553,1137 @@ threshold produces results that are not comparable.
   over-redaction for 68.6% coverage. If over-redaction matters more than address
   completeness, that is the better point.
 - ADDRESS remains **out of Tier 2** (§13). This section changes which checkpoint
-  runs, not which entity types it looks for.
+  runs, not which entity types it looks for. **Superseded by §18.2**, which
+  restores it after finding that its false positives change no output.
+- **The coverage numbers above are raw**, and §17.1 shows the raw metric counts
+  separators between adjacent spans as leaks. Effective coverage is ~10 points
+  higher for every model here.
+
+---
+
+## 17. Separators are not leaks, and the residual is interior
+
+§14.4 recorded the shape of the address problem — any-hit ~99% against coverage
+~85% — and left the question that decides what to do about it unanswered: *where
+inside the address are the missed characters?* Leading and trailing characters
+are recoverable by a rule. Interior ones are not, and are the honest case for
+fine-tuning.
+
+`scripts/probe_address_residual.py` measures the split. It was written and run
+**before** the rule in §18.4, deliberately: a rule designed against an assumed
+failure mode measures its own assumption.
+
+3,600 cases — 300 OSM addresses, form-stratified, each through 12 sentence
+frames — against `gliner-community/gliner_medium-v2.5` at 0.55.
+
+### 17.1 A metric defect that runs through §3, §6.2, §14, §15 and §16
+
+When the encoder returns two adjacent spans for one address, `char_coverage`
+scores the `', '` between them as missed. Redaction then emits
+`[ADDRESS], [ADDRESS]`. A comma survives. Nothing identifying does.
+
+Measured: **53% of interior misses are punctuation and whitespace alone**, and
+21,430 separator characters in this run were scored as leaks.
+
+| metric | coverage |
+|---|---:|
+| raw — every gold character, the §14–§16 metric | 77.7% |
+| **effective — alphanumeric characters only** | **88.3%** |
+
+Every coverage number in §14, §15 and §16 is a raw number and understates the
+models by roughly ten points. The **rankings** between models mostly survive —
+all four pay the same penalty — but the distance to 100% does not, and that
+distance is what §16.4's first argument for fine-tuning was built on.
+
+This is the third measurement in this project reversed by measuring the same
+thing a second way.
+
+### 17.2 The residual is interior
+
+Of the missed *identifying* characters, 14,810 of 126,312:
+
+| where | chars | share |
+|---|---:|---:|
+| leading — the house or plot number | 3,972 | 26.8% |
+| trailing — the city | 294 | 2.0% |
+| **interior — a gap in the middle** | **10,073** | **68.0%** |
+| never found at all | 471 | 3.2% |
+
+So a span-extension rule has a **ceiling of 28.8%** of the residual: it could
+take effective coverage from 88.3% to at most 91.7%. My hypothesis going in —
+that the residual was mostly the dropped house number — was wrong in aggregate.
+
+It is not wrong everywhere. By form:
+
+| form | effective | leading | trailing | interior |
+|---|---:|---:|---:|---:|
+| plain_street | 93.5% | **64.1%** | 0.9% | 28.0% |
+| block_phase | 89.9% | 18.7% | 6.1% | 73.3% |
+| sector_code | 84.7% | 23.0% | 0.3% | 73.6% |
+
+On plain streets the residual **is** the house number, and a rule reaches most
+of it.
+
+### 17.3 The 26.8% is the most identifying 26.8%
+
+Aggregate share is the wrong way to weigh this. What survives, verbatim
+(`·` = redacted):
+
+```
+'R1525, FB Area Block 3, Karachi'   ->  R1525, ·······················
+'68, Model Town Block G, Lahore'    ->  68, ··························
+'D 5, Block 10-A, ...'              ->  D 5, ·························
+```
+
+The street and city are redacted; the plot number is not. `FB Area Block 3` is a
+district of some 40,000 people. `R1525` selects one house in it. A partly
+redacted address looks redacted and is not, and the part that survives here is
+the part that identifies.
+
+Interior gaps are a different failure and mostly land on degenerate OSM records
+— `'Block 5-E Block 5 E Block 5 Nazimabad'` is malformed data, not an address
+anyone wrote.
+
+---
+
+## 18. ADDRESS returns to Tier 2, with a rule for the house number
+
+### 18.1 The generator now emits addresses
+
+§13 removed ADDRESS because nothing in the stream contained one. That made the
+capability untestable end to end and the fine-tuning question unanswerable, so
+`generator/addresses.py` closes the premise rather than arguing with it.
+
+Place names are real, from the OSM corpus. **House and plot numbers are always
+random.** That split is the whole privacy argument and it is asserted in tests:
+a place name is geography, the number attached to it is what identifies a
+dwelling, and `decisions.md` §1 requires the generator to generate rather than
+replay. Hand-writing a fresh set would have rebuilt §5's circularity one layer
+down.
+
+`ADDRESS_MEMO_RATE = 0.30` of non-blank memos, so the default mix is 40% blank,
+18% address-bearing, 42% other narration.
+
+### 18.2 §13.2's false-positive rate is withdrawn
+
+Measured on the shipped path — `Tier2Detector`, not a reimplementation — over
+400 address-bearing and 400 address-free memos:
+
+| | ADDRESS | PERSON | incremental over-redaction | cost |
+|---|---:|---:|---:|---:|
+| PERSON labels only | 24.1% | 99.2% | — | 1.00x |
+| **+ ADDRESS group** | **98.5%** | **100.0%** | **0.0%** | ~2x |
+| all labels, one pass | 98.0% | 98.4% | 0.0% | 1.10x |
+
+The ADDRESS labels **do** fire on ~50% of address-free memos, which is roughly
+what §13.2 reported. But every character they claim was already claimed by
+PERSON or is intended PII, so `merge_spans()` unions them and the redacted
+output is **byte-identical**. §13.2 counted the firing and not the effect.
+
+*A false positive that changes no output is not a cost.* The only real price is
+one extra forward pass.
+
+### 18.3 One pass or two
+
+§13 recorded combining all labels into one pass as dropping PERSON 99.4% → 90.9%.
+**That does not replicate here**: 100.0% → 98.4%, for 45% less compute — another
+instance of §6.1's rule that nothing transfers between checkpoints.
+
+Two passes still ship. PERSON is the entity this pipeline exists for, and 1.6
+points of it is not worth ~7 ms. **This is a live trade to revisit if throughput
+binds** — it is the cheapest 2x available.
+
+### 18.4 The span-extension rule
+
+`extend_address_span()` widens an ADDRESS finding over its leading house number
+and its trailing city — the two positional components §17.2 identified.
+
+| | before | after |
+|---|---:|---:|
+| OSM corpus, effective coverage | 88.3% | **90.0%** |
+| OSM corpus, addresses **fully** redacted | 62.4% | **74.3%** |
+| generated stream, ADDRESS coverage | 98.5% | **99.9%** |
+| incremental over-redaction, address-free memos | — | **0.0%** |
+
+The second row matters most for a firewall: the share of addresses leaving with
+*nothing* identifying intact rises by twelve points.
+
+By form, effective coverage: plain_street 93.5% → **96.3%**, block_phase 89.9% →
+**91.4%**, sector_code 84.7% → **86.2%**. It delivered 1.7 of the 3.4 points
+§17.2 said were available, and the shortfall is deliberate conservatism.
+
+The rule requires a digit, so `'qadri manzil'` is left alone rather than guessed
+at — a building name can carry a person. It extends one token per side, because
+an unbounded walk swallows the invoice number in `'Payment against order #4821,
+House 12, Model Town'`.
+
+Three defects the tests caught in the rule as first written:
+
+- a bare word boundary let the trailing-city match eat `Sialkot` out of
+  `'Model Town, Sialkot Road'` — in Pakistan a city name is a road name more
+  often than not
+- the optional letter prefix, which exists for `R1525` and `D 5`, had no left
+  boundary and matched the final `o` of `'Statement to 14, Islamabad'`
+- a single-comma anchor could not reach back over OSM's doubled separators
+
+### 18.5 What this does to the fine-tuning question
+
+§16.5 recommended against fine-tuning. That holds, and two of its reasons are
+now stronger while one is gone.
+
+**Gone:** "the generator contains no addresses, so fine-tuning would build a
+capability with no field." It has a field now.
+
+**Stronger:** §16.4's lead argument was "79% is not 99%". At the corrected metric
+with the rule applied it is **90.0% against 100.0%** — the same gap, ten points
+narrower, closed without training anything.
+
+**Stronger:** the corpus is thinner than 91,675 suggests. It holds **17,177
+distinct street-tails**, of which Karachi contributes 15,236; `'PECHS Block 2,
+Karachi'` appears 2,655 times with a different number in front. As an evaluation
+set 91,675 is honest. As a training set it is ~17k contexts, 83% one city.
+
+**And the sector-code finding needs qualifying again.** The `sector_code` bucket
+mixes two unrelated patterns: 55% match mid-string (the Islamabad `F-6/3`
+convention) and 45% at position 0 (Karachi plot numbers — `A-50`, `R-31`,
+`C-34`). By city it is 1,910 Karachi against 548 Islamabad. Every claim in §15
+and §16 about sector codes being weakest is measured on a bucket that is mostly
+Karachi plot numbers. Splitting the bucket is the next measurement, not a
+conclusion.
+
+The residual remaining after §18.4 is **74.6% interior**. That is the part no
+rule reaches and the only honest argument left for fine-tuning — and it cannot
+be tested, because the only city with the Islamabad convention in any volume is
+Islamabad itself (548 addresses). Hold it out and you train with almost no
+examples of the form you want to fix; keep it in and there is no held-out
+evaluation. Lahore has 12 such addresses and Rawalpindi 11.
+
+**Verdict unchanged: do not fine-tune.** Not because the gap is closed, but
+because the corpus cannot support the experiment that would prove it closed.
+
+### 18.6 Limits
+
+- **The generated addresses are easier than real ones.** 99.9% coverage on the
+  stream against 90.0% on OSM. The generator does not reproduce OSM's doubled
+  commas, repeated block names or ALL-CAPS shop descriptions, so the stream
+  number is an upper bound and the corpus number is the one to trust.
+- **`CITIES` is a fixed list of eleven.** An address in a city not on it loses
+  the trailing-city extension silently. It is locale knowledge of the same kind
+  Tier 1 already encodes, and it degrades toward under-extension rather than
+  over-redaction.
+- **Cost figures fluctuate ±15% between runs** on this GPU. Treat the ~2x
+  multiplier as the result, not the millisecond values.
+- **Over-redaction is still measured on generated memos**, and §16.7's warning
+  stands: the hand-written precision corpus is the weakest evidence here.
+- **The interior residual is unaddressed** and this section does not pretend
+  otherwise.
+
+---
+
+## 19. The sector-code weakness was Karachi plot numbers
+
+§15.5, §16.4 and the Monday recap all carried a version of the same claim:
+sector-code addresses are the form encoders handle worst. §16.4 used it as an
+argument for fine-tuning — *"sector forms stay weakest even for the best model,
+74.0% at 0.55 against 82.0% on plain streets."*
+
+The claim was measured on a bucket holding two structurally different things.
+
+### 19.1 One regex, two conventions
+
+`SECTOR_CODE` matches `[A-Z]-\d+(/\d+)?`. In this corpus that catches:
+
+```
+plot_number   'A-103, Block S North Nazimabad Town, Karachi'
+sector_code   '14, Hill Road, F-6/3, Islamabad'
+```
+
+The first is a plot or flat designator in the leading component. The second is
+the Islamabad sector convention in a later one. 45% of the old bucket was the
+first kind, and by city it was 1,910 Karachi against 548 Islamabad.
+
+`classify()` now splits them by **position**. The corpus gains a `plot_number`
+form; `block_phase` and `plain_street` are untouched, so every number §15 and
+§16 reported for those still compares.
+
+### 19.2 Position is not convention, so the probe reports city as well
+
+Splitting by position does not by itself separate the conventions, and the
+letters say why:
+
+```
+mid-string codes, Islamabad   F 275   I 161   G 66   H 10   E 3
+mid-string codes, Karachi     A 112   B 106   G 70   D 52   R 44   C 44   F 28
+```
+
+Islamabad's mid-string codes are the sector alphabet. Karachi's are spread
+across the alphabet and are flat or shop designators — but Karachi *also* uses
+G, F and E, so no letter rule separates them either. Only city does, which is
+why `probe_address_residual.py` now reports city and form together rather than
+trusting `classify()` to carry the distinction alone.
+
+### 19.3 The finding reverses
+
+800 addresses, form-stratified, 9,600 cases, `gliner_medium-v2.5` at 0.55.
+Effective coverage (§17.1), no extension rule:
+
+| cell | n | raw | **effective** |
+|---|---:|---:|---:|
+| **Islamabad / sector_code** | 1,200 | 80.7% | **94.4%** |
+| Karachi / plain_street | 1,824 | 81.1% | 92.7% |
+| Karachi / block_phase | 2,112 | 80.8% | 91.6% |
+| Karachi / plot_number | 2,100 | 73.9% | 83.4% |
+| Karachi / sector_code | 1,128 | 71.6% | 81.9% |
+| *the old mixed bucket* | — | *74.6%* | *85.9%* |
+
+**The Islamabad sector form is among the strongest cells measured.** It is the
+form §3 built the entire address finding on, and the weakness attributed to it
+belongs to Karachi's plot and flat designators.
+
+With the span-extension rule applied, by form:
+
+| form | raw | effective |
+|---|---:|---:|
+| plain_street | 91.5% | 95.7% |
+| block_phase | 89.5% | 93.1% |
+| sector_code | 82.1% | 87.4% |
+| plot_number | 79.4% | 85.3% |
+
+Aggregate: 89.4% effective, 73.0% of addresses fully redacted. **Those
+aggregates are not comparable to §18.4's**, because the sample now spans four
+buckets rather than three and the new bucket is the weakest; the per-cell
+numbers are the ones that carry.
+
+### 19.4 What is withdrawn
+
+- §15.5's and §16.4's "sector forms stay weakest" — withdrawn. It measured
+  Karachi plot numbers.
+- The Monday recap's fine-tuning argument built on it — withdrawn with it.
+- §16.7's "83% Karachi" limit is *reinforced*: the mixed bucket was a case of
+  Karachi's composition being read as a property of a form.
+
+This is the fourth result in this project reversed by measuring the same thing a
+second way, and the second where the first measurement was mine.
+
+### 19.5 A defect that destroyed the corpus twice
+
+`build_address_corpus.py` prints Urdu-script sample addresses at the end of its
+report, which raises `UnicodeEncodeError` on a cp1252 console — and `report()`
+ran **before** the file was written, so the whole build was discarded each time.
+
+It happened twice before being noticed. The first traceback scrolled past under
+a `head` pipe; the stale corpus on disk looked current, and a full probe ran
+against it and produced a three-bucket result that was read as real.
+
+The write now happens first and stdout is reconfigured to UTF-8. The file is the
+deliverable; the report is a convenience.
+
+---
+
+## 20. Pinning the checkpoint, and making Tier 2 deployable
+
+§6.1 established that a threshold does not transfer between checkpoints, and
+§16 chose `gliner-community/gliner_medium-v2.5` at 0.55 on that basis. Neither
+section noticed that the checkpoint was never actually fixed.
+
+### 20.1 A model repo is a git repo
+
+`GLiNER.from_pretrained(model_id)` with no `revision` resolves `main`. That is a
+moving pointer:
+
+```
+88c3b98b57ad  2026-04-28  add fp16 and bf16 variants
+ed16f26c9374  2024-06-18  Update README.md
+```
+
+The weights changed in April. The name `gliner-community/gliner_medium-v2.5` did
+not. `_TUNED_FOR` compares the **name**, so it would have stayed silent: the
+pipeline would run an uncalibrated cutoff against weights nobody swept it
+against, and the audit would look normal.
+
+`TIER2_MODEL_REVISION` now pins `88c3b98b57ad5e7d66fb209ed61c53f4b1fd05da` — the
+commit every number in §14–§19 was measured against. The repo carries no tags,
+so a commit hash is the only immutable identifier available.
+
+Verified end to end: the pinned SHA returns `200` from the hub, and a
+non-existent one raises `RevisionNotFoundError` rather than silently loading
+`main`. A pin that is not enforced is worse than none.
+
+`resolved_revision()` drops the default pin when a different model is chosen — a
+commit hash belongs to one repo, and carrying it across would fail the load on
+a config the operator never set. An explicitly supplied revision is always kept.
+
+### 20.2 The pin is not total
+
+GLiNER resolves its base ~~tokenizer~~ **architecture config** from
+`microsoft/deberta-v3-base` at `main`, a different repo the revision above
+cannot reach. Pinning fixes the weights, not every byte the load touches.
+
+*Corrected in §25.1: it is the config, not the tokenizer — the checkpoint ships
+its own tokenizer. §25 closes the gap with a prefetch plus offline mode, and
+`load()` now logs which of the two states it is in.*
+
+Only a warm cache plus `HF_HUB_OFFLINE=1` closes that, and compose documents it.
+Verified: with the volume warm, the container loads and detects with
+`HF_HUB_OFFLINE=1` set, in **10 seconds and zero network calls**.
+
+Stating the gap is worth more than the pin: a pin believed to be total is how a
+silent change gets attributed to something else.
+
+### 20.3 Tier 2 could not run in Docker at all
+
+`torch` and `gliner` lived only in `requirements.txt`, which the Dockerfile
+never reads — it runs `pip install .` from `pyproject.toml`. The image had no
+encoder. It started only because `TIER2_ENABLED` defaults to false; setting it
+true died on an import three frames deep.
+
+| | |
+|---|---|
+| `[tier2]` extra | `pip install '.[tier2]'` |
+| Build arg | `--build-arg INSTALL_TIER2=true`, default false |
+| torch source | the CPU index explicitly — pip's default serves a multi-gigabyte CUDA build this image has no GPU for |
+| Image size | 257 MB base, **1.81 GB** with Tier 2 |
+| Cache | `HF_HOME=/models` on a named volume — 1.6 GB, so a restart does not re-fetch |
+| Warm start | 10 s, offline-capable, against ~14 min cold |
+| Failure mode | asking for Tier 2 without the extra now names the fix |
+
+The cache volume matters more than it looks. `restart: unless-stopped` is what
+makes the crash-and-replay design real; without a warm cache, one network
+outage turns that restart policy into a download loop.
+
+### 20.4 Limits
+
+- **The image is 7x larger with Tier 2**, which is why it is opt-in rather than
+  default. A GPU image would be larger again and is not built here.
+- **`HF_HUB_OFFLINE=1` is documented, not default.** The first run must
+  download, so defaulting it on would break a clean start.
+- **Nothing verifies the weights against a checksum after download.** The
+  revision is the hub's guarantee, and this project takes it on trust.
+
+---
+
+## 21. Fine-tuning: the decision, with the evidence that decides it
+
+§16.5 recommended against fine-tuning on five grounds. §18.5 noted one had
+disappeared and two had strengthened. §19 then removed the strongest remaining
+argument for it. This settles the question with four new measurements.
+
+### 21.1 Two thirds of the residual is malformed OSM data
+
+800 addresses, `gliner_medium-v2.5` at 0.55 with the span rule, classified by
+whether the record is something a person would write. A record is malformed if
+it has an empty comma component, runs past 80 characters, repeats a two-word
+phrase, or shouts in capitals.
+
+| | addresses | coverage | share of all missed characters |
+|---|---:|---:|---:|
+| malformed records | 202 | 83.9% | **63.3%** |
+| well-formed records | 598 | **93.3%** | 36.7% |
+
+```
+empty-component   119     'D-57,, Block H North Nazimabad Town'
+over-80-chars     105     'V28C+4M, SHOP NO G-12 GROUND FLOOR THE CENTRAL MALL ...'
+repeated-phrase    29     'Block 5-E Block 5 E Block 5 Nazimabad'
+shouting            8
+```
+
+This matters more than the aggregate. **On addresses a person would actually
+write, the shipped configuration is at 93.3%, not 90.5%.** The aggregate is
+dragged down by OSM data-entry errors, and a model fine-tuned on this corpus
+would spend most of its capacity learning to parse them.
+
+That is not a hypothetical objection. 63.3% of the training signal available
+here is signal about malformed records.
+
+### 21.2 The worst well-formed cases were one fixable shape
+
+Ranking well-formed addresses by coverage, the bottom of the list was almost
+entirely one pattern:
+
+```
+31.6%   C-21, Block J North Nazimabad Town, Karachi
+31.6%   C-11, Block I North Nazimabad Town, Karachi
+32.4%   C-18, Block J North Nazimabad Town, Karachi
+50.0%   B-14, Block D North Nazimabad Town, Karachi
+```
+
+The encoder finds `North Nazimabad Town`. The plot number sits **two** components
+out, behind `Block J` — which carries no digit, so the single-step rule of §18.4
+stopped there and never reached it.
+
+Extending the walk to step over a structural component and try again:
+
+| | effective coverage | over-redaction |
+|---|---:|---:|
+| §18.4 rule | 89.4% | 0.0% |
+| **stepping rule** | **90.5%** | **0.0%** |
+
+By form: `plot_number` 85.3% → **86.9%**, `sector_code` 87.4% → **88.2%**,
+`block_phase` 93.1% → **94.3%**, `plain_street` 95.7% → **96.5%**. Addresses
+redacted *completely* rise from 74.3% to **77.1%**.
+
+Over-redaction on 400 address-free memos is **0.0% of memos and 0.00% of
+characters** — identical to the narrower rule. The gain is free.
+
+**This is the second time a residual attributed to model weakness turned out to
+be a span-boundary problem a regex could reach.** That is the pattern the
+fine-tuning decision has to weigh.
+
+### 21.3 Full fine-tuning does not fit the *local* hardware
+
+~~Not an argument about value — an argument about possibility~~ **Withdrawn as
+an argument against fine-tuning.** The measurement below stands; the conclusion
+drawn from it does not. Kaggle (T4 16 GB, 30 h/week) and Colab are available, so
+the constraint is local only.
+
+```
+parameters                     208.6 M (all trainable)
+weights on GPU                 0.84 GB
+weights + gradients + Adam     4.18 GB
+GPU total                      4.29 GB  (RTX 3050 Ti Laptop)
+```
+
+**4.18 of 4.29 GB before a single activation**, on a card that also drives a
+display. Full fine-tuning cannot run on *this* machine — but 4.18 GB fits a
+16 GB T4 roughly four times over, so LoRA and 8-bit Adam are not needed either.
+
+This removes one of the five arguments in §21.4, and it was the one explicitly
+labelled as not being about value. §21.5 does not turn on it.
+
+### 21.4 The arguments, current state
+
+**For, and what remains of each:**
+
+| §16.4 argument | state |
+|---|---|
+| "79% is not 99%" | **weakened further.** 96.0% on well-formed addresses after §23, against 100% for PERSON |
+| "sector forms stay weakest" | **withdrawn** (§19.3). It was Karachi plot numbers |
+| "the residual is the identifying part" | **partly addressed.** 77.1% of addresses now leave with nothing readable, up from 62.4% |
+| "a training corpus now exists" | **true, and thinner than it looks.** 17,177 distinct street-tails, 83% Karachi, 63% of the residual malformed |
+| "no Pakistani-locale address model off the shelf" | **still true.** The one thing a checkpoint cannot buy |
+| *new:* "ADDRESS has a field now" | **true.** §13's objection is gone |
+
+**Against:**
+
+- **The weak cell is a span problem, not a language problem.** Karachi plot
+  numbers at 86.9%, and 30.2% of that residual is still leading characters —
+  the shape rules have twice proven able to reach.
+- **PERSON is at 100% and there is nothing to protect it with.** Fine-tuning on
+  ADDRESS risks catastrophic forgetting on the entity this pipeline exists for,
+  and `decisions.md` §1 forbids a real-name corpus to train against. The only
+  PERSON data is synthetic and already scores 100%, so it can detect damage but
+  cannot prevent it.
+- **Testable, but only just.** Grouped splitting by street-tail gives an honest
+  evaluation — a plain record split leaks, because `PECHS Block 2, Karachi`
+  appears 2,655 times with different numbers. But the Islamabad sector cell has
+  **134 distinct street contexts**, so that cell cannot be evaluated with
+  confidence whatever the split.
+- ~~**It does not fit the hardware** (§21.3).~~ Withdrawn — free Kaggle/Colab
+  GPUs are available, and 208M params fit a T4 without LoRA.
+- **Tier 2 already costs ~2x** since ADDRESS returned. Fine-tuning does not
+  reduce that.
+
+### 21.5 Decision
+
+**Do not fine-tune. Ship the pinned checkpoint plus the span rules.**
+
+The reasoning has changed since §16.5, and the change matters more than the
+verdict. §16 said don't, mostly because ADDRESS had no consumer and the
+evaluation would be circular. Both of those are now fixed — and the answer is
+still don't, for a better reason:
+
+> Every time this project has attributed an address failure to the model, and
+> then measured where the failure actually was, it turned out to be somewhere a
+> rule could reach. §17 found separators. §18 found the house number. §21.2
+> found the component behind the structural word. Three for three.
+
+The remaining residual is 63% malformed records and 27.8% leading characters.
+Neither is a language-understanding problem. Before spending a rented GPU on
+208M parameters, the cheaper question is how much of the last 6.7% on
+well-formed addresses is still positional.
+
+### 21.6 What would change this
+
+Concrete, so the decision can be revisited on evidence rather than mood:
+
+1. **The residual stops being positional.** If a further span rule gains under
+   0.3 points, the easy ground is gone and the rest is genuinely the model.
+   *Tested in §23: the bridging rule gained 2.6 points. This did not fire.*
+2. **Addresses become a primary entity.** ADDRESS is a secondary field in a
+   memo. If a `beneficiary_address` column appears, 93.3% is no longer good
+   enough and the calculus changes.
+3. **A second city arrives with real sector density.** 134 Islamabad street
+   contexts cannot support a claim either way. More Islamabad and Rawalpindi
+   data is a prerequisite, not an optimisation.
+4. **PERSON gets a corpus that can prove it survived training.** Without one,
+   any fine-tune is a bet on the entity that matters most.
+
+### 21.7 If it is done anyway, the design
+
+Recorded now so it cannot be improvised later:
+
+- **Group by street-tail.** Never split one street across train and test. 17,177
+  groups.
+- **Stratify the test set by city × form**, so no cell is reported as an average
+  of Karachi.
+- **Exclude malformed records from training**, or measure with and without. 63%
+  of the signal is otherwise about data-entry errors.
+- **Pre-declare the PERSON floor.** Run the §2 probe before and after; any drop
+  below 99% fails the experiment regardless of the ADDRESS result.
+- **Pre-declare the ADDRESS bar.** Not clearly above ~~93.3%~~ **96.0%** (§23.4)
+  on well-formed addresses means the checkpoint won.
+- **Report the Islamabad sector cell separately**, labelled underpowered at
+  n≈134 contexts.
+- **Run it on Kaggle or Colab.** Full fine-tuning does not fit locally, but
+  4.18 GB fits a 16 GB T4 with room to spare — no LoRA, no 8-bit Adam.
+- **Upload nothing that §1 forbids.** The corpus is public OSM address data and
+  synthetic names, so a hosted notebook is within the privacy line. That has to
+  stay true of anything added to it later.
+
+### 21.8 Limits
+
+- **"Malformed" is a heuristic**, not ground truth. It uses four structural
+  rules and no human review. The 63.3% is indicative.
+- **The stepping rule is tuned on this corpus.** It was designed after looking
+  at the failures it fixes, which is exactly the loop §5 warns about — the
+  0.0% over-redaction figure is the guard, and it is measured on generated
+  memos, not real ones.
+- **No fine-tune was actually run.** This argues from the structure of the
+  residual and the cost of the alternative, not from a trained model. A
+  contrary result from an actual run would beat this reasoning.
+
+---
+
+## 22. Tier 3 has nothing to escalate on
+
+`decisions.md` §11 settles Tier 3's shape — genuine escalation, same span,
+promoted on uncertainty — and §12 pre-registers its failure condition: *"if it
+exceeds ~1-2% of messages the cost argument for tiering collapses."*
+
+Both assume an uncertainty signal exists. §10.1 already tested one and found it
+backwards. This tests the only remaining candidate, the encoder's own confidence
+score, over 1,200 generated memos: 600 address-bearing, 600 address-free.
+
+### 22.1 Confidence is weakly predictive, and not monotonic
+
+| band | spans | precision |
+|---|---:|---:|
+| 0.55–0.65 | 525 | 76.6% |
+| 0.65–0.75 | 668 | 85.8% |
+| 0.75–0.85 | 899 | **99.3%** |
+| 0.85–0.95 | 1,441 | 95.4% |
+| 0.95–1.00 | 188 | 100.0% |
+| **all** | **3,721** | **92.2%** |
+
+Mean confidence is 0.811 on correct spans and 0.690 on wrong ones. So the signal
+is real — unlike §10.1's masked fraction, this is not backwards.
+
+It is also **not monotonic**: the 0.75–0.85 band is more precise than 0.85–0.95.
+A threshold drawn anywhere on this curve is drawn through noise as well as
+signal.
+
+### 22.2 The population it would fix is 0.25% of records
+
+Counting a leak as identifying characters surviving **both** tiers:
+
+```
+records leaking after Tier 1 + Tier 2 : 3 of 1,200  (0.25%)
+```
+
+**§23 has since cut this to 1 of 1,200 (0.08%)** by closing two of the three.
+Every figure below is the pre-§23 measurement; the decision only hardens, since
+a smaller population buys less.
+
+All three are address boundary errors:
+
+```
+'Delivery to Bilal Raza, Flat G-790, Vehari Road, Multan, contact ...'
+   leaks: 'Vehari Road'
+'Delivery to Muhammad Iqbal, House No. 38-N, Chaman Housing Scheme, Quetta, ...'
+   leaks: 'Chaman Housing Scheme'
+'Statement Plot 12B, Street 14, PECHS Block 2, Karachi par bhej dein'
+   leaks: 'Karachi'
+```
+
+Not one is a missed entity. All three are the same positional class §17, §18 and
+§21 have now reached three times with regexes.
+
+**A correction to this section's own first run.** It scored Tier 2 in isolation
+and reported 6.1% of records leaking, with half invisible to any confidence
+rule. Production runs Tier 1 on the same memo, and once the rules are included
+the figure is 0.25% and nothing is invisible. The phones, CNICs and emails the
+rules already remove were being counted as Tier 2's misses. Fifth reversal in
+this project, and the third caused by measuring one component as though it were
+the system.
+
+### 22.3 The trigger costs a third of the stream to reach two records
+
+| escalate if any span below | catches | escalates |
+|---|---:|---:|
+| 0.65 | 66.7% of leaks (2 of 3) | **35.6% of the stream** |
+| 0.75 | 66.7% | 61.8% |
+| 0.85 | 66.7% | 74.7% |
+
+To adjudicate 2 leaking records, 427 records go to an LLM. **213 to 1.**
+
+Against §12's budget:
+
+| threshold | records escalated | §12 verdict |
+|---|---:|---|
+| < 0.60 | 20.5% | collapses |
+| < 0.65 | 35.6% | collapses |
+| < 0.70 | 49.2% | collapses |
+| < 0.75 | 61.8% | collapses |
+
+There is no threshold under 2%. The lowest band that exists at all starts at
+0.55, because that *is* the shipped threshold — everything below it was already
+discarded. The confidence scores that survive into production are, by
+construction, the ones the model was most sure of.
+
+### 22.4 Cost, if it were built anyway
+
+At ~800 ms per LLM call, amortised over the whole stream:
+
+| escalation rate | added ms/record | throughput ceiling |
+|---:|---:|---:|
+| 1% | ~8 ms | ~125 /s |
+| 20.5% (the best measured) | ~164 ms | **~6 /s** |
+
+Current throughput is ~160 /s. The measured escalation rate would cut it by
+96%.
+
+Local inference does not rescue this. The GPU holds 4.29 GB and GLiNER already
+occupies 0.84 GB during inference, leaving room for roughly a 3B model at 4-bit
+— and a 3B model adjudicating Pakistani-locale PII is not obviously better than
+the encoder it is adjudicating.
+
+### 22.5 Decision
+
+**Tier 3 is not built. Recorded as a measured non-goal, not an unfinished item.**
+
+The three-tier architecture in the README and `decisions.md` describes an
+escalation Tier 3 that this measurement shows cannot exist as specified:
+
+1. The error population is **0.25% of records**.
+2. Every one of those errors is **positional**, and rules have reached that class
+   three times.
+3. The cheapest trigger that finds two thirds of them **escalates 35.6% of the
+   stream** — eighteen times §12's budget.
+4. It would cost **96% of throughput**.
+
+This is the second uncertainty signal this project has tested and the second to
+fail, and the reason is the same both times. §10 stated it plainly: *"at runtime
+there is no ground truth. The processor cannot know whether a masked span was a
+real name or a false positive; if it could, it would not need the model."*
+Confidence is a weaker restatement of the model's own opinion, not an
+independent check on it.
+
+### 22.6 What would change this
+
+- **A different error population.** If contextual PII enters the stream —
+  identity inferable across a sentence rather than located in a span — Tier 3
+  stops being escalation and becomes a capability argument, which is how Tier 2
+  earned its place. That needs a corpus demonstrating the gap, which does not
+  exist.
+- **An independent signal.** Disagreement between two cheap detectors is a real
+  uncertainty measure in a way one model's own score is not. Two encoders cost
+  2x, not 100x, and that is measurable.
+- **A materially higher leak rate.** 0.25% leaves nothing to buy. If a field
+  arrives where Tier 2 performs far worse, the arithmetic changes.
+
+### 22.7 Limits
+
+- **Measured on generated memos**, whose addresses §21.8 records as easier than
+  real OSM ones. The true leak rate on messier text is higher than 0.25%, and
+  the 3-record population is too small to characterise.
+- **`decisions.md` §11's design is not disproven in general** — only shown to
+  have no viable trigger on this stream, with this detector.
+- **No LLM was benchmarked.** The 800 ms figure is an assumption; the argument
+  does not turn on it, because the escalation rate fails at any latency.
+- **The generous span-correctness rule** (a span is correct if it touches gold
+  at all) flatters precision. A stricter rule would lower every band and would
+  not change the escalation rates, which depend only on scores.
+
+---
+
+## 23. The residual was a hole, not a boundary
+
+§21.6 pre-registered the condition that would end the span-rule programme:
+*"if a further span rule gains under 0.3 points, the easy ground is gone and the
+rest is genuinely the model."* This tests it. The rule gains **2.6 points**, so
+the condition does not fire.
+
+### 23.1 The encoder was not missing the address — it was splitting it
+
+Dumping every identifying run the extension rules still leave behind, over 2,786
+well-formed OSM addresses, the residual is **not** where §17 and §18 found it.
+Leading runs: 104. **Interior runs: 263.** The single largest shape:
+
+```
+48 runs   'Gulistan e Jauhar Block #'
+15 runs   'Block <letter> North Nazimabad Town'
+ 5 runs   'Federal B Area Block'
+ 3 runs   'Bahria Town Main Boulevard'
+```
+
+Inspecting the spans behind them shows why no outward walk could reach them:
+
+```
+'Deliver to C-21, Block J North Nazimabad Town, Karachi'
+   0.77 'C-21'
+   0.89 'Karachi'          <- the locality between them: no span at all
+
+'Transfer to 706, Federal B Area Azizabad Block 8 Gulberg Town'
+   0.63 '706'
+   0.87 'Federal B Area'
+   0.91 'Gulberg Town'     <- 'Azizabad Block 8' falls in the hole
+```
+
+The encoder returns the plot number *and* the city and drops the locality
+between them. `extend_address_span()` walks outward from a span; an interior gap
+has no outer edge to walk from. **This is a different failure mode from §17 and
+§18, and it was hidden inside the word "interior" in §17's breakdown.**
+
+### 23.2 Joining spans, and where to stop
+
+`bridge_address_spans()` joins two ADDRESS spans separated by at most
+`_MAX_BRIDGE` characters. Sweeping the window on the same 2,786 addresses,
+against over-redaction on 400 address-free memos:
+
+| max gap | coverage | fully redacted | memos hurt | extra chars |
+|---:|---:|---:|---:|---:|
+| 0 (shipped before) | 93.4% | 88.1% | 0.0% | 0.00% |
+| 8 | 93.7% | 89.7% | 0.0% | 0.00% |
+| 16 | 94.2% | 91.0% | 1.5% | 0.38% |
+| 24 | 94.9% | 92.4% | 1.5% | 0.38% |
+| **32** | **96.0%** | **93.5%** | **1.5%** | **0.38%** |
+| 48 | 96.6% | 94.1% | 1.5% | 0.38% |
+| 64 | 96.7% | 94.2% | 1.5% | 0.38% |
+
+**32 ships.** The cost is flat from 16 upward, so the window is not chosen to
+control cost — it is chosen to bound the blast radius on text shapes this corpus
+does not contain. 48 and 64 buy 0.6 and 0.7 points for the right to join spans
+half a line apart, and a memo carrying an amount or a reference number between
+two locations is exactly the shape not sampled here.
+
+### 23.3 The cost is one stopword
+
+Every over-redacted character, at every window from 16 to 64, is the same thing:
+
+```
+'Rent payment from Hussain Syed, contact 03033547159'
+   newly redacted: ', contact '
+```
+
+The name and the phone number either side are both PII and both already
+redacted. Bridging joins them and takes the word `contact` with it. That is the
+whole of the 0.38%: no amount, no reference, no business fact — one stopword
+between two spans that were being masked anyway.
+
+### 23.4 Results on the shipped path
+
+Measured through `Tier2Detector` and `RulesDetector` as `processor.py` wires
+them, not a reimplementation:
+
+| | before | after |
+|---|---:|---:|
+| OSM well-formed, coverage | 93.4% | **96.0%** |
+| OSM well-formed, fully redacted | 88.1% | **93.5%** |
+| generated stream, ADDRESS | 99.9% | **100.0%** |
+| generated stream, PERSON | 100.0% | **100.0%** |
+| **records leaking after both tiers** | **3 of 1,200** | **1 of 1,200** |
+
+By cell, the gain lands on the weakest ones — the cell §19 identified and §21
+proposed to fine-tune:
+
+| cell | before | after | |
+|---|---:|---:|---:|
+| **Karachi / plot_number** | 86.5% | **95.2%** | **+8.7** |
+| Islamabad / block_phase | 90.7% | 96.9% | +6.2 |
+| Karachi / sector_code | 89.9% | 96.0% | +6.1 |
+| Peshawar / plain_street | 85.9% | 89.0% | +3.0 |
+| Karachi / block_phase | 95.6% | 97.9% | +2.3 |
+
+The two leaks it closes are `'Vehari Road'` and `'Chaman Housing Scheme'` — two
+of the three §22 found. The survivor is `'Karachi'` in
+`'Statement Plot 12B, Street 14, PECHS Block 2, Karachi par bhej dein'`.
+
+### 23.5 What this does to the fine-tuning decision
+
+**It strengthens §21.5 rather than reopening it.** §21.6's stopping condition was
+written to be falsifiable and it did not fire: the rule gained 2.6 points where
+0.3 would have ended the argument.
+
+> §17 found separators. §18 found the house number. §21.2 found the component
+> behind the structural word. §23 found the hole between two spans. **Four for
+> four**, every address failure this project has attributed to the model has
+> turned out to be somewhere a rule could reach.
+
+Two consequences for §21.7, which stay pre-declared:
+
+- **The ADDRESS bar moves from 93.3% to 96.0%** on well-formed addresses. A
+  fine-tune now has to clear a materially higher number to win.
+- **The proposed anchors were not the target.** `Plot\s*\d+` and `KDA Scheme` were
+  proposed as the Karachi fix; measurement shows the encoder already finds
+  `'Plot NO 13A'` (0.81), `'Plot# 5-11'` (0.86) and `'KDA Scheme No 1'` (0.81).
+  Adding those anchors would have gained nothing, because the failure was never
+  the prefix.
+
+### 23.6 Limits
+
+- **`_MAX_BRIDGE` is tuned on this corpus**, the loop §5 warns about. The 400
+  address-free memos are the guard, and they are generated, not real.
+- **Bridging cannot separate two genuinely different addresses** in one memo if
+  they sit within 32 characters. No case appeared in 400 memos; the shape is
+  plausible in real remittance narration and is not covered by any test.
+- ~~**One leak survives** and it is a trailing city after a Roman-Urdu tail.~~
+  **Closed in §24.** The cause was not the encoder's span but the trailing-city
+  rule's lookahead, which required the sentence to end after the city. Found by
+  a live broker run, not by any probe here.
+- **The over-redaction sample is one template family.** All six damaged memos are
+  `'Rent payment from <name>, contact <phone>'`, so 0.38% is a measurement of one
+  shape, not a general rate.
+
+---
+
+## 24. A live broker found what no offline probe did
+
+Every number in §14–§23 came from a probe calling the detectors directly. This
+runs the actual pipeline: Kafka 3.8 (KRaft), Postgres 16, and the processor in
+its own container with `INSTALL_TIER2=true`, consuming `txn.raw` and writing
+`txn.clean` plus the audit.
+
+It found a defect that eleven sections of offline measurement did not.
+
+### 24.1 The defect: the city rule assumed the sentence ended
+
+§18.4's trailing-city rule required end-of-string or punctuation after the city:
+
+```python
+_TRAILING_CITY = re.compile(rf"^,?\s*({cities})(?=$|[,.;])")
+```
+
+That guard exists for a real reason — `'Model Town, Sialkot Road'` must not lose
+`Sialkot`, because in Pakistan a city name is a road name more often than not.
+But it is too strong, and **Roman-Urdu memos continue past the city**:
+
+```
+RAW  : Statement Plot E-379, Airport Road, Quetta par bhej dein
+CLEAN: Statement [ADDRESS], Quetta par bhej dein          <- leaked
+```
+
+The lookahead sees ` par`, not `$` or punctuation, so the rule declines and the
+city ships in the clear. **This is the leak §22.2 recorded and §23.4 could not
+close** — the survivor was `'Karachi'` in
+`'... PECHS Block 2, Karachi par bhej dein'`, the identical shape.
+
+The corrected test is not "is anything after the city" but "is what follows a
+ROAD word", which is all the original guard was ever protecting against:
+
+```python
+(?=$|[,.;]|\s+(?!(?i:Road|Rd|Street|St|Highway|...|Cantt)\b))
+```
+
+| tail | before | after |
+|---|---|---|
+| `, Quetta par bhej dein` | no match | **`, Quetta`** |
+| `, Multan hai` | no match | **`, Multan`** |
+| `, Sialkot Road` | no match | no match |
+| `, Sialkot road` | no match | no match |
+| ` Karachi Cantt` | no match | no match |
+| `, Quetta.` | `, Quetta` | `, Quetta` |
+
+### 24.2 Proof on the live stream
+
+Same broker, same topics, processor rebuilt and restarted mid-run:
+
+| | memos | city left in the clear |
+|---|---:|---:|
+| processed **before** the fix | 3,984 | **2** |
+| processed **after** the fix | 1,147 | **0** |
+
+141 of the post-fix memos carried a redacted address. No city survived any of
+them.
+
+### 24.3 Why the probes missed it
+
+The offline probes build their cases as `TEMPLATE.format(a=address)` where the
+address is at or near the end of the string. `probe_address_residual.py` uses
+six templates and only one puts narration after the address. The generator's
+`ADDRESS_MEMO_TEMPLATES` do — `'Statement {} par bhej dein'` — but
+`probe_address_in_stream.py` scored ADDRESS coverage at 99.9% because it
+measured *identifying characters covered*, and a missed city is 7 characters
+against an address of 40.
+
+**The aggregate hid it. The stream did not.** A leak is a property of a record,
+not of a character count, and only the end-to-end run scored records.
+
+### 24.4 What else the run confirmed
+
+- **Tier 2 loads in a container from the warm volume**, at the pinned revision,
+  and logs it: `revision=88c3b98b... threshold=0.55 labels=['PERSON_NAME',
+  'ADDRESS'] batch=8 device=cpu`.
+- **The pin's known gap is visible in the logs.** The run still fetches
+  `microsoft/deberta-v3-base` at `main` for the tokenizer — exactly what §20
+  documents the revision pin does *not* cover.
+- **Both tiers write to the audit**: 21,678 Tier 1 findings and 2,609 Tier 2
+  (1,957 PERSON_NAME, 652 ADDRESS) over the run.
+- **CPU throughput is ~13 records/s**, p50 112–128 ms, against ~160/s rules-only.
+  That is the honest cost of Tier 2 without a GPU, and the Dockerfile installs
+  the CPU wheels deliberately.
+- **The integration tests ran for the first time.** With Postgres up, the 13
+  tests that always skip executed and passed.
+
+### 24.5 An observation the run surfaced, not yet acted on
+
+The encoder labels address fragments as people:
+
+```
+'Deliver to C-21, Block J, Karachi'
+   PERSON_NAME  'C-21'      conf=0.81
+   ADDRESS      'C-21, Block J, Karachi'  conf=0.84
+   PERSON_NAME  'Block J'   conf=0.70
+```
+
+The redaction is correct — `merge_spans()` unions them and the output is
+`[ADDRESS+PERSON_NAME]`, nothing leaks. But **the audit records two PERSON_NAME
+findings that are not people**, and the governance report counts entity types
+from that table. §18.2 established that a false positive changing no output is
+not a cost; that argument holds for redaction and does not hold for the audit.
+
+Not fixed here. Recorded because the compliance report is the one consumer for
+which entity_type accuracy, not span coverage, is the product.
+
+### 24.6 Limits
+
+- **One broker, one partition assignment, one consumer.** Rebalancing under
+  `--scale processor=3` with Tier 2 loaded is still untested, and model load
+  takes ~20 s per replica, which is inside the rebalance window.
+- **CPU only.** The container installs CPU torch. No GPU container was built,
+  so the ~16 ms/record GPU figure is still probe-measured, not stream-measured.
+- **The fix is measured on 1,147 records.** The shape it corrects is common in
+  this generator; its frequency in real remittance narration is unknown.
+- **`_ROAD_WORD` is a list, and lists are incomplete.** `Chowk`, `Cantt` and
+  `Bypass` are in it because they appeared; a city followed by an unlisted road
+  word will still be over-extended.
+
+---
+
+## 25. The second repo, and how to pin something that takes no revision
+
+§20 pinned `TIER2_MODEL_REVISION` and recorded that the pin was not total. §24
+saw the gap in a live log. This closes it, and corrects what §20 said the gap
+was.
+
+### 25.1 It is the backbone config, not the tokenizer
+
+§20 said GLiNER "resolves its base tokenizer from microsoft/deberta-v3-base at
+`main`". That is wrong. Reading `gliner/model.py`:
+
+```python
+tokenizer_config_path = model_dir / "tokenizer_config.json"
+if tokenizer_config_path.is_file():
+    tokenizer = AutoTokenizer.from_pretrained(model_dir, ...)   # <- this branch
+else:
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name, ...)
+```
+
+The checkpoint ships its own tokenizer, so the fallback never runs:
+
+```
+gliner_medium-v2.5 snapshot: tokenizer.json, tokenizer_config.json,
+                             special_tokens_map.json, added_tokens.json, spm.model
+```
+
+The real fetch is in `gliner/modeling/encoder.py`:
+
+```python
+encoder_config = AutoConfig.from_pretrained(model_name, cache_dir=cache_dir)
+```
+
+No `revision=`, and GLiNER exposes no way to pass one. The cache confirms which
+repo is touched and how little of it:
+
+```
+models--microsoft--deberta-v3-base/snapshots/8ccc9b6f.../config.json    (only)
+```
+
+**One file: the architecture config.** Weights and tokenizer both come from the
+pinned checkpoint. That makes the risk smaller than §20 implied — a changed
+`hidden_size` fails the load loudly rather than drifting — but it is still an
+unpinned input to a system whose threshold is checkpoint-specific.
+
+### 25.2 A pin that cannot be passed as an argument
+
+Since no revision can be handed to `AutoConfig`, the only lever is what the
+cache contains and whether the network is allowed. Measured on a clean
+`HF_HOME`:
+
+| | result |
+|---|---|
+| `snapshot_download(repo, revision=SHA)` writes `refs/main`? | **no** |
+| offline `AutoConfig.from_pretrained(repo)` with no revision | **works** |
+| offline `AutoConfig.from_pretrained(repo, revision=SHA)` | works |
+
+The second row is the one that matters and it was not obvious: with no `refs`
+written, offline resolution still finds the snapshot on disk. So **prefetching
+an exact commit and then forbidding the network is a real pin**, not a hope.
+
+That gives the two-step:
+
+```bash
+python -m pipelineguard.prefetch     # once, with network
+HF_HUB_OFFLINE=1 ...                 # from then on
+```
+
+`prefetch_pinned()` fetches the checkpoint at `TIER2_MODEL_REVISION` and exactly
+`config.json` of the backbone at `TIER2_BASE_REVISION`.
+
+### 25.3 The pin says whether it is real
+
+A pin nobody checks is a comment (§20). `Tier2Detector.load()` now reports which
+state it is in, because "pinned" is a property of the machine, not of the code:
+
+```
+backbone config PINNED: microsoft/deberta-v3-base@8ccc9b6f3619 (offline)
+```
+
+and otherwise warns, naming the fix:
+
+```
+backbone config UNPINNED: microsoft/deberta-v3-base is resolved at `main`
+because GLiNER passes no revision. Run `python -m pipelineguard.prefetch`
+then set HF_HUB_OFFLINE=1 to pin it. cached=['8ccc9b6f3619']
+```
+
+The third state — offline but the cache holds more than one commit — warns too.
+Offline resolution picks one and does not say which, so a cache with two
+commits is not a pin even though nothing goes over the network.
+
+### 25.4 Measured, both environments
+
+| | HF requests during load |
+|---|---:|
+| native venv, before | several |
+| native venv, prefetched + `HF_HUB_OFFLINE=1` | **0** |
+| container, before | several (visible in §24's log) |
+| container, prefetched + `HF_HUB_OFFLINE=1` | **0** |
+
+The container then processed 300 records with Tier 2 enabled and **zero**
+requests to huggingface.co.
+
+Note that the two caches are separate: the native run uses the developer's
+`HF_HOME`, the container uses the `models` volume. The prefetch is once per
+cache, not once per project.
+
+### 25.5 Limits
+
+- **`AutoConfig` is not the only unpinned input.** This closes the one a live
+  log exposed. `torch` and `gliner` are pinned by version range in
+  `pyproject.toml`, not by lockfile, and the CUDA/CPU wheel choice is a build
+  argument.
+- **`HF_HUB_OFFLINE=1` is not the default** in `docker-compose.yml`, because the
+  first run on a cold volume has to download. Two states ship, and only one of
+  them is pinned.
+- **The backbone commit was read off a warm cache**, not chosen. It is whatever
+  `main` served on 2026-08-12. Recording it makes it stable, not correct.

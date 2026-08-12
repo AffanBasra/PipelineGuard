@@ -107,10 +107,15 @@ def load_corpus(sample: int, stratify: str = "kind",
 
 
 def build_cases(records: list[dict]) -> list[tuple]:
-    """(style, kind, form, address, text, gold_start, gold_end).
+    """(style, kind, form, address, text, gold_start, gold_end, city).
 
     Every address goes through every frame, so style is a within-address
     comparison rather than a between-address one.
+
+    City is carried because §19 needs it. `classify()` splits the sector bucket
+    by POSITION, which is not the same as convention: a mid-string code is the
+    Islamabad sector form in Islamabad and a flat designator in Karachi. Only
+    city and form together tell those apart.
     """
     cases = []
     for record in records:
@@ -120,7 +125,8 @@ def build_cases(records: list[dict]) -> list[tuple]:
                 text = template.format(x=address)
                 start = text.index(address)
                 cases.append((style, record["kind"], record["form"], address,
-                              text, start, start + len(address)))
+                              text, start, start + len(address),
+                              record.get("city", "(unknown)")))
     return cases
 
 
@@ -143,7 +149,7 @@ def build_person_cases() -> list[tuple]:
                 text = template.format(x=name)
                 start = text.index(name)
                 cases.append((style, band, "name", name,
-                              text, start, start + len(name)))
+                              text, start, start + len(name), "(n/a)"))
     return cases
 
 
@@ -194,11 +200,12 @@ def score(predict, cases, threshold, batch_size=16) -> dict:
     for start in range(0, len(cases), batch_size):
         chunk = cases[start:start + batch_size]
         preds = predict([c[4] for c in chunk], threshold)
-        for (style, kind, form, _addr, _text, gs, ge), spans in zip(chunk, preds):
+        for (style, kind, form, _addr, _text, gs, ge, city), spans in zip(chunk, preds):
             covered = char_coverage(gs, ge, spans)
             hit = any(gs < e and s < ge for s, e, _ in spans)
             for key in (("ALL", "ALL"), ("kind", kind), ("style", style),
-                        ("form", form)):
+                        ("form", form), ("city", city),
+                        ("cityform", f"{city}/{form}")):
                 bucket = agg[key]
                 bucket["n"] += 1
                 bucket["cov"] += covered

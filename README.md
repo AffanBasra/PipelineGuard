@@ -72,10 +72,15 @@ span, promoted on uncertainty.
 - [x] Dockerfile + processor service, so `docker compose up` runs the pipeline
 - [x] Schema-based redaction of declared PII fields (`account_holder`)
 - [x] Tier 2: encoder NER over free text, batched, GPU-optional
-- [ ] Tier 2 locale fine-tune (needs an evaluation set of independent provenance)
+- [x] Tier 2 verified end to end against a live Kafka broker (findings §24),
+      which found a leak eleven sections of offline probing had missed
+- [~] Tier 2 locale fine-tune -- **measured and declined** (findings §21, §23):
+      the residual is positional, not semantic, and span rules closed most of it
+      -- four times running, most recently for +2.6 points
 - [ ] Flagging records whose redaction left nothing
 - [ ] End-to-end latency measurement (current figures are detection-only)
-- [ ] Tier 3: pluggable LLM escalation (Gemini, Ollama)
+- [~] Tier 3: LLM escalation -- **measured and declined** (findings §22): 0.08%
+      of records leak, and the cheapest trigger escalates 35.6% of the stream
 - [ ] Support-chat free-text topic
 - [ ] Airflow batch-scan mode
 
@@ -206,8 +211,10 @@ Measured on 2,000 records ([full findings](docs/tier2-detection-findings.md)):
 | p50 detection | 0.09 ms | 6.43 ms |
 | names found in `memo` | **0** | **892** |
 
-`urchade/gliner_multi_pii-v1` at threshold 0.25, **99.4%** character coverage on
-PERSON. Four results worth knowing before changing anything:
+`gliner-community/gliner_medium-v2.5`, **pinned to revision `88c3b98b`**, at
+threshold 0.55. On the generated stream: **PERSON 100.0%, ADDRESS 100.0%**
+character coverage. On 2,786 real OSM addresses: **96.0%**. Five results worth
+knowing before changing anything:
 
 - **The threshold is not a probability.** It is an uncalibrated sigmoid cutoff
   and does not transfer between checkpoints — `nvidia/gliner-PII` at this
@@ -220,11 +227,46 @@ PERSON. Four results worth knowing before changing anything:
 - **Batching is the whole speedup.** 7.2 ms/record at batch 8 against 29.4 at
   batch 1, which is why inference happens in `main()` and findings are injected
   into `process_message` rather than detected there.
-- **ADDRESS was measured, then removed.** Nothing in this pipeline contains an
-  address, so the pass could only ever be wrong — it fired on 30% of memos,
-  mostly re-tagging names. Restoring it is one line, plus a corpus.
+- **ADDRESS was removed, then restored** (findings §18). It was dropped when
+  nothing in the stream contained an address; the generator now emits them, and
+  the ADDRESS labels cost one extra forward pass and **0.0% incremental
+  over-redaction** — the characters they claim were already claimed by PERSON.
+- **The residual is positional, not semantic.** Four times a missed address was
+  blamed on the model and four times a span rule reached it: separators,
+  the house number, the component behind `Block J`, and the hole between two
+  spans (§17, §18, §21, §23). That is why there is no fine-tune.
 
 Off by default. Enable with `TIER2_ENABLED=true`, `TIER2_DEVICE=cuda|cpu|auto`.
+In Docker it is opt-in at build time too, because torch and gliner add ~1.5 GB:
+`INSTALL_TIER2=true docker compose build processor`.
+
+**Pin the model, then stop talking to HuggingFace.** A load touches two repos:
+the checkpoint, and the backbone config GLiNER resolves at `main` with no
+revision it will accept (findings §25). Both are pinned by prefetching the exact
+commits and then forbidding the network:
+
+```bash
+python -m pipelineguard.prefetch                    # once, with network
+$env:HF_HUB_OFFLINE=1                               # PowerShell; export on POSIX
+```
+
+After that every run — pipeline or `try_redaction.py` — loads from disk with
+**zero** requests to huggingface.co. `load()` logs which state it is in
+(`backbone config PINNED` / `UNPINNED`), and `scripts/verify_tier2_pin.py`
+checks both halves. Docker keeps its own cache in the `models` volume, so warm
+it separately: `docker compose run --rm processor python -m pipelineguard.prefetch`.
+
+**Try it on your own text** — same detectors, same rewrite as the pipeline:
+
+```bash
+python scripts/try_redaction.py "Transfer to Ayesha Malik, CNIC 42101-1234567-8"
+python scripts/try_redaction.py --tier2 "Statement Plot E-379, Airport Road, Quetta par bhej dein"
+python scripts/try_redaction.py --tier2          # interactive
+```
+
+It prints the redacted output, every finding with its tier and confidence, and
+how the overlapping spans merge. Without `--tier2` you get the rules only, which
+match formats — a name or address in free text needs the encoder.
 
 **Over-redaction is the accepted cost.** At this threshold ~38% of clean
 Roman-Urdu memos fire, and some are destroyed whole (`Kiraya jama karwa diya` →
@@ -235,9 +277,12 @@ them. Flagging fully-saturated redactions is the open mitigation.
 ## Design decisions
 
 **Tiered detection under a latency budget.** Tier 1 (compiled regex +
-checksum validation, µs) handles structured PII; Tier 2 (fine-tuned encoder,
-ms) handles names and contextual PII in free text; Tier 3 (LLM) is invoked
-only for spans where Tier 2 confidence falls in an uncertainty band. The
+checksum validation, µs) handles structured PII; Tier 2 (a pinned off-the-shelf
+encoder plus positional span rules, ms) handles names and addresses in free
+text. A third LLM tier was
+specified and then **declined on measurement** -- 0.08% of records leak after
+both tiers, and the cheapest confidence trigger escalates 35.6% of the stream
+to reach them (findings §22, §23). The
 tiering is a throughput/cost tradeoff, not just an accuracy ladder — the
 benchmark table [below](#benchmarks) quantifies it — and shows detection is
 currently only ~15% of per-record cost, so the plumbing dominates the rules.
