@@ -36,16 +36,28 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from pipelineguard.config import settings  # noqa: E402
 from pipelineguard.detectors.tier2_encoder import (  # noqa: E402
     _TUNED_FOR,
+    _TUNED_FOR_BASE,
+    _TUNED_FOR_BASE_REVISION,
     _TUNED_FOR_REVISION,
     Tier2Detector,
+    cached_base_revisions,
 )
 
 SAMPLE = "Rent for Ayesha Malik, Ghar 61C, Adamjee Road, Rawalpindi"
 
 
-def check(label: str, ok: bool, detail: str = "") -> bool:
-    print(f"  [{'PASS' if ok else 'FAIL'}] {label}" + (f" -- {detail}" if detail else ""))
+def check(label: str, ok: bool, detail: str = "", hint: str = "") -> bool:
+    """`detail` prints either way; `hint` only on failure, so a passing line
+    never carries advice for a state it is not in."""
+    suffix = f" -- {detail}" if detail else ""
+    if not ok and hint:
+        suffix += f"\n         {hint}"
+    print(f"  [{'PASS' if ok else 'FAIL'}] {label}{suffix}")
     return ok
+
+
+def skip(label: str, why: str) -> None:
+    print(f"  [SKIP] {label} -- {why}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -84,24 +96,73 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     api = HfApi()
-    try:
-        info = api.model_info(settings.tier2_model,
-                              revision=settings.tier2_model_revision)
-        results.append(check("the hub serves this revision", True,
-                             f"sha {info.sha[:12]}"))
-    except Exception as exc:  # noqa: BLE001 -- any hub failure is a failed check
-        results.append(check("the hub serves this revision", False,
-                             f"{type(exc).__name__}"))
+    # Offline is the PINNED state (§25), so the hub checks cannot run and must
+    # not be reported as failures. They also cannot be faked: offline raises
+    # OfflineModeIsEnabled for a good revision and a bad one alike, so the
+    # "wrong revision is refused" check would pass for the wrong reason.
+    offline = os.getenv("HF_HUB_OFFLINE", "").strip().lower() in {"1", "true"}
+    if offline:
+        skip("the hub serves this revision", "HF_HUB_OFFLINE=1")
+        skip("a WRONG revision is refused",
+             "HF_HUB_OFFLINE=1 -- offline refuses every revision equally, "
+             "so this proves nothing; re-run online to check enforcement")
+    else:
+        try:
+            info = api.model_info(settings.tier2_model,
+                                  revision=settings.tier2_model_revision)
+            results.append(check("the hub serves this revision", True,
+                                 f"sha {info.sha[:12]}"))
+        except Exception as exc:  # noqa: BLE001 -- any hub failure fails the check
+            results.append(check("the hub serves this revision", False,
+                                 f"{type(exc).__name__}"))
 
-    # The check the others exist for. If a bad revision loads anyway, the pin is
-    # decorative and every threshold claim in the findings doc rests on nothing.
-    try:
-        api.model_info(settings.tier2_model, revision="0" * 40)
-        results.append(check("a WRONG revision is refused", False,
-                             "the hub accepted a nonexistent commit"))
-    except Exception as exc:  # noqa: BLE001
-        results.append(check("a WRONG revision is refused", True,
-                             type(exc).__name__))
+        # The check the others exist for. If a bad revision loads anyway the pin
+        # is decorative, and every threshold claim in the findings rests on it.
+        try:
+            api.model_info(settings.tier2_model, revision="0" * 40)
+            results.append(check("a WRONG revision is refused", False,
+                                 "the hub accepted a nonexistent commit"))
+        except Exception as exc:  # noqa: BLE001
+            results.append(check("a WRONG revision is refused", True,
+                                 type(exc).__name__))
+
+    # ---- the OTHER repo, which the revision above cannot reach (§25) --------
+    print()
+    results.append(check(
+        "config declares the backbone commit",
+        settings.tier2_base_model == _TUNED_FOR_BASE
+        and settings.tier2_base_revision == _TUNED_FOR_BASE_REVISION,
+        f"expected {_TUNED_FOR_BASE}@{_TUNED_FOR_BASE_REVISION[:12]}",
+    ))
+
+    if offline:
+        skip("the hub serves the backbone commit", "HF_HUB_OFFLINE=1")
+    else:
+        try:
+            info = api.model_info(settings.tier2_base_model,
+                                  revision=settings.tier2_base_revision)
+            results.append(check("the hub serves the backbone commit", True,
+                                 f"sha {info.sha[:12]}"))
+        except Exception as exc:  # noqa: BLE001
+            results.append(check("the hub serves the backbone commit", False,
+                                 f"{type(exc).__name__}"))
+
+    # The backbone is pinned by the CACHE, not by an argument, so these two are
+    # what say whether the pin is real on THIS machine.
+    cached = cached_base_revisions(settings.tier2_base_model)
+    results.append(check(
+        "the cache holds exactly the pinned backbone commit",
+        cached == [settings.tier2_base_revision],
+        f"cached {[r[:12] for r in cached] or 'none'}",
+        hint="run `python -m pipelineguard.prefetch`",
+    ))
+    results.append(check(
+        "HF_HUB_OFFLINE is set, so the cache is what loads",
+        offline,
+        "set" if offline else "unset",
+        hint="unset means GLiNER resolves the backbone at `main` over the "
+             "network, and the cache proves nothing",
+    ))
 
     if args.load:
         print()

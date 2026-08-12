@@ -42,6 +42,18 @@ class Settings:
     tier2_model_revision: str = os.getenv(
         "TIER2_MODEL_REVISION", "88c3b98b57ad5e7d66fb209ed61c53f4b1fd05da"
     )
+    # The SECOND repo a Tier 2 load touches, and the half the revision above
+    # does not cover (§25). GLiNER calls AutoConfig.from_pretrained() on its
+    # backbone name with no revision, so `microsoft/deberta-v3-base` is fetched
+    # at `main` no matter how tightly the weights are pinned. GLiNER exposes no
+    # way to pass a revision through, so this is pinned by PREFETCHING exactly
+    # this commit into the cache and then running with HF_HUB_OFFLINE=1 --
+    # scripts/verify_tier2_pin.py checks both halves.
+    tier2_base_model: str = os.getenv("TIER2_BASE_MODEL",
+                                      "microsoft/deberta-v3-base")
+    tier2_base_revision: str = os.getenv(
+        "TIER2_BASE_REVISION", "8ccc9b6f36199bec6961081d44eb72fb3f7353f3"
+    )
     tier2_threshold: float = float(os.getenv("TIER2_THRESHOLD", "0.55"))
     tier2_device: str = os.getenv("TIER2_DEVICE", "auto")
     tier2_batch_size: int = int(os.getenv("TIER2_BATCH_SIZE", "8"))

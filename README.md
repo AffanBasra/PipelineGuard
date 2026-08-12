@@ -240,6 +240,22 @@ Off by default. Enable with `TIER2_ENABLED=true`, `TIER2_DEVICE=cuda|cpu|auto`.
 In Docker it is opt-in at build time too, because torch and gliner add ~1.5 GB:
 `INSTALL_TIER2=true docker compose build processor`.
 
+**Pin the model, then stop talking to HuggingFace.** A load touches two repos:
+the checkpoint, and the backbone config GLiNER resolves at `main` with no
+revision it will accept (findings §25). Both are pinned by prefetching the exact
+commits and then forbidding the network:
+
+```bash
+python -m pipelineguard.prefetch                    # once, with network
+$env:HF_HUB_OFFLINE=1                               # PowerShell; export on POSIX
+```
+
+After that every run — pipeline or `try_redaction.py` — loads from disk with
+**zero** requests to huggingface.co. `load()` logs which state it is in
+(`backbone config PINNED` / `UNPINNED`), and `scripts/verify_tier2_pin.py`
+checks both halves. Docker keeps its own cache in the `models` volume, so warm
+it separately: `docker compose run --rm processor python -m pipelineguard.prefetch`.
+
 **Try it on your own text** — same detectors, same rewrite as the pipeline:
 
 ```bash

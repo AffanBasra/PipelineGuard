@@ -1915,9 +1915,13 @@ a config the operator never set. An explicitly supplied revision is always kept.
 
 ### 20.2 The pin is not total
 
-GLiNER resolves its base tokenizer from `microsoft/deberta-v3-base` at `main`,
-a different repo the revision above cannot reach. Pinning fixes the weights, not
-every byte the load touches.
+GLiNER resolves its base ~~tokenizer~~ **architecture config** from
+`microsoft/deberta-v3-base` at `main`, a different repo the revision above
+cannot reach. Pinning fixes the weights, not every byte the load touches.
+
+*Corrected in §25.1: it is the config, not the tokenizer — the checkpoint ships
+its own tokenizer. §25 closes the gap with a prefetch plus offline mode, and
+`load()` now logs which of the two states it is in.*
 
 Only a warm cache plus `HF_HUB_OFFLINE=1` closes that, and compose documents it.
 Verified: with the volume warm, the container loads and detects with
@@ -2562,3 +2566,124 @@ which entity_type accuracy, not span coverage, is the product.
 - **`_ROAD_WORD` is a list, and lists are incomplete.** `Chowk`, `Cantt` and
   `Bypass` are in it because they appeared; a city followed by an unlisted road
   word will still be over-extended.
+
+---
+
+## 25. The second repo, and how to pin something that takes no revision
+
+§20 pinned `TIER2_MODEL_REVISION` and recorded that the pin was not total. §24
+saw the gap in a live log. This closes it, and corrects what §20 said the gap
+was.
+
+### 25.1 It is the backbone config, not the tokenizer
+
+§20 said GLiNER "resolves its base tokenizer from microsoft/deberta-v3-base at
+`main`". That is wrong. Reading `gliner/model.py`:
+
+```python
+tokenizer_config_path = model_dir / "tokenizer_config.json"
+if tokenizer_config_path.is_file():
+    tokenizer = AutoTokenizer.from_pretrained(model_dir, ...)   # <- this branch
+else:
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name, ...)
+```
+
+The checkpoint ships its own tokenizer, so the fallback never runs:
+
+```
+gliner_medium-v2.5 snapshot: tokenizer.json, tokenizer_config.json,
+                             special_tokens_map.json, added_tokens.json, spm.model
+```
+
+The real fetch is in `gliner/modeling/encoder.py`:
+
+```python
+encoder_config = AutoConfig.from_pretrained(model_name, cache_dir=cache_dir)
+```
+
+No `revision=`, and GLiNER exposes no way to pass one. The cache confirms which
+repo is touched and how little of it:
+
+```
+models--microsoft--deberta-v3-base/snapshots/8ccc9b6f.../config.json    (only)
+```
+
+**One file: the architecture config.** Weights and tokenizer both come from the
+pinned checkpoint. That makes the risk smaller than §20 implied — a changed
+`hidden_size` fails the load loudly rather than drifting — but it is still an
+unpinned input to a system whose threshold is checkpoint-specific.
+
+### 25.2 A pin that cannot be passed as an argument
+
+Since no revision can be handed to `AutoConfig`, the only lever is what the
+cache contains and whether the network is allowed. Measured on a clean
+`HF_HOME`:
+
+| | result |
+|---|---|
+| `snapshot_download(repo, revision=SHA)` writes `refs/main`? | **no** |
+| offline `AutoConfig.from_pretrained(repo)` with no revision | **works** |
+| offline `AutoConfig.from_pretrained(repo, revision=SHA)` | works |
+
+The second row is the one that matters and it was not obvious: with no `refs`
+written, offline resolution still finds the snapshot on disk. So **prefetching
+an exact commit and then forbidding the network is a real pin**, not a hope.
+
+That gives the two-step:
+
+```bash
+python -m pipelineguard.prefetch     # once, with network
+HF_HUB_OFFLINE=1 ...                 # from then on
+```
+
+`prefetch_pinned()` fetches the checkpoint at `TIER2_MODEL_REVISION` and exactly
+`config.json` of the backbone at `TIER2_BASE_REVISION`.
+
+### 25.3 The pin says whether it is real
+
+A pin nobody checks is a comment (§20). `Tier2Detector.load()` now reports which
+state it is in, because "pinned" is a property of the machine, not of the code:
+
+```
+backbone config PINNED: microsoft/deberta-v3-base@8ccc9b6f3619 (offline)
+```
+
+and otherwise warns, naming the fix:
+
+```
+backbone config UNPINNED: microsoft/deberta-v3-base is resolved at `main`
+because GLiNER passes no revision. Run `python -m pipelineguard.prefetch`
+then set HF_HUB_OFFLINE=1 to pin it. cached=['8ccc9b6f3619']
+```
+
+The third state — offline but the cache holds more than one commit — warns too.
+Offline resolution picks one and does not say which, so a cache with two
+commits is not a pin even though nothing goes over the network.
+
+### 25.4 Measured, both environments
+
+| | HF requests during load |
+|---|---:|
+| native venv, before | several |
+| native venv, prefetched + `HF_HUB_OFFLINE=1` | **0** |
+| container, before | several (visible in §24's log) |
+| container, prefetched + `HF_HUB_OFFLINE=1` | **0** |
+
+The container then processed 300 records with Tier 2 enabled and **zero**
+requests to huggingface.co.
+
+Note that the two caches are separate: the native run uses the developer's
+`HF_HOME`, the container uses the `models` volume. The prefetch is once per
+cache, not once per project.
+
+### 25.5 Limits
+
+- **`AutoConfig` is not the only unpinned input.** This closes the one a live
+  log exposed. `torch` and `gliner` are pinned by version range in
+  `pyproject.toml`, not by lockfile, and the CUDA/CPU wheel choice is a build
+  argument.
+- **`HF_HUB_OFFLINE=1` is not the default** in `docker-compose.yml`, because the
+  first run on a cold volume has to download. Two states ship, and only one of
+  them is pinned.
+- **The backbone commit was read off a warm cache**, not chosen. It is whatever
+  `main` served on 2026-08-12. Recording it makes it stable, not correct.

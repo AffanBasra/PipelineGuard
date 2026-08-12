@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import re
+from pathlib import Path
 
 from pipelineguard.models import Finding, Tier
 
@@ -193,12 +194,57 @@ def extend_address_span(text: str, start: int, end: int) -> tuple[int, int]:
 # name changing. A name-only check cannot see that, so anyone tracking `main`
 # would silently get different weights under an unchanged threshold.
 #
-# The pin is NOT total, and saying so matters more than the pin does. GLiNER
-# resolves its base tokenizer from microsoft/deberta-v3-base at `main`, a
-# different repo this revision cannot reach. Pinning here fixes the weights;
-# only a warm cache plus HF_HUB_OFFLINE=1 fixes everything (see docker-compose).
+# The pin is NOT total on its own, and saying so matters more than the pin does.
+# A Tier 2 load touches TWO repos: the checkpoint, and the backbone config
+# GLiNER resolves from `config.model_name` at `main`. §25 measured which -- it is
+# the architecture config, not the tokenizer (the checkpoint ships its own).
+# GLiNER exposes no way to pass a revision there, so the second repo is pinned by
+# prefetching it and running offline; prefetch_pinned() below is that step.
 _TUNED_FOR = "gliner-community/gliner_medium-v2.5"
 _TUNED_FOR_REVISION = "88c3b98b57ad5e7d66fb209ed61c53f4b1fd05da"
+_TUNED_FOR_BASE = "microsoft/deberta-v3-base"
+_TUNED_FOR_BASE_REVISION = "8ccc9b6f36199bec6961081d44eb72fb3f7353f3"
+
+
+def cached_base_revisions(base_model: str,
+                          cache_root: str | Path | None = None) -> list[str]:
+    """Commits of `base_model` present in the local HuggingFace cache.
+
+    The pin on the backbone is only real if the cache holds exactly the pinned
+    commit and the process runs offline, so this is what makes it checkable.
+    Returns [] when the repo is absent, which offline means a load failure.
+
+    `cache_root` defaults to the hub's own cache directory, imported lazily so
+    this stays callable without the tier2 extra installed.
+    """
+    if cache_root is None:
+        from huggingface_hub.constants import HF_HUB_CACHE
+
+        cache_root = HF_HUB_CACHE
+    snapshots = (Path(cache_root)
+                 / f"models--{base_model.replace('/', '--')}" / "snapshots")
+    if not snapshots.is_dir():
+        return []
+    return sorted(p.name for p in snapshots.iterdir() if p.is_dir())
+
+
+def prefetch_pinned(model: str, revision: str,
+                    base_model: str, base_revision: str) -> None:
+    """Populate the cache with exactly the pinned commits of both repos.
+
+    Run once against a warm network, then set HF_HUB_OFFLINE=1. That pair is
+    what pins the backbone config, because GLiNER requests it with no revision
+    and offline resolution can only return what is already cached.
+    """
+    from huggingface_hub import snapshot_download
+
+    snapshot_download(model, revision=revision)
+    # Only the config: GLiNER reads the backbone architecture from here and
+    # takes its weights and tokenizer from the checkpoint above.
+    snapshot_download(base_model, revision=base_revision,
+                      allow_patterns=["config.json"])
+    log.info("prefetched %s@%s and %s@%s", model, revision[:12],
+             base_model, base_revision[:12])
 
 
 def resolve_device(requested: str) -> str:
@@ -277,6 +323,35 @@ class Tier2Detector:
                 "a git repo and its weights can change under an unchanged name",
                 self.threshold, _TUNED_FOR, _TUNED_FOR_REVISION,
                 revision or "main (UNPINNED)",
+            )
+        self._log_base_pin()
+
+    def _log_base_pin(self) -> None:
+        """Say which backbone config this load actually used.
+
+        The revision above cannot reach it (§25), so the only honest options are
+        to report it or to leave it invisible. Reporting costs one cache read.
+        """
+        import os
+
+        cached = cached_base_revisions(_TUNED_FOR_BASE)
+        offline = os.getenv("HF_HUB_OFFLINE", "").strip().lower() in {"1", "true"}
+        if cached == [_TUNED_FOR_BASE_REVISION] and offline:
+            log.info("backbone config PINNED: %s@%s (offline)",
+                     _TUNED_FOR_BASE, _TUNED_FOR_BASE_REVISION[:12])
+        elif not offline:
+            log.warning(
+                "backbone config UNPINNED: %s is resolved at `main` because "
+                "GLiNER passes no revision. Run "
+                "`python -m pipelineguard.prefetch` then set HF_HUB_OFFLINE=1 "
+                "to pin it. cached=%s",
+                _TUNED_FOR_BASE, [r[:12] for r in cached] or "none",
+            )
+        else:
+            log.warning(
+                "backbone config offline but the cache does not hold exactly "
+                "the pinned commit: expected [%s], have %s",
+                _TUNED_FOR_BASE_REVISION[:12], [r[:12] for r in cached] or "none",
             )
 
     def resolved_revision(self) -> str | None:

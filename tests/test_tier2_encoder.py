@@ -16,12 +16,15 @@ import pytest
 
 from pipelineguard.detectors.tier2_encoder import (
     _TUNED_FOR,
+    _TUNED_FOR_BASE,
+    _TUNED_FOR_BASE_REVISION,
     _TUNED_FOR_REVISION,
     LABEL_GROUPS,
     _MAX_BRIDGE,
     _MAX_EXTENSIONS,
     Tier2Detector,
     bridge_address_spans,
+    cached_base_revisions,
     extend_address_span,
 )
 from pipelineguard.models import Tier
@@ -318,6 +321,40 @@ def test_the_default_pin_is_dropped_for_a_different_model():
     and fail the load outright — on a config the operator never set."""
     detector = Tier2Detector("nvidia/gliner-PII", revision=_TUNED_FOR_REVISION)
     assert detector.resolved_revision() is None
+
+
+def test_the_backbone_commit_is_declared_too():
+    """§25: a Tier 2 load touches TWO repos. TIER2_MODEL_REVISION pins the
+    checkpoint; the backbone config is resolved at `main` by GLiNER with no
+    revision, so it has to be declared separately or it is invisible."""
+    from pipelineguard.config import settings
+
+    assert settings.tier2_base_model == _TUNED_FOR_BASE
+    assert settings.tier2_base_revision == _TUNED_FOR_BASE_REVISION
+
+
+def test_the_two_pins_are_different_repos():
+    """Carrying one repo's commit to the other would ask the hub for a commit
+    that does not exist and fail a load on a config nobody set."""
+    assert _TUNED_FOR_BASE != _TUNED_FOR
+    assert _TUNED_FOR_BASE_REVISION != _TUNED_FOR_REVISION
+
+
+def test_cached_base_revisions_reports_an_absent_repo_as_empty(tmp_path):
+    """An empty list is the signal that offline mode has nothing to resolve, so
+    it must not raise on a cold cache -- that is the normal first-run state."""
+    assert cached_base_revisions(_TUNED_FOR_BASE, cache_root=tmp_path) == []
+
+
+def test_cached_base_revisions_lists_what_is_there(tmp_path):
+    """More than one commit cached means offline mode resolves an unspecified
+    one, which is exactly the state the prefetch warns about."""
+    snapshots = tmp_path / "models--microsoft--deberta-v3-base" / "snapshots"
+    (snapshots / "aaa").mkdir(parents=True)
+    (snapshots / "bbb").mkdir(parents=True)
+    assert cached_base_revisions(_TUNED_FOR_BASE, cache_root=tmp_path) == [
+        "aaa", "bbb"
+    ]
 
 
 def test_an_explicit_revision_survives_a_model_change():
