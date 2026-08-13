@@ -27,6 +27,14 @@ dev = ["pytest>=8.0", "pytest-cov>=5.0"]
 # image, install torch from the CPU index FIRST; see the Dockerfile.
 tier2 = ["torch>=2.13", "gliner>=0.2.28"]
 
+# The local inspection UI. Separate from `tier2` on purpose: installing both
+# together lets pip re-resolve `torch>=2.13` and replace a working CUDA build
+# with the CPU wheel from PyPI. Install into an env that already has tier2.
+#
+# Deliberately absent from requirements.txt, which the Dockerfile reads -- the
+# processor image has no business carrying a web server.
+ui = ["streamlit>=1.40", "fpdf2>=2.8", "markdown-it-py>=3.0"]
+
 # src layout: the package lives in src/, so it is importable only once installed.
 # `pip install -e .` puts it on the path for the terminal, for pytest and for any
 # IDE — without it, `python -m pipelineguard.processor` works only if the IDE has
