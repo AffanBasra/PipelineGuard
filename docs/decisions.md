@@ -27,6 +27,70 @@ Accepting third-party documents would make this a data controller with
 retention, breach-notification and PECA/GDPR obligations attached to a student
 side project. A public repo is also the artifact a reviewer can actually read.
 
+**A local inspection UI, not a metrics dashboard, and not deployed.**
+*(settled)*
+`src/pipelineguard/ui.py` is a Streamlit app with three tabs: scan one memo,
+scan an uploaded file, and render the governance report from the audit trail.
+It exists because the detectors' behaviour was previously only reachable
+through a CLI or a SQL query, and the interesting cases — a bridged Karachi
+plot number, a city trailing an address, an Urdu term read as a name — are
+positional facts about a span that a table of aggregate scores cannot show.
+
+Two earlier decisions constrain it, and both are honoured rather than
+sidestepped:
+
+* *Never a hosted service accepting uploads.* The file uploader is why this
+  matters. `.streamlit/config.toml` sets `server.address = "localhost"`, so the
+  app is not reachable off the machine even by accident; without it Streamlit
+  binds every interface and prints a LAN URL. The rule is enforced by
+  configuration, not by convention. It must not be deployed.
+* *A metrics dashboard demonstrates plumbing rather than domain understanding.*
+  So the UI invents no charts and no counters. Tabs 1 and 2 show spans, tiers
+  and confidences — the detectors' actual output. Tab 3 renders
+  `report.render()` unchanged. Every number on screen is one the pipeline
+  already computes.
+
+The UI holds no logic. `scan.py` and `batch_report.py` carry everything
+assertable and are covered by the suite; `ui.py` is `st.*` calls. It composes
+the shipped `RulesDetector`, `Tier2Detector` and `processor.redact()` rather
+than reimplementing any of them, because a second copy of span arithmetic would
+drift and the UI would then show a redaction the pipeline does not perform.
+
+**Sections are a keyed segmented control, not `st.tabs`.** *(settled)*
+`st.tabs` keeps its selection client-side and springs back to the first tab
+when a widget triggers a rerun. Pressing "Load report" therefore built the
+report correctly and then returned the reader to the playground, so the result
+was never seen -- a bug that looked like the query silently failing. A
+`st.segmented_control` with a `key` stores the selection in session state and
+survives the rerun. The same reasoning applies to the results themselves: a
+button is `True` for exactly one run, so anything rendered inside its branch
+disappears on the next one. Outcomes are written to session state and rendered
+outside the branch, errors included.
+
+Slow work shows a centre-screen spinner that can be dismissed, leaving a corner
+pill until it finishes. This is not decoration: `psycopg.connect` against a
+stopped database waits out its default timeout, which is ten seconds of a UI
+that looks broken. The connect timeout is now explicit, and the failure is
+reported with its cause and a pointer to `docker compose`.
+
+**The batch report is a file scan, and says so.** *(settled)*
+Exporting a governance report for an uploaded file reuses `report.render()`,
+which is pure. That created one problem worth naming: `render()` hardcoded
+`**Source:** PipelineGuard audit trail`, which is false for a file scan.
+`ReportData` gained a defaulted `source` field rather than the UI printing a
+correction underneath a line that contradicts it. The same reasoning rejected
+labelling the export "Audit Cleared" — `compliance.DISCLAIMER` says the report
+is not a compliance determination, and a button asserting otherwise would
+contradict the document it sits on. It is "Download Redaction Report".
+
+The export carries redacted row text as well as aggregate counts, which the
+audit-trail report never does. That is a deliberate widening for a local tool
+whose input the operator already holds, and it is bounded: original text and
+matched values are never displayed or exported in the batch tab, and a test
+asserts a sentinel identifier cannot reach the output. Because ADDRESS
+redaction is routinely incomplete rather than binary, the report carries that
+caveat next to the rows rather than presenting them as cleared data.
+
 **Pakistani-locale focus.** *(settled)*
 CNIC, PK IBAN, PK mobile formats, Roman-Urdu names. No existing tool serves
 this, which makes it the memorable differentiator rather than a generic
