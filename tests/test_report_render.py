@@ -70,6 +70,19 @@ def test_disclaimer_is_present() -> None:
     assert "not legal advice" in out
 
 
+def test_source_defaults_to_the_audit_trail() -> None:
+    """The database path must keep saying what it always said."""
+    assert "**Source:** PipelineGuard audit trail" in report.render(make_data())
+
+
+def test_source_can_be_overridden_and_replaces_the_default() -> None:
+    """A scan of an uploaded file did not come from the audit trail, and the
+    report has to say so rather than inherit a stock line that is false."""
+    out = report.render(make_data(source="uploaded file `memos.csv`"))
+    assert "**Source:** uploaded file `memos.csv`" in out
+    assert "audit trail (`messages_processed`" not in out
+
+
 def test_classified_entities_carry_their_category_and_basis() -> None:
     out = report.render(make_data())
     assert "National identity number" in out

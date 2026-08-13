@@ -214,6 +214,12 @@ class ReportData:
     uncertain: list[ReviewItem]
     uncertain_total: int
 
+    # Defaulted so `fetch()` and every existing caller keep working. It exists
+    # because a second producer now builds this data -- a UI scanning an
+    # uploaded file -- and a report that named the audit trail either way would
+    # be stating something false about where its figures came from.
+    source: str = "PipelineGuard audit trail (`messages_processed`, `findings`)"
+
 
 # --------------------------------------------------------------------------- #
 # I/O layer -- the only code here that touches a database
@@ -354,7 +360,7 @@ def render(data: ReportData) -> str:
         "",
         f"**Period covered:** {_window_label(data.since, data.until)}  ",
         f"**Generated:** {_ts(data.generated_at)}  ",
-        f"**Source:** PipelineGuard audit trail (`messages_processed`, `findings`)",
+        f"**Source:** {data.source}",
         "",
         f"> {compliance.DISCLAIMER}",
         "",
