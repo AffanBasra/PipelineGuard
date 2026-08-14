@@ -238,24 +238,31 @@ def build_markdown(
     return "\n".join(lines).rstrip() + "\n"
 
 
-def markdown_to_pdf(markdown_text: str, *, title: str) -> bytes:
+def markdown_to_pdf(markdown_text: str, *, title: str,
+                    orientation: str = "landscape") -> bytes:
     """Render Markdown to PDF bytes.
 
     Imported lazily, like the encoder's gliner import, so this module stays
     usable without the `ui` extra installed.
+
+    Splits on `report.PAGE_BREAK` before rendering, so the marker never reaches
+    the HTML writer -- fpdf2 has no page-break element to hand it. Portrait is
+    available because the six-column entity table is what forced landscape, and
+    a summary without it reads better on a normal page.
     """
     from fpdf import FPDF
     from markdown_it import MarkdownIt
 
-    body = MarkdownIt("commonmark").enable("table").render(markdown_text)
+    md = MarkdownIt("commonmark").enable("table")
 
-    pdf = FPDF(orientation="landscape", unit="mm", format="A4")
+    pdf = FPDF(orientation=orientation, unit="mm", format="A4")
     pdf.set_title(title)
     pdf.set_auto_page_break(auto=True, margin=12)
-    pdf.add_page()
-    pdf.set_font("Helvetica", size=8)
-    # Latin-1 is all the core fonts cover, and the report can carry a stray
-    # non-Latin character from a scanned row. Losing one glyph beats raising.
-    pdf.write_html(body.encode("latin-1", "replace").decode("latin-1"),
-                   table_line_separators=True)
+    for chunk in markdown_text.split(report.PAGE_BREAK):
+        pdf.add_page()
+        pdf.set_font("Helvetica", size=8)
+        # Latin-1 is all the core fonts cover, and the report can carry a stray
+        # non-Latin character from a scanned row. Losing one glyph beats raising.
+        pdf.write_html(md.render(chunk).encode("latin-1", "replace").decode("latin-1"),
+                       table_line_separators=True)
     return bytes(pdf.output())

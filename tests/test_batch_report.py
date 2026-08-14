@@ -251,3 +251,49 @@ def test_markdown_to_pdf_produces_a_pdf():
     )
     assert out.startswith(b"%PDF-")
     assert len(out) > 1000
+
+
+def test_summary_pdf_survives_an_entity_found_in_two_fields():
+    """fpdf2's HTML writer refuses any table cell holding nested markup, so two
+    backticked field names in one cell raised NotImplementedError against real
+    audit data. The fixtures elsewhere only ever had one field per entity."""
+    pytest.importorskip("fpdf")
+    pytest.importorskip("markdown_it")
+    from datetime import datetime, timedelta, timezone
+
+    from pipelineguard import report as R
+
+    t0 = datetime(2026, 7, 1, 9, 0, tzinfo=timezone.utc)
+    data = R.ReportData(
+        since=t0, until=t0 + timedelta(hours=1),
+        generated_at=t0 + timedelta(hours=2),
+        records=100, event_ts_min=t0, event_ts_max=t0,
+        processed_ts_min=t0, processed_ts_max=t0 + timedelta(seconds=10),
+        by_topic=[], disposition=[("redacted", 100)], by_tier=[(1, 100)],
+        entities=[R.EntityRow("IBAN_PK", 200, 100, 1, 1, 1.0)],
+        # The shape that broke it: one entity, two fields.
+        entity_fields=[("IBAN_PK", "iban_from", 100),
+                       ("IBAN_PK", "iban_to", 100)],
+        failures=[], failclosed=[], failclosed_total=0,
+        uncertain=[], uncertain_total=0,
+    )
+
+    out = batch_report.markdown_to_pdf(
+        R.render_summary(data), title="Data Governance Summary",
+        orientation="portrait",
+    )
+    assert out.startswith(b"%PDF-")
+
+
+def test_page_break_marker_starts_a_new_pdf_page():
+    pytest.importorskip("fpdf")
+    pytest.importorskip("markdown_it")
+    import re
+
+    from pipelineguard import report as R
+
+    one = batch_report.markdown_to_pdf("# A", title="t")
+    two = batch_report.markdown_to_pdf(f"# A\n\n{R.PAGE_BREAK}\n\n# B", title="t")
+    pages = lambda b: len(re.findall(rb"/Type\s*/Page[^s]", b))  # noqa: E731
+    assert pages(one) == 1
+    assert pages(two) == 2
