@@ -125,6 +125,28 @@ services:
     volumes:
       - models:/models
 
+  # One-shot, and the reason `docker compose up` is a complete demonstration
+  # rather than an empty pipeline: it feeds a bounded batch and exits. Running
+  # `up` again seeds again, which is additive rather than harmful -- the audit
+  # trail is keyed on message id and every record is synthetic.
+  #
+  # Set SEED_COUNT=0 to skip it once the volume already holds data.
+  seed:
+    <<: *app-image
+    entrypoint: ["python", "-m", "pipelineguard.producer"]
+    command: ["--rate", "${SEED_RATE:-200}", "--count", "${SEED_COUNT:-1000}"]
+    environment: *app-env
+    restart: "no"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      topics-init:
+        condition: service_completed_successfully
+      # After the processor, so the records it writes are consumed rather than
+      # sitting unread until someone notices the topic has a backlog.
+      processor:
+        condition: service_started
+
   # ---------------------------------------------------------------------- #
   # On-demand tools. The `tools` profile keeps them out of `docker compose
   # up`, while `docker compose run` activates a service's profile

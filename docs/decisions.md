@@ -43,7 +43,9 @@ sidestepped:
   matters. `.streamlit/config.toml` sets `server.address = "localhost"`, so the
   app is not reachable off the machine even by accident; without it Streamlit
   binds every interface and prints a LAN URL. The rule is enforced by
-  configuration, not by convention. It must not be deployed.
+  configuration, not by convention. **Superseded for a separate demo build --
+  see "A public demo build, and what it actually costs" below.** The default
+  build is unchanged and still binds loopback.
 * *A metrics dashboard demonstrates plumbing rather than domain understanding.*
   So the UI invents no charts and no counters. Tabs 1 and 2 show spans, tiers
   and confidences — the detectors' actual output. Tab 3 renders
@@ -74,6 +76,47 @@ pill until it finishes. This is not decoration: `psycopg.connect` against a
 stopped database waits out its default timeout, which is ten seconds of a UI
 that looks broken. The connect timeout is now explicit, and the failure is
 reported with its cause and a pointer to `docker compose`.
+
+**A public demo build, and what it actually costs.** *(settled)*
+This supersedes "it must not be deployed" for one build, and the honest version
+of the reasoning matters more than the outcome.
+
+The original rule was written against *uploads*: accepting third-party
+documents brings retention and breach-notification duties. Two things about
+that turned out to be true and one turned out to be overstated.
+
+True: the app stores nothing. Streamlit hands an upload over as bytes in
+memory, the UI writes nothing to disk, and it writes nothing to the audit
+database. `ScanResult.without_text()` now drops the scanned rows from session
+state once the figures are computed, so "gone when the scan finishes" is a
+property rather than a promise.
+
+True: the guarantee stops being ours at the container boundary. The demo runs
+on infrastructure we do not own, on a free tier with no data processing
+agreement. If a visitor uploads something real and it reaches a platform log,
+our no-storage claim was true of our code and false of the system delivering
+it. That risk is accepted, not solved.
+
+Overstated: "would make this a data controller with retention obligations". No
+storage removes the retention and most of the breach exposure, but not
+controller status -- processing under GDPR Art. 4(2) includes consultation and
+use. What survives is small: a lawful basis, a privacy notice, and being
+contactable. All three are now in the app. Separately, GDPR's territorial scope
+(Art. 3) reaches a Pakistan-based operator only when offering services to
+people in the Union or monitoring them, which a demo aimed at neither does; the
+instruments that actually apply are the ones `compliance.py` already cites.
+
+The demo is a *different build*, not the same one exposed. `PG_DEMO=1` caps the
+batch at 100 rows, removes the threshold and widener controls, swaps the live
+governance tab for a stored run, and shows the privacy notice. The two removed
+controls are not cosmetic: `tier2_settings` takes a global lock only when a
+setting is overridden, so leaving them alone is what stops one visitor's scan
+queueing behind another's.
+
+Rejected: keeping the uploader but relying on a "do not upload real PII"
+banner alone. A disclaimer is a wish, not a control. It is still shown, because
+saying so is better than not, but the retention properties above are what the
+decision rests on.
 
 **The encoder never reads what a rule already claimed.** *(settled)*
 Tier 2 used to run on the raw value, so it read an email's local part as a name

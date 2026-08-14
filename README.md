@@ -6,6 +6,31 @@ Raw events flow through a tiered detection pipeline; PII is redacted in-stream,
 uncertain records are quarantined for review, and every decision is written to
 a Postgres audit trail from which a governance report is generated.
 
+```mermaid
+flowchart TD
+    P["producer<br/>synthetic PK transactions"] --> RAW["txn.raw<br/>unredacted · 24h"]
+    RAW --> D{"dispatch by field<br/>not escalation"}
+
+    D -->|"declared fields<br/>cnic · iban · phone · email"| T1["Tier 1 — rules<br/>regex + checksum<br/>exact, microseconds"]
+    D -->|"free text<br/>memo"| T1
+    D -->|"free text<br/>memo"| T2["Tier 2 — GLiNER encoder<br/>names + addresses<br/>one pass per label group"]
+
+    T1 --> M["shield · combine · merge spans"]
+    T2 --> M
+    M --> R{"route"}
+
+    R -->|"no findings"| CLEAN["txn.clean<br/>redacted · 168h"]
+    R -->|"redacted"| CLEAN
+    R -->|"rule finding below 1.0"| Q["txn.quarantine<br/>unredacted · 72h"]
+
+    M -.->|"audit before emit"| DB[("Postgres audit trail<br/>type · field · span · tier · confidence<br/>never the value")]
+    DB --> REP["governance report"]
+    DB --> UI["inspection UI"]
+```
+
+The same flow in more detail, including the batching that makes Tier 2 pay for
+itself:
+
 ```
   ┌────────────┐
   │  producer  │   synthetic PK bank transactions, ~40% with no memo
@@ -89,17 +114,27 @@ span, promoted on uncertainty.
 ## Quick start
 
 ```bash
-docker compose up -d                                       # broker, database, topics, firewall
-docker compose run --rm producer --rate 50 --count 1000    # feed txn.raw
-docker compose logs -f processor                           # watch it work
+docker compose up -d          # everything: broker, database, topics, firewall, and 1,000 records
 ```
 
-That is the whole thing — no local Python needed. `up` brings the stack to a
-running pipeline idling on an empty topic: Kafka and Postgres come up, a
-one-shot `topics-init` container creates the topics (broker auto-create is
-disabled), and the processor starts only once that container has *exited
-successfully*, so "the topics probably exist by now" is an ordering guarantee
-rather than a hope.
+One command, no local Python. It brings up Kafka and Postgres, runs a one-shot
+`topics-init` container to create the topics (broker auto-create is disabled),
+starts the processor only once that container has *exited successfully* — so
+"the topics probably exist by now" is an ordering guarantee rather than a hope
+— and then feeds a bounded batch through it.
+
+```bash
+docker compose logs -f processor    # watch it work
+```
+
+The seed is deliberately bounded and one-shot. Change it, or turn it off once
+the volume already holds data:
+
+```bash
+SEED_COUNT=5000 docker compose up -d      # a bigger batch
+SEED_COUNT=0 docker compose up -d         # no new records
+docker compose run --rm producer --rate 50 --count 200   # ad hoc, any time
+```
 
 ```bash
 docker compose run --rm report                             # governance report to stdout
@@ -322,6 +357,81 @@ Roman-Urdu memos fire, and some are destroyed whole (`Zakat contribution` →
 address). Coverage was deliberately not traded away to fix it, and the false
 positives score up to 0.98 — high enough that no threshold change removes them.
 Flagging fully-saturated redactions is the open mitigation.
+
+## The public demo
+
+<!-- TODO, needs a human: the Space does not exist yet and no recording has been
+     made. Once it is live, put its URL on the line below, drop a screen
+     recording at docs/demo.gif, and uncomment the image.
+
+     **[Try it](https://huggingface.co/spaces/<user>/<space>)**
+
+     ![PipelineGuard scanning a memo](docs/demo.gif)
+-->
+
+A cut-down build runs as a Hugging Face Space. It is a different build, not the
+same one exposed — `PG_DEMO=1` changes four things, and they are the difference
+between "local tool" and "thing strangers can reach":
+
+| | local | demo |
+|---|---|---|
+| Batch cap | 500 rows | **100** — CPU is ~95 ms/row and scans serialise |
+| Threshold slider | shown | **removed** — any override takes the global lock, so leaving it alone lets visitors scan concurrently |
+| Span-widener toggle | shown | removed, same reason |
+| Governance tab | live Postgres | a stored run, `docs/sample-summary.md` |
+| Privacy notice | not shown | shown on the welcome screen and the batch tab |
+
+**Nothing uploaded is retained.** Streamlit hands the file over as bytes in
+memory; the UI writes nothing to disk and nothing to the audit database. After
+a scan the rows are dropped from session state by `ScanResult.without_text()`,
+which keeps every figure already computed and discards the text. A test asserts
+the original cannot survive it.
+
+### Building it
+
+```bash
+docker build -f deploy/hf-space/Dockerfile -t pipelineguard-demo .
+docker run --rm -p 7860:7860 pipelineguard-demo
+```
+
+Docker SDK rather than the Streamlit SDK for one reason: a build step. GLiNER
+resolves its backbone config at `main` and passes no revision, so the only way
+to pin it is to warm the cache with the right commit and then forbid the
+network (findings §25). `python -m pipelineguard.prefetch` runs at build time
+and `HF_HUB_OFFLINE=1` is set for runtime. Without that the demo would run
+unpinned and its own sidebar would say so.
+
+The weights are baked into the image rather than fetched on first boot. A Space
+downloading 1.6 GB while someone watches is a bad first impression.
+
+`deploy/hf-space/README.md` is the Space card — copy it to the Space root along
+with the Dockerfile.
+
+### What it costs a visitor
+
+| | |
+|---|---|
+| First load after idle | 30–50 s: container wake plus a 15 s encoder load |
+| Playground scan | ~0.1 s once warm |
+| 100-row batch | ~10 s, during which other visitors queue |
+| Memory | ~1.9 GB, inside CPU Basic's 16 GB |
+
+Tier 1 answers while the encoder is still loading, so the page is useful before
+it finishes.
+
+### Keeping it awake
+
+A Space sleeps when idle, and the wake plus encoder load is the 30–50 s above.
+An uptime monitor pinging the Space URL on a schedule keeps it warm, at the
+cost of holding free compute you are not using. Point it at the Space root; any
+200 counts.
+
+### Regenerating the stored report
+
+```bash
+docker compose up -d
+venv/Scripts/python.exe scripts/make_sample_summary.py
+```
 
 ## Design decisions
 
@@ -564,12 +674,16 @@ and exactly 40,000 IBAN detections — precisely two per message.
 
 ```
 Dockerfile                       one image, four entry points (processor, topics, producer, report)
-docker-compose.yml               broker, database, topic init, processor, on-demand tools
+docker-compose.yml               broker, database, topic init, processor, seed, on-demand tools
+deploy/hf-space/Dockerfile       the public demo image (CPU torch, weights baked in, pinned)
+deploy/hf-space/README.md        the Space card
 db/init.sql                      audit schema (idempotent upserts by message_id)
 scripts/create_topics.py         explicit topic creation + retention (auto-create disabled)
 scripts/peek_topic.py            print recent messages on a topic (reads from the END)
 scripts/probe_ner_*.py           the Tier 2 measurement suite — model, threshold,
                                  runtime, precision, redaction damage
+scripts/make_sample_summary.py   regenerate the stored report the demo renders
+scripts/make_favicon.py          raster the shield for the browser tab
 src/pipelineguard/
   config.py                      env-driven settings
   models.py                      Envelope, Finding, Tier
@@ -589,4 +703,5 @@ src/pipelineguard/
   observability.py               console logging + rolling throughput/latency stats
 .streamlit/config.toml           UI theme, and the localhost bind that keeps it local
 docs/sample-report.md            a generated report, committed as an example
+docs/sample-summary.md           the executive view of the same, rendered by the demo
 ```
