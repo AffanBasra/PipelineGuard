@@ -398,3 +398,50 @@ def test_widest_column_of_empty_file_is_none():
 
 def test_widest_column_breaks_ties_leftmost():
     assert scan.widest_column(b"a,b\nxx,yy\n") == "a"
+
+
+# --------------------------------------------------------------------------- #
+# without_text -- what the batch tab holds after a scan
+# --------------------------------------------------------------------------- #
+def test_without_text_drops_the_original_and_its_spans(tier1):
+    result = scan.scan_text(f"Sent by {CNIC} today", tier1=tier1)
+
+    stripped = result.without_text()
+
+    assert stripped.text == ""
+    assert stripped.spans == ()
+    assert CNIC not in stripped.text
+    assert CNIC not in stripped.redacted
+
+
+def test_without_text_keeps_every_figure_the_batch_view_needs(tier1):
+    result = scan.scan_text(f"Sent by {CNIC} today", tier1=tier1)
+
+    stripped = result.without_text()
+
+    assert stripped.redacted == result.redacted
+    assert stripped.findings == result.findings
+    assert stripped.masked_chars == result.masked_chars
+    assert stripped.identifying_chars == result.identifying_chars
+    assert stripped.truncated == result.truncated
+    assert stripped.coverage == result.coverage
+
+
+def test_without_text_leaves_the_original_result_alone(tier1):
+    """Frozen dataclass, so this returns a copy rather than mutating in place.
+    The playground still needs the text it was given."""
+    text = f"Sent by {CNIC} today"
+    result = scan.scan_text(text, tier1=tier1)
+
+    result.without_text()
+
+    assert result.text == text
+    assert result.spans
+
+
+def test_findings_carry_no_value_so_stripping_text_leaves_nothing(tier1):
+    """The reason dropping the text is sufficient: a Finding stores a span and
+    a type, never the matched characters."""
+    result = scan.scan_text(f"Sent by {CNIC} today", tier1=tier1).without_text()
+
+    assert CNIC not in repr(result)

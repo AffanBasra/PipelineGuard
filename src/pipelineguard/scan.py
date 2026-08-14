@@ -18,7 +18,7 @@ import io
 import threading
 from collections.abc import Callable, Collection, Iterable, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from pipelineguard.models import Finding
 from pipelineguard.processor import combine, merge_spans, redact, shield
@@ -60,6 +60,16 @@ class ScanResult:
         if not self.identifying_chars:
             return 0.0
         return self.masked_chars / self.identifying_chars
+
+    def without_text(self) -> ScanResult:
+        """The same result with the scanned text dropped.
+
+        Every figure here is derived during the scan and stored, so nothing on
+        screen needs the original afterwards. Holding it would keep an uploaded
+        row in session memory for the life of the session for no purpose. See
+        decisions.md, the demo build entry.
+        """
+        return replace(self, text="", spans=())
 
 
 _TIER2_LOCK = threading.Lock()
