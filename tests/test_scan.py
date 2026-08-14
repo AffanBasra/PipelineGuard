@@ -29,6 +29,9 @@ class FakeGLiNER:
 
     def __init__(self, raises: bool = False):
         self.calls: list[tuple[int, tuple[str, ...], float]] = []
+        # Kept apart from `calls` so the shielding tests can read the exact
+        # text the encoder was handed without disturbing the batching asserts.
+        self.texts: list[str] = []
         self.raises = raises
 
     def eval(self):
@@ -36,6 +39,7 @@ class FakeGLiNER:
 
     def batch_predict_entities(self, texts, labels, threshold=0.25):
         self.calls.append((len(texts), tuple(labels), threshold))
+        self.texts.extend(texts)
         if self.raises:
             raise RuntimeError("boom")
         out = []
@@ -127,6 +131,64 @@ def test_findings_are_sorted_by_position(tier1):
     result = scan.scan_text(text, tier1=tier1, tier2=make_tier2())
     starts = [f.span_start for f in result.findings]
     assert starts == sorted(starts)
+
+
+# --------------------------------------------------------------------------- #
+# shielding — the encoder must not read characters a rule already owns
+# --------------------------------------------------------------------------- #
+def test_encoder_never_sees_a_rule_claimed_span(tier1):
+    """Row 3 of the reported file in miniature. Unshielded, the encoder reads
+    an email domain as a place and bridges from it into the next address,
+    swallowing the text between. See findings §26."""
+    tier2 = make_tier2()
+    text = f"Ayesha {CNIC} lives in Islamabad"
+
+    scan.scan_text(text, tier1=tier1, tier2=tier2)
+
+    seen = tier2._model.texts[0]
+    assert CNIC not in seen
+    assert len(seen) == len(text)
+    # Everything the rules did not claim must survive untouched.
+    assert "Ayesha" in seen and "Islamabad" in seen
+
+
+def test_batch_also_shields_every_row(tier1):
+    tier2 = make_tier2(batch_size=2)
+    texts = [f"Ayesha {CNIC}", f"Islamabad {CNIC}"]
+
+    scan.scan_batch(texts, tier1=tier1, tier2=tier2)
+
+    # One forward pass per label group, so each row is handed over more than
+    # once. Every copy must be shielded, which is what the set comparison says.
+    assert set(tier2._model.texts) == {
+        "Ayesha" + " " * (len(texts[0]) - len("Ayesha")),
+        "Islamabad" + " " * (len(texts[1]) - len("Islamabad")),
+    }
+
+
+def test_shielding_leaves_the_result_text_and_spans_on_the_original(tier1):
+    """Blanking is length-preserving, so encoder offsets still index the text
+    the user typed. A shorter placeholder would shift every later span."""
+    tier2 = make_tier2()
+    text = f"{CNIC} Ayesha"
+
+    result = scan.scan_text(text, tier1=tier1, tier2=tier2)
+
+    assert result.text == text
+    person = next(f for f in result.findings if f.entity_type == "PERSON_NAME")
+    assert text[person.span_start:person.span_end] == "Ayesha"
+
+
+def test_encoder_finding_inside_a_rule_span_is_dropped(tier1):
+    """The fake hits on 'Ayesha' wherever it appears, including inside a span
+    the rules already own. That guess must not reach the findings table."""
+    tier2 = make_tier2()
+    # The rules claim the whole email; 'Ayesha' sits inside it.
+    result = scan.scan_text("mail Ayesha.k@example.com", tier1=tier1,
+                            tier2=tier2)
+
+    assert [f.entity_type for f in result.findings] == ["EMAIL"]
+    assert result.redacted == "mail [EMAIL]"
 
 
 # --------------------------------------------------------------------------- #

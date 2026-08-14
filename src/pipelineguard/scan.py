@@ -21,7 +21,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 
 from pipelineguard.models import Finding
-from pipelineguard.processor import merge_spans, redact
+from pipelineguard.processor import combine, merge_spans, redact, shield
 
 # The field name is load-bearing: "memo" is in schema_rules.FREE_TEXT, which is
 # what marks a value as free text the encoder should read.
@@ -151,7 +151,11 @@ def scan_text(
     if tier2 is not None:
         with tier2_settings(tier2, threshold=threshold,
                             extend_addresses=extend_addresses) as detector:
-            findings += detector.detect(text, field)
+            # Shielded, exactly as the pipeline does it: the encoder must not
+            # read characters a rule already owns. See findings §26.
+            findings = combine(
+                findings, detector.detect(shield(text, findings), field)
+            )
     return _result(text, _keep(findings, entity_types), truncated)
 
 
@@ -193,12 +197,14 @@ def scan_batch(
             chunk = clipped[start:start + size]
             # detect_batch omits keys with no findings, so results are read back
             # by key. Zipping would shift every later row onto the wrong text.
+            rules = [list(tier1.detect(text, field)) for text, _ in chunk]
             found = detector.detect_batch(
-                {start + i: {field: text} for i, (text, _) in enumerate(chunk)}
+                {start + i: {field: shield(text, rules[i])}
+                 for i, (text, _) in enumerate(chunk)}
             )
             for i, (text, truncated) in enumerate(chunk):
-                findings = list(tier1.detect(text, field))
-                findings += found.get(start + i, {}).get(field, [])
+                findings = combine(rules[i],
+                                   found.get(start + i, {}).get(field, []))
                 results.append(
                     _result(text, _keep(findings, entity_types), truncated)
                 )
