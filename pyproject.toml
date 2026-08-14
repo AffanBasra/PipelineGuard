@@ -33,7 +33,8 @@ tier2 = ["torch>=2.13", "gliner>=0.2.28"]
 #
 # Deliberately absent from requirements.txt, which the Dockerfile reads -- the
 # processor image has no business carrying a web server.
-ui = ["streamlit>=1.40", "fpdf2>=2.8", "markdown-it-py>=3.0"]
+ui = ["streamlit>=1.40", "fpdf2>=2.8", "markdown-it-py>=3.0",
+      "streamlit-option-menu>=0.4", "pillow>=10.0"]
 
 # src layout: the package lives in src/, so it is importable only once installed.
 # `pip install -e .` puts it on the path for the terminal, for pytest and for any

@@ -25,9 +25,12 @@ os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 warnings.filterwarnings("ignore")
 
+import threading  # noqa: E402
 from datetime import datetime, time, timedelta, timezone  # noqa: E402
+from pathlib import Path  # noqa: E402
 
 import streamlit as st  # noqa: E402
+from streamlit_option_menu import option_menu  # noqa: E402
 
 from pipelineguard import batch_report, compliance, report, scan  # noqa: E402
 from pipelineguard.config import settings  # noqa: E402
@@ -97,7 +100,12 @@ LOGO = """
 </svg>
 """
 
-st.set_page_config(page_title="PipelineGuard", page_icon="🛡️",
+# Resolved from __file__, not the working directory: Streamlit is launched from
+# the repo root, but nothing enforces that and a missing icon is silent.
+FAVICON = Path(__file__).resolve().parent / "assets" / "shield.png"
+
+st.set_page_config(page_title="PipelineGuard",
+                   page_icon=str(FAVICON) if FAVICON.exists() else "🛡️",
                    layout="wide", initial_sidebar_state="expanded")
 
 # Sticky tabs, the loading overlay, and the logo lockup. Streamlit ships no
@@ -126,6 +134,27 @@ st.markdown(f"""<style>
 .pg-lockup {{ display:flex; align-items:center; gap:.7rem; margin:.2rem 0 .1rem; }}
 .pg-word {{ font-size:1.42rem; font-weight:800; color:{PAPER}; line-height:1.1; }}
 .pg-tag {{ color:#94a3b8; font-size:.86rem; margin:.1rem 0 .9rem; }}
+
+/* The welcome lockup. Sized off the sidebar one so the logo reads as the same
+   mark at both scales rather than a second, larger badge. */
+.pg-hero {{ display:flex; align-items:center; gap:1.1rem; margin:1.2rem 0 .4rem; }}
+/* height only: the mark is 44x52, so forcing a square would squash it. */
+.pg-hero svg {{ width:auto; height:72px; }}
+.pg-hero h1 {{ font-size:2.1rem; font-weight:800; color:{PAPER};
+               margin:0; line-height:1.1; }}
+.pg-hero p {{ color:#94a3b8; font-size:1rem; margin:.25rem 0 0; }}
+
+/* Metric cards. Bare numbers float against the page background and read as
+   unrelated to each other; a slate panel groups them and separates the row
+   from the tables underneath. */
+[data-testid="stMetric"] {{
+  background: {SLATE};
+  border: 1px solid rgba(248,250,252,.09);
+  border-radius: 10px;
+  padding: .8rem 1rem .9rem;
+  box-shadow: 0 8px 18px -14px rgba(0,0,0,.95);
+}}
+[data-testid="stMetricLabel"] p {{ color:#94a3b8; font-size:.82rem; }}
 
 .pg-dismiss {{ display:none; }}
 .pg-overlay {{
@@ -186,16 +215,58 @@ def load_tier1() -> RulesDetector:
 
 
 @st.cache_resource(show_spinner=False)
-def load_tier2(model: str, revision: str, device: str):
-    """Load the encoder once per process. Keyed on the pin so a config change
-    builds a new one rather than silently serving the old weights."""
-    from pipelineguard.detectors.tier2_encoder import Tier2Detector
+def encoder_slot(model: str, revision: str, device: str) -> dict:
+    """One mutable holder shared by every session and by the loader thread.
 
-    detector = Tier2Detector(model, threshold=settings.tier2_threshold,
-                             device=device, batch_size=settings.tier2_batch_size,
-                             revision=revision)
-    detector.load()
-    return detector
+    cache_resource rather than a module global: Streamlit re-executes this file
+    top to bottom on each rerun, so a global would be rebuilt every time. Keyed
+    on the pin, so changing it builds a new slot instead of serving old weights.
+    """
+    return {"state": "idle", "detector": None, "error": None,
+            "lock": threading.Lock()}
+
+
+def start_encoder(slot: dict, model: str, revision: str, device: str) -> None:
+    """Kick off the ~20 s load off the main thread, so Tier 1 stays usable.
+
+    The worker must never touch `st`. Streamlit binds a script context to the
+    thread that runs the page, and calls from anywhere else either warn or do
+    nothing. So the thread only writes into `slot`, and the page reads it.
+    """
+    with slot["lock"]:
+        if slot["state"] != "idle":
+            return
+        slot["state"] = "loading"
+
+    def work() -> None:
+        try:
+            from pipelineguard.detectors.tier2_encoder import Tier2Detector
+
+            detector = Tier2Detector(model, threshold=settings.tier2_threshold,
+                                     device=device,
+                                     batch_size=settings.tier2_batch_size,
+                                     revision=revision)
+            detector.load()
+            slot["detector"] = detector
+            slot["state"] = "ready"
+        except Exception as exc:  # noqa: BLE001 - shown on the page, not swallowed
+            slot["error"] = f"{type(exc).__name__}: {exc}"
+            slot["state"] = "error"
+
+    threading.Thread(target=work, name="pg-encoder-load", daemon=True).start()
+
+
+@st.fragment(run_every=1.0)
+def encoder_heartbeat() -> None:
+    """Streamlit cannot notice a thread finishing, so poll until it has.
+
+    Only rendered while the state is 'loading', so the polling stops by itself
+    once the app rerun below sees a settled state.
+    """
+    slot = encoder_slot(settings.tier2_model, settings.tier2_model_revision,
+                        settings.tier2_device)
+    if slot["state"] != "loading":
+        st.rerun(scope="app")
 
 
 def tier_name(tier: Tier) -> str:
@@ -278,56 +349,66 @@ with st.sidebar:
     )
 
     st.subheader("Detection")
+
+    # Resolved before the widgets, because every Tier 2 control below is
+    # disabled until the encoder can actually answer. A live slider over a
+    # model that is still loading promises something the app cannot do.
+    tier1 = load_tier1()
+    tier2 = None
+    slot = encoder_slot(settings.tier2_model, settings.tier2_model_revision,
+                        settings.tier2_device)
+
     use_tier2 = st.toggle(
         "Tier 2 encoder", value=True,
         help="Names and addresses have no fixed format, so only the encoder "
              "finds them. Off, you see exactly what the processor does with "
              "TIER2_ENABLED=false.",
     )
+    if use_tier2:
+        start_encoder(slot, settings.tier2_model,
+                      settings.tier2_model_revision, settings.tier2_device)
+    encoder_ready = use_tier2 and slot["state"] == "ready"
+    if encoder_ready:
+        tier2 = slot["detector"]
 
     st.markdown("**Tier 1 — rules**")
     st.caption("Deterministic, predictable and runs in microseconds.")
     selected = {t for t in RULE_TYPES if st.checkbox(t, value=True, key=f"t1_{t}")}
 
     st.markdown("**Tier 2 — encoder**")
-    st.caption("GLiNER over free text. One forward pass per group.")
+    st.caption("Reads meaning, not patterns. Catches names and addresses "
+               "no rule can match.")
     for entity_type in ENCODER_TYPES:
         if st.checkbox(entity_type, value=True, key=f"t2_{entity_type}",
-                       disabled=not use_tier2):
-            selected.add(entity_type)
+                       disabled=not encoder_ready):
+            if encoder_ready:
+                selected.add(entity_type)
 
     threshold = st.slider(
         "Confidence threshold", min_value=0.10, max_value=0.95,
-        value=float(settings.tier2_threshold), step=0.05, disabled=not use_tier2,
+        value=float(settings.tier2_threshold), step=0.05,
+        disabled=not encoder_ready,
         help="Model and threshold are a pair. 0.55 is the value measured "
              "against this checkpoint; another checkpoint would need its own.",
     )
     extend = st.checkbox(
-        "Widen and bridge address spans", value=True, disabled=not use_tier2,
+        "Widen and bridge address spans", value=True,
+        disabled=not encoder_ready,
         help="Walks outward over a leading house or plot number and a trailing "
              "city, then joins address spans separated by a gap. Turn it off to "
              "see the raw model span.",
     )
 
-    tier1 = load_tier1()
-    tier2 = None
     if use_tier2:
-        boot = st.empty()
-        # Only the cold load is slow enough to be worth an overlay; afterwards
-        # cache_resource returns instantly and a flash would just be noise.
-        if "encoder_ready" not in st.session_state:
-            loading(boot, "Loading the encoder…", settings.tier2_model)
-        try:
-            tier2 = load_tier2(settings.tier2_model,
-                               settings.tier2_model_revision,
-                               settings.tier2_device)
-            st.session_state["encoder_ready"] = True
-        except ImportError:
-            st.error("Tier 2 needs torch and gliner: pip install '.[tier2]'")
-        except Exception as exc:  # noqa: BLE001 - shown, not swallowed
-            st.error(f"Encoder failed to load: {exc}")
-        finally:
-            boot.empty()
+        if slot["state"] == "ready":
+            st.success("Encoder ready", icon=":material/check_circle:")
+        elif slot["state"] == "error":
+            st.error(f"Encoder failed to load: {slot['error']}")
+            st.caption("Tier 2 needs torch and gliner: `pip install '.[tier2]'`.")
+        else:
+            st.info("Encoder loading… rules work now.",
+                    icon=":material/hourglass_top:")
+            encoder_heartbeat()
 
     with st.expander("Model provenance"):
         if tier2 is None:
@@ -367,19 +448,84 @@ scan_kwargs = dict(tier1=tier1, tier2=tier2, entity_types=active_types,
 
 
 # --------------------------------------------------------------------------- #
+# Welcome
+# --------------------------------------------------------------------------- #
+# Shown first so the encoder has something to load behind. The rules are ready
+# by now either way -- it is only the encoder that costs ~20 s.
+if not st.session_state.get("pg_started"):
+    st.markdown(
+        f'<div class="pg-hero">{LOGO}'
+        f'<div><h1>PipelineGuard</h1>'
+        f'<p>Protect your data, safely and securely</p></div></div>',
+        unsafe_allow_html=True,
+    )
+    st.write("")
+
+    one, two, three = st.columns(3)
+    one.markdown("**Playground**")
+    one.caption("Paste a memo. See what each tier finds, and what the "
+                "pipeline would write downstream.")
+    two.markdown("**Batch scan**")
+    two.caption(f"Scan a CSV or text file, up to {MAX_ROWS} rows, and export "
+                "a redaction report.")
+    three.markdown("**Governance report**")
+    three.caption("Read the audit trail the running pipeline writes to "
+                  "Postgres.")
+
+    st.write("")
+    ready = slot["state"] == "ready" or not use_tier2
+    left, right = st.columns([2, 3])
+    if left.button("Start", type="primary", width="stretch"):
+        st.session_state["pg_started"] = True
+        st.rerun()
+    if not use_tier2:
+        right.caption("Tier 2 is off. Rules only, which is what the processor "
+                      "does with `TIER2_ENABLED=false`.")
+    elif ready:
+        right.caption("Both tiers ready.")
+    elif slot["state"] == "error":
+        right.caption("Rules are ready. The encoder failed — see the sidebar.")
+    else:
+        right.caption("Rules are ready now. The encoder is still loading; "
+                      "start anyway and it will switch on by itself.")
+
+    st.caption(
+        "Runs entirely on this machine. Nothing you type or upload leaves it."
+    )
+    st.stop()
+
+
+# --------------------------------------------------------------------------- #
 # Tabs
 # --------------------------------------------------------------------------- #
 SECTIONS = ["Playground", "Batch scan", "Governance report"]
+SECTION_ICONS = ["terminal", "database", "shield-check"]
 
-# A keyed segmented control rather than st.tabs. st.tabs keeps its selection
-# client-side and springs back to the first tab on a rerun, so clicking "Load
-# report" bounced the reader to the playground and the finished report was
-# never seen. This selection lives in session state and survives the rerun.
+# Keyed, so the selection lives in session state. st.tabs keeps its selection
+# client-side and springs back to the first tab on a rerun, which is what made
+# "Load report" build a report the reader never saw.
 nav = st.container(key="pg_nav")
 with nav:
-    section = st.segmented_control(
-        "Section", SECTIONS, default=SECTIONS[0], key="pg_section",
-        label_visibility="collapsed",
+    section = option_menu(
+        None, SECTIONS, icons=SECTION_ICONS, default_index=0,
+        orientation="horizontal", key="pg_section",
+        styles={
+            # Centred and content-width. Left to itself the component spreads
+            # each item across a third of the page, which turns the active tab
+            # into a banner rather than a tab.
+            "container": {"padding": "0", "background-color": NAVY,
+                          "max-width": "680px", "margin": "0 auto",
+                          "justify-content": "center"},
+            "icon": {"font-size": "0.95rem", "margin-right": ".4rem"},
+            "nav-link": {
+                "font-size": "0.92rem", "font-weight": "600",
+                "color": "#94a3b8", "padding": ".5rem 1.15rem",
+                "margin": "0 .3rem", "border-radius": "8px",
+                "flex": "none", "white-space": "nowrap",
+                "--hover-color": SLATE,
+            },
+            "nav-link-selected": {"background-color": COBALT, "color": PAPER},
+        },
     ) or SECTIONS[0]
 
 if section == "Playground":
@@ -517,7 +663,9 @@ elif section == "Governance report":
     st.subheader("Governance report from the audit trail")
     st.caption(
         "Reads the Postgres audit trail the running pipeline writes. This is "
-        "the report `python -m pipelineguard.report` produces, unchanged."
+        "the summary view, written for a reader who needs the numbers rather "
+        "than the internals. `python -m pipelineguard.report` still writes the "
+        "full technical version."
     )
 
     left, mid, right = st.columns(3)
@@ -548,7 +696,7 @@ elif section == "Governance report":
                 conn.close()
             # Kept in state, not rendered here: a button is True for exactly one
             # run, so anything drawn inside this block vanishes on the next one.
-            st.session_state["governance"] = ("ok", report.render(data))
+            st.session_state["governance"] = ("ok", report.render_summary(data))
         except Exception as exc:  # noqa: BLE001 - the cause is what matters
             st.session_state["governance"] = ("error", str(exc))
         finally:
@@ -563,7 +711,18 @@ elif section == "Governance report":
             f"Connecting to `{settings.postgres_dsn}`."
         )
     elif outcome:
-        st.download_button("Download report (Markdown)", outcome[1],
-                           file_name="governance-report.md",
-                           mime="text/markdown")
-        st.markdown(outcome[1])
+        left, right = st.columns(2)
+        left.download_button("Download report (Markdown)", outcome[1],
+                             file_name="governance-report.md",
+                             mime="text/markdown", width="stretch")
+        try:
+            right.download_button(
+                "Download report (PDF)",
+                batch_report.markdown_to_pdf(
+                    outcome[1], title="Data Governance Summary",
+                    orientation="portrait"),
+                file_name="governance-report.pdf",
+                mime="application/pdf", width="stretch")
+        except ImportError:
+            right.info("PDF export needs `pip install '.[ui]'`.")
+        st.markdown(outcome[1].replace(report.PAGE_BREAK, "---"))
