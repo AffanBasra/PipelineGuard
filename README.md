@@ -74,6 +74,8 @@ span, promoted on uncertainty.
 - [x] Tier 2: encoder NER over free text, batched, GPU-optional
 - [x] Tier 2 verified end to end against a live Kafka broker (findings §24),
       which found a leak eleven sections of offline probing had missed
+- [x] Local inspection UI (Streamlit): playground, batch file scan with an
+      exportable report, and the governance report from the audit trail
 - [~] Tier 2 locale fine-tune -- **measured and declined** (findings §21, §23):
       the residual is positional, not semantic, and span rules closed most of it
       -- four times running, most recently for +2.6 points
@@ -268,11 +270,58 @@ It prints the redacted output, every finding with its tier and confidence, and
 how the overlapping spans merge. Without `--tier2` you get the rules only, which
 match formats — a name or address in free text needs the encoder.
 
+## The inspection UI
+
+A local Streamlit app over the same detectors. Three tabs: scan one memo, scan
+an uploaded CSV or TXT, and render the governance report from the audit trail.
+
+```bash
+pip install -e ".[ui]"                 # into an env that already has [tier2]
+HF_HUB_OFFLINE=1 python -m streamlit run src/pipelineguard/ui.py
+```
+
+Run it from the repo root, which is where Streamlit reads
+`.streamlit/config.toml`. Install `[ui]` on its own rather than `.[tier2,ui]`:
+resolving `torch>=2.13` again can replace a working CUDA build with the CPU
+wheel from PyPI.
+
+**Local only, and enforced.** `docs/decisions.md` §1 rules out a hosted service
+that accepts uploads, so the config binds the server to `localhost`. Without
+that, Streamlit binds every interface and advertises a LAN URL. Do not deploy
+it.
+
+| Tab | What it does |
+|---|---|
+| Playground | One memo. Highlighted spans, the redacted output, and every finding with its tier, confidence and regulatory category |
+| Batch scan | Up to 500 rows (~8 s at the measured 16 ms/row). Exports the governance report as Markdown or PDF |
+| Governance report | `report.fetch()` + `report.render_summary()` against Postgres — the three-page summary view. `python -m pipelineguard.report` still writes the full technical version |
+
+On a cold start the encoder loads on a background thread, so Tier 1 rules are
+usable within a second or two while it does. Every Tier 2 control stays
+disabled until the encoder answers — a live threshold slider over a model that
+has not loaded promises something the app cannot do.
+
+The sidebar toggles the encoder, selects entity types per tier, moves the
+confidence threshold, and turns the address span widener on and off. The
+threshold and the widener are applied to the detector and the text re-scanned,
+not filtered afterwards: address spans are bridged during detection and a
+bridge keeps the highest score of the spans it joins, so a post-hoc filter
+would show spans the pipeline never produces.
+
+**What the batch export is not.** It is a scan of a file, and the report says
+so — `ReportData.source` names the upload instead of the audit trail. It is not
+called "audit cleared", because `compliance.py` states the report is not a
+compliance determination. The exported rows are redacted output only; original
+text and matched values never leave the playground tab. Address redaction is
+routinely incomplete rather than binary, and the report carries that caveat
+beside the rows.
+
 **Over-redaction is the accepted cost.** At this threshold ~38% of clean
-Roman-Urdu memos fire, and some are destroyed whole (`Kiraya jama karwa diya` →
-`[PERSON_NAME]`). Coverage was deliberately not traded away to fix it, and the
-false positives score up to 0.98 — high enough that no threshold change removes
-them. Flagging fully-saturated redactions is the open mitigation.
+Roman-Urdu memos fire, and some are destroyed whole (`Zakat contribution` →
+`[ADDRESS+PERSON_NAME] contribution`, scoring 0.89 as a name and 0.84 as an
+address). Coverage was deliberately not traded away to fix it, and the false
+positives score up to 0.98 — high enough that no threshold change removes them.
+Flagging fully-saturated redactions is the open mitigation.
 
 ## Design decisions
 
@@ -534,6 +583,10 @@ src/pipelineguard/
   audit.py                       idempotent Postgres audit writer
   compliance.py                  entity type → regulatory classification
   report.py                      governance report (SQL over the audit trail → Markdown)
+  scan.py                        detect + redact + highlight for the UI (pure, tested)
+  batch_report.py                a scanned batch → ReportData → Markdown → PDF
+  ui.py                          local Streamlit app — presentation only, no logic
   observability.py               console logging + rolling throughput/latency stats
+.streamlit/config.toml           UI theme, and the localhost bind that keeps it local
 docs/sample-report.md            a generated report, committed as an example
 ```

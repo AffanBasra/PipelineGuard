@@ -61,6 +61,7 @@ import json
 import logging
 import time
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -195,6 +196,38 @@ def merge_spans(findings: list[Finding]) -> list[tuple[int, int, str]]:
     return [(s, e, "+".join(sorted(t))) for s, e, t in merged]
 
 
+def shield(text: str, findings: Iterable[Finding]) -> str:
+    """Blank what the rules already claimed, keeping the length identical.
+
+    The encoder reads raw text and cannot see that a rule owns the email, so it
+    reads 'example.org' as a place and bridges from there into a real address
+    further along. Length is preserved so encoder offsets still index the
+    original text. See findings §26.
+    """
+    spans = merge_spans(list(findings))
+    if not spans:
+        return text
+    out = list(text)
+    for start, end, _ in spans:
+        out[start:end] = [" "] * (end - start)
+    return "".join(out)
+
+
+def combine(rule_findings: list[Finding],
+            encoder_findings: Iterable[Finding]) -> list[Finding]:
+    """Both tiers, minus encoder findings a rule already covers completely.
+
+    A rule span is exact, so an encoder guess inside it changes no redaction --
+    only the label and the audit counts. Containment must be total: a partial
+    overlap is kept, because dropping it would leave its outer part unmasked.
+    """
+    covered = [(f.span_start, f.span_end) for f in rule_findings]
+    return list(rule_findings) + [
+        f for f in encoder_findings
+        if not any(s <= f.span_start and f.span_end <= e for s, e in covered)
+    ]
+
+
 def redact(text: str, findings: list[Finding]) -> str:
     """Replace each finding's span with [ENTITY_TYPE].
 
@@ -303,10 +336,12 @@ def process_message(
                 findings_by_field[field] = _SCHEMA.detect(value, field)
             elif field in FREE_TEXT:
                 # Both tiers: rules for the embedded identifiers, encoder for
-                # the names. merge_spans() resolves any overlap at redaction.
-                findings_by_field[field] = detector.detect(value, field) + (
-                    tier2_findings or {}
-                ).get(field, [])
+                # the names. combine() drops encoder guesses a rule already
+                # covers; merge_spans() resolves what overlap is left.
+                findings_by_field[field] = combine(
+                    detector.detect(value, field),
+                    (tier2_findings or {}).get(field, []),
+                )
             else:
                 findings_by_field[field] = detector.detect(value, field)
 
@@ -480,8 +515,12 @@ def main(argv: list[str] | None = None) -> None:
             escalated: set[int] = set()
             tier2_ms = 0.0
             if tier2 is not None:
+                # Rules run here as well as in process_message. They cost
+                # microseconds, and the alternative -- threading their output
+                # through the batch -- buys nothing. See findings §26.
                 inputs = {
-                    i: fields
+                    i: {field: shield(value, detector.detect(value, field))
+                        for field, value in fields.items()}
                     for i, msg in enumerate(good_messages)
                     if (fields := free_text_fields(msg.value()))
                 }

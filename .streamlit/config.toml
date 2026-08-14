@@ -1,0 +1,24 @@
+# Theme and server settings for the local inspection UI (src/pipelineguard/ui.py).
+# Streamlit reads this from the working directory, so run from the repo root.
+
+[theme]
+base = "dark"
+backgroundColor = "#0F172A"
+# Streamlit paints the sidebar with secondaryBackgroundColor -- this is the
+# portable spelling, not a `sidebarColor` key.
+secondaryBackgroundColor = "#1E293B"
+primaryColor = "#2563EB"
+textColor = "#F8FAFC"
+
+[server]
+# Loopback only. docs/decisions.md section 1 rules out a hosted service that
+# accepts uploads; Streamlit otherwise binds every interface and prints a
+# LAN-reachable URL, which would make that rule true only by convention.
+address = "localhost"
+# Streamlit's source watcher walks module __path__ attributes, and torch.classes
+# raises when that attribute is read. Disabling it costs auto-reload on save.
+fileWatcherType = "none"
+maxUploadSize = 5
+
+[browser]
+gatherUsageStats = false

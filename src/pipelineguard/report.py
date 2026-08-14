@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Sequence
@@ -214,6 +215,12 @@ class ReportData:
     uncertain: list[ReviewItem]
     uncertain_total: int
 
+    # Defaulted so `fetch()` and every existing caller keep working. It exists
+    # because a second producer now builds this data -- a UI scanning an
+    # uploaded file -- and a report that named the audit trail either way would
+    # be stating something false about where its figures came from.
+    source: str = "PipelineGuard audit trail (`messages_processed`, `findings`)"
+
 
 # --------------------------------------------------------------------------- #
 # I/O layer -- the only code here that touches a database
@@ -354,7 +361,7 @@ def render(data: ReportData) -> str:
         "",
         f"**Period covered:** {_window_label(data.since, data.until)}  ",
         f"**Generated:** {_ts(data.generated_at)}  ",
-        f"**Source:** PipelineGuard audit trail (`messages_processed`, `findings`)",
+        f"**Source:** {data.source}",
         "",
         f"> {compliance.DISCLAIMER}",
         "",
@@ -605,6 +612,240 @@ def render(data: ReportData) -> str:
         "idempotent recording, not exactly-once processing.",
         "",
     ]
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+# A marker, not markup: `markdown_to_pdf` splits on it and starts a new page.
+# It survives as an invisible comment when the Markdown is read as Markdown.
+PAGE_BREAK = "<!-- PAGE BREAK -->"
+
+_TIER_SHORT = {0: "Nothing found", 1: "Tier 1 -- rules",
+               2: "Tier 2 -- encoder", 3: "Tier 3 -- LLM"}
+
+_OUTCOME_MEANING = {
+    "clean": "No personal data found. Forwarded unchanged.",
+    "redacted": "Personal data found and masked before the record moved on.",
+    "quarantined": "Held back from the clean stream for a person to look at.",
+}
+
+
+def _share(count: int, total: int) -> str:
+    return f"{count / total:.1%}" if total else "--"
+
+
+def _quarantine_summary(data: ReportData) -> list[str]:
+    """The review queue as a sentence, not as a page of message ids.
+
+    The ids are deliberately absent: they identify records, this document is
+    read by people who cannot act on them, and the queue itself lives in the
+    quarantine topic. What a reader needs here is how many and why.
+    """
+    total = dict(data.disposition).get("quarantined", 0)
+    if not total:
+        return ["No records were held for review in this period."]
+
+    triggers = Counter(
+        item.detail.split(" failed validation")[0]
+        for item in data.uncertain
+        if " failed validation" in item.detail
+    )
+    lines = [
+        f"**{total:,} record(s)** were held back for review: "
+        f"{data.failclosed_total:,} could not be processed at all, and "
+        f"{data.uncertain_total:,} were withheld because a rule check did not "
+        "pass cleanly.",
+    ]
+    if triggers:
+        top, n = triggers.most_common(1)[0]
+        sampled = len(data.uncertain)
+        basis = (f"all {sampled:,}" if sampled >= data.uncertain_total
+                 else f"a sample of {sampled:,}")
+        lines += [
+            "",
+            f"The most common trigger, across {basis} of the withheld records, "
+            f"is **{top}** failing its validation check ({n:,} of them).",
+        ]
+    lines += [
+        "",
+        "Message ids are not printed here. They identify records, and this "
+        "document is meant to be shareable. The queue itself is held in the "
+        "`txn.quarantine` topic, where a reviewer can work through it.",
+    ]
+    return lines
+
+
+def render_summary(data: ReportData) -> str:
+    """Render `data` as an executive Markdown summary. Pure, like `render()`.
+
+    A second view of the same data, not a replacement: `render()` stays the
+    technical artefact the CLI writes. This one drops the message-id tables and
+    moves every regulatory passage into one appendix, because the reader it is
+    written for needs the numbers first and the statute last.
+    """
+    dispositions = dict(data.disposition)
+    total = data.records
+
+    lines: list[str] = [
+        "# Data Governance Summary",
+        "",
+        f"**Period:** {_window_label(data.since, data.until)}  ",
+        f"**Generated:** {_ts(data.generated_at)}  ",
+        f"**Source:** {data.source}",
+        "",
+        "> This is a description of what the pipeline saw and did. It is not a "
+        "compliance determination and not legal advice.",
+        "",
+        "## 1. Processing scope",
+        "",
+    ]
+    lines += _table(
+        ["measure", "value"],
+        [
+            ["Records scanned", f"{total:,}"],
+            ["Period covered", _window_label(data.since, data.until)],
+            ["First record processed", _ts(data.processed_ts_min)],
+            ["Last record processed", _ts(data.processed_ts_max)],
+            ["Observed rate", _throughput(data)],
+        ],
+    )
+    lines += ["", "### What happened to those records", ""]
+    if dispositions:
+        lines += _table(
+            ["outcome", "records", "share", "meaning"],
+            [[action.title(), f"{count:,}", _share(count, total),
+              _OUTCOME_MEANING.get(action, "")]
+             for action, count in sorted(data.disposition)],
+        )
+    else:
+        lines += ["No records were processed in this period."]
+
+    lines += ["", "## 2. Which tier caught what", ""]
+    if data.by_tier:
+        lines += _table(
+            ["caught by", "records", "share"],
+            [[_TIER_SHORT.get(tier, f"Tier {tier}"), f"{count:,}",
+              _share(count, total)] for tier, count in data.by_tier],
+        )
+        lines += [
+            "",
+            "Tier 1 matches fixed formats -- identity, account and contact "
+            "details -- and is exact. Tier 2 reads free text for names and "
+            "addresses, which have no fixed format, and reports a confidence "
+            "score with each find.",
+        ]
+    else:
+        lines += ["No detections were recorded in this period."]
+
+    # ---- page 2 ---------------------------------------------------------- #
+    lines += ["", PAGE_BREAK, "", "## 3. Personal data inventory", ""]
+    if data.entities:
+        # Field names are plain here, not in backticks. An entity found in two
+        # fields would otherwise put two <code> elements in one cell, and
+        # fpdf2's HTML writer refuses any table cell with nested markup.
+        fields_for: dict[str, list[str]] = {}
+        for etype, field, _ in data.entity_fields:
+            fields_for.setdefault(etype, []).append(field)
+        rows = []
+        for e in data.entities:
+            cls = compliance.classify(e.entity_type)
+            tier = (_TIER_SHORT.get(e.min_tier, str(e.min_tier))
+                    if e.min_tier == e.max_tier
+                    else f"tiers {e.min_tier}-{e.max_tier}")
+            rows.append([
+                e.entity_type,
+                cls.data_category if cls else "**unclassified**",
+                f"{e.mentions:,}",
+                f"{e.messages:,}",
+                ", ".join(fields_for.get(e.entity_type, ["--"])),
+                tier,
+            ])
+        lines += _table(
+            ["data type", "category", "detections", "records", "found in",
+             "detected by"],
+            rows,
+        )
+        lines += [
+            "",
+            "Detections, not people. The same person in two records counts "
+            "twice, because no value is stored that could link them.",
+        ]
+        missing = compliance.unclassified([e.entity_type for e in data.entities])
+        if missing:
+            lines += [
+                "",
+                "Detected but not classified in this build: "
+                + ", ".join(f"`{m}`" for m in missing)
+                + ". Listed rather than dropped, so 'none found' cannot be "
+                "confused with 'found and not understood'.",
+            ]
+    else:
+        lines += ["No personal data was detected in this period."]
+
+    lines += ["", "## 4. Quarantine and review worklist", ""]
+    lines += _quarantine_summary(data)
+
+    if data.failures:
+        lines += ["", "### Processing failures", ""]
+        lines += _table(["failure class", "records"],
+                        [[f"`{fc}`", f"{n:,}"] for fc, n in data.failures])
+
+    lines += [
+        "",
+        "## 5. Limitations",
+        "",
+        "- **This covers what reached the pipeline, not what exists.** Whether "
+        "every record arrived is a question this audit trail cannot answer.",
+        "- **Detection is not exhaustive.** Only data types the configured "
+        "detectors know about can appear here.",
+        "- **Counts are detections, not individuals.** No value is stored, so "
+        "records about the same person cannot be linked.",
+        "- **Address masking is partial by nature.** A fragment can remain in "
+        "a record that is otherwise masked.",
+        "- **Delivery is at-least-once.** A record seen twice is counted once, "
+        "but that is idempotent recording, not exactly-once processing.",
+    ]
+
+    # ---- page 3, the appendix -------------------------------------------- #
+    lines += [
+        "",
+        PAGE_BREAK,
+        "",
+        "## 6. Compliance framework mapping",
+        "",
+        "Why the pipeline behaves the way it does, and what each regime makes "
+        "of it. These explain significance. They are not claims that any "
+        "obligation has been met.",
+        "",
+        f"> {compliance.LEGAL_LANDSCAPE_NOTE}",
+        "",
+        "### 6.1 How the pipeline is built",
+        "",
+    ]
+    for prop in compliance.SYSTEM_PROPERTIES:
+        lines += [
+            f"**{prop.title}.** {prop.behaviour}",
+            "",
+            f"- *Pakistan:* {prop.pk_basis}",
+            f"- *GDPR:* {prop.gdpr_basis}",
+            "",
+        ]
+
+    if data.entities:
+        lines += ["### 6.2 Why each data type matters", ""]
+        for e in data.entities:
+            cls = compliance.classify(e.entity_type)
+            if cls is None:
+                continue
+            lines += [
+                f"**{e.entity_type}** -- {cls.data_category}"
+                + ("  *(special category)*" if cls.special_category else ""),
+                "",
+                f"- *Pakistan:* {cls.pk_basis}",
+                f"- *GDPR:* {cls.gdpr_basis}",
+                "",
+            ]
+        lines += [f"> {compliance.CROSS_BORDER_NOTE}", ""]
 
     return "\n".join(lines).rstrip() + "\n"
 

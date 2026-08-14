@@ -161,10 +161,10 @@ def test_free_text_gets_both_tiers(detector):
     assert "Ayesha Malik" not in body and "03001234567" not in body
 
 
-def test_overlapping_spans_do_not_corrupt_output(detector):
-    """Tier 2 flags a name inside the local part of an address Tier 1 claims as
-    EMAIL. Naive right-to-left rewriting would emit nested garbage, and dropping
-    the narrower span would leave the leading characters in the clear."""
+def test_encoder_finding_inside_a_rule_span_is_dropped(detector):
+    """Tier 2 reads the local part of an email as a name. The rule span already
+    covers those characters exactly, so the guess changes no redaction -- only
+    the label and the audit counts. See findings §26."""
     memo = "Refund processed, notify at ayesha.malik@example.com"
     email_start = memo.index("ayesha")
     outcome = P.process_message(
@@ -173,9 +173,27 @@ def test_overlapping_spans_do_not_corrupt_output(detector):
     )
 
     redacted = payload_of(outcome)["memo"]
-    assert redacted == "Refund processed, notify at [EMAIL+PERSON]"
+    assert redacted == "Refund processed, notify at [EMAIL]"
     assert "ayesha" not in redacted
-    assert redacted.count("[") == 1
+    assert {f.tier for f in outcome.findings} == {Tier.RULES}
+
+
+def test_encoder_finding_overlapping_a_rule_span_is_kept(detector):
+    """The leak guard, stated where it actually applies. A span that pokes out
+    past the rule span must survive: dropping it would leave the characters
+    outside the rule span in the clear."""
+    memo = "Refund processed, notify Ayesha at ayesha.malik@example.com"
+    outcome = P.process_message(
+        make_message({"memo": memo}), detector,
+        # Starts at the free-standing 'Ayesha' and runs into the email.
+        {"memo": [t2("memo", memo.index("Ayesha"),
+                     memo.index("ayesha.malik") + len("ayesha.malik"))]},
+    )
+
+    redacted = payload_of(outcome)["memo"]
+    assert "Ayesha" not in redacted
+    assert "ayesha" not in redacted
+    assert {f.tier for f in outcome.findings} == {Tier.RULES, Tier.ENCODER}
 
 
 def test_merge_spans_unions_partial_overlap():
@@ -193,6 +211,73 @@ def test_merge_spans_keeps_touching_spans_separate():
         Finding("PHONE_PK", "memo", 5, 10, Tier.RULES, 1.0),
     ]
     assert P.merge_spans(findings) == [(0, 5, "EMAIL"), (5, 10, "PHONE_PK")]
+
+
+# --------------------------------------------------------------------------- #
+# shield / combine — keeping the encoder off characters a rule already owns
+# --------------------------------------------------------------------------- #
+def test_shield_blanks_a_rule_span_and_keeps_the_length():
+    text = "notify at ayesha.malik@example.com now"
+    findings = [Finding("EMAIL", "memo", 10, 34, Tier.RULES, 1.0)]
+
+    out = P.shield(text, findings)
+
+    assert len(out) == len(text)
+    assert out == text[:10] + " " * 24 + text[34:]
+    assert "example.com" not in out
+
+
+def test_shield_without_findings_is_the_original_text():
+    assert P.shield("nothing here", []) == "nothing here"
+
+
+def test_shield_blanks_every_rule_span():
+    text = "a@b.com and 35202-1234567-1 both"
+    findings = [
+        Finding("EMAIL", "memo", 0, 7, Tier.RULES, 1.0),
+        Finding("CNIC", "memo", 12, 27, Tier.RULES, 1.0),
+    ]
+
+    out = P.shield(text, findings)
+
+    assert out == " " * 7 + " and " + " " * 15 + " both"
+    assert len(out) == len(text)
+
+
+def test_combine_drops_an_encoder_finding_inside_a_rule_span():
+    rule = Finding("EMAIL", "memo", 10, 30, Tier.RULES, 1.0)
+    inside = Finding("PERSON", "memo", 12, 20, Tier.ENCODER, 0.6)
+
+    assert P.combine([rule], [inside]) == [rule]
+
+
+def test_combine_drops_an_encoder_finding_matching_a_rule_span_exactly():
+    """The boundary. Equal bounds are containment, not a partial overlap."""
+    rule = Finding("EMAIL", "memo", 10, 30, Tier.RULES, 1.0)
+    same = Finding("ADDRESS", "memo", 10, 30, Tier.ENCODER, 0.6)
+
+    assert P.combine([rule], [same]) == [rule]
+
+
+@pytest.mark.parametrize("start,end", [(5, 20), (20, 40), (5, 40)])
+def test_combine_keeps_an_encoder_finding_that_pokes_out(start, end):
+    """Anything not fully covered must survive, or its outer part leaks."""
+    rule = Finding("EMAIL", "memo", 10, 30, Tier.RULES, 1.0)
+    overlap = Finding("ADDRESS", "memo", start, end, Tier.ENCODER, 0.9)
+
+    assert P.combine([rule], [overlap]) == [rule, overlap]
+
+
+def test_combine_keeps_a_disjoint_encoder_finding():
+    rule = Finding("EMAIL", "memo", 10, 30, Tier.RULES, 1.0)
+    other = Finding("PERSON", "memo", 40, 50, Tier.ENCODER, 0.9)
+
+    assert P.combine([rule], [other]) == [rule, other]
+
+
+def test_combine_without_rule_findings_keeps_everything():
+    encoder = [Finding("PERSON", "memo", 0, 5, Tier.ENCODER, 0.9)]
+    assert P.combine([], encoder) == encoder
 
 
 def test_empty_memo_is_clean(detector):

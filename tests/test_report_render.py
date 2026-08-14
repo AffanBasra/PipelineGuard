@@ -70,6 +70,19 @@ def test_disclaimer_is_present() -> None:
     assert "not legal advice" in out
 
 
+def test_source_defaults_to_the_audit_trail() -> None:
+    """The database path must keep saying what it always said."""
+    assert "**Source:** PipelineGuard audit trail" in report.render(make_data())
+
+
+def test_source_can_be_overridden_and_replaces_the_default() -> None:
+    """A scan of an uploaded file did not come from the audit trail, and the
+    report has to say so rather than inherit a stock line that is false."""
+    out = report.render(make_data(source="uploaded file `memos.csv`"))
+    assert "**Source:** uploaded file `memos.csv`" in out
+    assert "audit trail (`messages_processed`" not in out
+
+
 def test_classified_entities_carry_their_category_and_basis() -> None:
     out = report.render(make_data())
     assert "National identity number" in out
@@ -282,3 +295,107 @@ def test_parse_ts_defaults_naive_input_to_utc(text, expected) -> None:
     """A naive --since would otherwise be compared against timestamptz using
     the server's timezone, silently shifting the window."""
     assert report._parse_ts(text) == expected
+
+# --------------------------------------------------------------------------- #
+# render_summary -- the executive view of the same data
+# --------------------------------------------------------------------------- #
+def summary_data(**overrides) -> ReportData:
+    """Like make_data, but with review details in the shape _uncertain_detail
+    actually produces, which is what the trigger summary reads."""
+    defaults = dict(
+        uncertain=[
+            ReviewItem("11111111-1111-1111-1111-111111111111", T0,
+                       "sub-threshold confidence",
+                       "IBAN_PK failed validation (confidence 0.50)"),
+            ReviewItem("22222222-2222-2222-2222-222222222222", T0,
+                       "sub-threshold confidence",
+                       "IBAN_PK failed validation (confidence 0.50)"),
+            ReviewItem("33333333-3333-3333-3333-333333333333", T0,
+                       "sub-threshold confidence",
+                       "CNIC failed validation (confidence 0.50)"),
+        ],
+    )
+    defaults.update(overrides)
+    return make_data(**defaults)
+
+
+def test_summary_renders_all_six_sections() -> None:
+    out = report.render_summary(summary_data())
+    for heading in [
+        "## 1. Processing scope",
+        "## 2. Which tier caught what",
+        "## 3. Personal data inventory",
+        "## 4. Quarantine and review worklist",
+        "## 5. Limitations",
+        "## 6. Compliance framework mapping",
+    ]:
+        assert heading in out
+
+
+def test_summary_has_two_page_breaks() -> None:
+    """Three pages: metrics, discovery, appendix."""
+    out = report.render_summary(summary_data())
+    assert out.count(report.PAGE_BREAK) == 2
+
+
+def test_summary_never_prints_a_message_id() -> None:
+    """The whole point of condensing the worklist. A shareable document must
+    not carry per-record identifiers."""
+    data = summary_data()
+    out = report.render_summary(data)
+    for item in list(data.uncertain) + list(data.failclosed):
+        assert item.message_id not in out
+
+
+def test_summary_names_the_most_common_quarantine_trigger() -> None:
+    out = report.render_summary(summary_data())
+    assert "IBAN_PK" in out
+    assert "2" in out.split("most common trigger")[1][:200]
+
+
+def test_summary_says_sample_when_the_queue_was_capped() -> None:
+    out = report.render_summary(summary_data(uncertain_total=37))
+    assert "a sample of 3" in out
+
+
+def test_summary_says_all_when_the_queue_is_complete() -> None:
+    out = report.render_summary(summary_data(uncertain_total=3))
+    assert "all 3" in out
+
+
+def test_summary_keeps_regulatory_text_out_of_the_inventory() -> None:
+    """Section 3 is the inventory; the statute lives in the appendix."""
+    out = report.render_summary(summary_data())
+    inventory = out.split("## 3.")[1].split("## 4.")[0]
+    assert "GDPR" not in inventory
+    assert "Pakistan" not in inventory
+    assert "GDPR" in out.split("## 6.")[1]
+
+
+def test_summary_carries_the_disclaimer() -> None:
+    out = report.render_summary(summary_data())
+    assert "not a compliance determination" in out
+    assert "not legal advice" in out
+
+
+def test_summary_survives_an_empty_period() -> None:
+    out = report.render_summary(make_data(
+        records=0, disposition=[], by_tier=[], entities=[], entity_fields=[],
+        failures=[], failclosed=[], failclosed_total=0,
+        uncertain=[], uncertain_total=0,
+    ))
+    assert "No personal data was detected" in out
+    assert "No records were held for review" in out
+
+
+def test_summary_shows_the_share_of_each_outcome() -> None:
+    out = report.render_summary(summary_data())
+    # 860 redacted of 1000 records.
+    assert "86.0%" in out
+
+
+def test_render_is_unchanged_by_the_summary_existing() -> None:
+    """The CLI artefact must keep its own shape."""
+    out = report.render(make_data())
+    assert "## 6. Items requiring review" in out
+    assert report.PAGE_BREAK not in out
