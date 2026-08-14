@@ -2687,3 +2687,130 @@ cache, not once per project.
   them is pinned.
 - **The backbone commit was read off a warm cache**, not chosen. It is whatever
   `main` served on 2026-08-12. Recording it makes it stable, not correct.
+
+---
+
+## 26. The encoder was reading text a rule already owned
+
+A 20-row test file produced `[ADDRESS+EMAIL+PERSON_NAME]` where the expected
+output was `[EMAIL]`. The reported symptom was span merging. The cause was
+upstream of it.
+
+### 26.1 What the encoder actually returned
+
+Row 1 of the file, with widening and bridging switched off so the raw model
+output is visible:
+
+```
+Hi, my name is Ayesha Khan. Please contact me at ayesha.khan@example.com ...
+
+  PERSON_NAME  [15: 26]  0.93  'Ayesha Khan'
+  PERSON_NAME  [49: 60]  0.55  'ayesha.khan'      <- inside the email
+  EMAIL        [49: 72]  1.00  'ayesha.khan@example.com'
+  ADDRESS      [61: 72]  0.61  'example.com'      <- inside the email
+```
+
+`merge_spans()` is correct here. Three spans genuinely overlap, so it unions
+them and the label carries all three types. Nothing leaks. The defect is that
+two of those three findings should never have existed: **Tier 2 runs on the raw
+value and has no idea Tier 1 already claimed those characters.**
+
+Measured across the 20 rows plus one constructed case: 11 encoder findings sat
+entirely inside a Tier 1 span, and 11 of 20 rows carried a compound label.
+
+### 26.2 The same blindness costs real text, not just a label
+
+Row 3 is the case that matters. Raw model output, bridging off:
+
+```
+Send the invoice to Sara Ahmed at sara.ahmed@example.org. She requested
+delivery to DHA Phase 5, Karachi.
+
+  ADDRESS  [45: 56]  0.59  'example.org'
+  ADDRESS  [84: 95]  0.82  'DHA Phase 5'
+  ADDRESS  [97:104]  0.98  'Karachi'
+```
+
+`bridge_address_spans` joins ADDRESS spans within `_MAX_BRIDGE` (32) characters.
+The gap from the end of `example.org` to the start of `DHA Phase 5` is **28**.
+So the mail domain became the anchor of a bridge, and the shipped output was:
+
+```
+Send the invoice to [PERSON_NAME] at [ADDRESS+EMAIL].
+```
+
+`She requested delivery to` — 59 characters of ordinary text — was masked.
+§23.3 measured bridging's over-redaction at 0.2% of characters on a corpus with
+**no Tier 1 identifiers in it at all**. This failure mode was outside what that
+corpus could show.
+
+Worse, bridging keeps the **maximum** score of the spans it joins. The 0.59
+guess left wearing `Karachi`'s 0.98, so the audit records a near-certain
+address where the evidence was a coin flip.
+
+### 26.3 The fix: shield, then combine
+
+Two functions in `processor.py`, applied at both join points (the Kafka path in
+`process_message`/`main`, and `scan.py` for the UI).
+
+**`shield(text, rule_findings)`** blanks every rule-claimed character with
+spaces before the encoder reads the value. Length-preserving, so the encoder's
+returned offsets still index the original text — a shorter placeholder would
+shift every later span.
+
+**`combine(rule_findings, encoder_findings)`** drops encoder findings that sit
+*entirely* inside a rule span. Containment must be total. A partial overlap is
+kept, because dropping it would leave the part outside the rule span unmasked,
+which is the exact leak `merge_spans()` was written to prevent.
+
+Shielding alone would nearly do it; `combine` is the cheap invariant that makes
+"no encoder finding lands wholly inside a rule span" true by construction
+rather than by argument.
+
+### 26.4 Result
+
+Measured on the same 20 rows:
+
+| | before | after |
+|---|---|---|
+| rows with a compound label | 11 of 20 | **5 of 20** |
+| row 1 | `[ADDRESS+EMAIL+PERSON_NAME]` | `[EMAIL]` |
+| row 3 | ate 59 characters of text | text intact |
+
+Every one of the 5 remaining compound labels was inspected: each span covers
+exactly the personal data and nothing else. They are all §24.5 — address
+components (`Flat 8B`, `G-11`, `27-B`) read as PERSON_NAME inside a real
+address. Redaction is correct; the entity counts are still inflated.
+
+Shielding changes what the model reads, so it is not label-neutral. Two rows
+shifted: row 20 gained a §24.5 compound it did not have before, row 6 gained an
+ADDRESS label on a person's name. Neither changes a span boundary.
+
+### 26.5 Why §23 and §24 did not need re-measuring
+
+Shielding changes the encoder's input, which would normally invalidate every
+address measurement taken before it. It does not here, and the reason is
+checkable rather than argued: the Tier 1 detector was run over all three
+corpora behind those sections.
+
+| corpus | texts | texts with a Tier 1 finding |
+|---|---|---|
+| `probe_ner_locale.build_cases()` | 237 | 0 |
+| `probe_ner_precision.build_negatives()` | 43 | 0 |
+| `probe_address_real.build_cases()` | 3,600 | 0 |
+
+`shield()` blanks nothing when there is nothing to blank, so it is the identity
+function on all 3,880 of them. The numbers stand unchanged.
+
+That is also the limitation. **No corpus in this project mixes Tier 1
+identifiers with addresses**, which is why a bridge anchored on a mail domain
+survived to be found by hand on a 20-row file. The generator writes emails and
+addresses into separate fields; real remittance narration does not.
+
+### 26.6 Not fixed
+
+- **§24.5 remains.** Address components still read as people, so the audit
+  over-counts PERSON_NAME. The compliance report is the one consumer for which
+  entity-type accuracy is the product.
+- **`_MAX_BRIDGE` is still 32 characters and still unaware of context.** Two
+  distinct addresses closer than that still merge into one span.

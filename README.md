@@ -294,7 +294,12 @@ it.
 |---|---|
 | Playground | One memo. Highlighted spans, the redacted output, and every finding with its tier, confidence and regulatory category |
 | Batch scan | Up to 500 rows (~8 s at the measured 16 ms/row). Exports the governance report as Markdown or PDF |
-| Governance report | `report.fetch()` + `report.render()` against Postgres — the same report the CLI produces |
+| Governance report | `report.fetch()` + `report.render_summary()` against Postgres — the three-page summary view. `python -m pipelineguard.report` still writes the full technical version |
+
+On a cold start the encoder loads on a background thread, so Tier 1 rules are
+usable within a second or two while it does. Every Tier 2 control stays
+disabled until the encoder answers — a live threshold slider over a model that
+has not loaded promises something the app cannot do.
 
 The sidebar toggles the encoder, selects entity types per tier, moves the
 confidence threshold, and turns the address span widener on and off. The

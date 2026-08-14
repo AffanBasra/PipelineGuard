@@ -56,13 +56,15 @@ the shipped `RulesDetector`, `Tier2Detector` and `processor.redact()` rather
 than reimplementing any of them, because a second copy of span arithmetic would
 drift and the UI would then show a redaction the pipeline does not perform.
 
-**Sections are a keyed segmented control, not `st.tabs`.** *(settled)*
+**Sections are a keyed nav, not `st.tabs`.** *(settled)*
 `st.tabs` keeps its selection client-side and springs back to the first tab
 when a widget triggers a rerun. Pressing "Load report" therefore built the
 report correctly and then returned the reader to the playground, so the result
-was never seen -- a bug that looked like the query silently failing. A
-`st.segmented_control` with a `key` stores the selection in session state and
-survives the rerun. The same reasoning applies to the results themselves: a
+was never seen -- a bug that looked like the query silently failing. Any keyed
+control stores the selection in session state and survives the rerun; this
+started as `st.segmented_control` and is now `streamlit-option-menu`, which
+carries icons and an explicit active style. The keying is the load-bearing
+part, not the widget. The same reasoning applies to the results themselves: a
 button is `True` for exactly one run, so anything rendered inside its branch
 disappears on the next one. Outcomes are written to session state and rendered
 outside the branch, errors included.
@@ -72,6 +74,28 @@ pill until it finishes. This is not decoration: `psycopg.connect` against a
 stopped database waits out its default timeout, which is ten seconds of a UI
 that looks broken. The connect timeout is now explicit, and the failure is
 reported with its cause and a pointer to `docker compose`.
+
+**The encoder never reads what a rule already claimed.** *(settled)*
+Tier 2 used to run on the raw value, so it read an email's local part as a name
+and its domain as a place. Both sat inside a span Tier 1 already owned, which
+made the label read `[ADDRESS+EMAIL+PERSON_NAME]`, inflated the audit's entity
+counts, and -- once `bridge_address_spans` used a mail domain as an anchor --
+masked 59 characters of ordinary text. `shield()` blanks rule-claimed
+characters before the encoder sees them, length-preserving so offsets still
+index the original; `combine()` drops encoder findings that sit entirely inside
+a rule span. Containment must be total: a partial overlap is kept, because
+dropping it would leave its outer part in the clear. Applied at both join
+points, so the UI cannot disagree with the pipeline. See findings §26.
+
+**Two governance reports, one dataset.** *(settled)*
+`render()` stays the technical artefact the CLI writes and `docs/sample-report.md`
+records. `render_summary()` is a second pure view of the same `ReportData` for
+a reader who needs the numbers rather than the internals: three pages, every
+regulatory passage moved into one appendix, and the review worklist condensed
+to a count and a trigger. The message-id table is deliberately absent -- it
+identifies records, and this is the version meant to be shareable. Two
+renderers rather than one rewritten renderer, because the audiences want
+genuinely different documents and the technical one is still the ground truth.
 
 **The batch report is a file scan, and says so.** *(settled)*
 Exporting a governance report for an uploaded file reuses `report.render()`,
