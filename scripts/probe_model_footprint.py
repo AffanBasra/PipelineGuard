@@ -68,6 +68,42 @@ MODELS = [
 
 MB = 1024 * 1024
 
+# How the weights are brought into memory. §27.2 measured that fp32 costs more
+# than twice the weight size, so these are the levers that could still fit a
+# 1 GB host once the model swap has failed to.
+#
+#   low_cpu_mem_usage   builds under meta device instead of materialising the
+#                       whole state dict and then copying it
+#   variant             loads the repo's fp16/bf16 safetensors rather than the
+#                       fp32 pytorch_model.bin
+#   quantize            torchao int8 dynamic quantization
+LOAD_CONFIGS = {
+    "fp32": {},
+    "fp32+lowmem": {"low_cpu_mem_usage": True},
+    "bf16": {"variant": "bf16", "low_cpu_mem_usage": True},
+    "fp16": {"variant": "fp16", "low_cpu_mem_usage": True},
+    "int8": {"quantize": "int8"},
+}
+
+
+def _inject_load_kwargs(extra: dict) -> None:
+    """Make `Tier2Detector.load()` pass `extra` to GLiNER, without changing it.
+
+    The shipped loader takes no such argument. Adding one to production so a
+    probe can measure five variants would be the measurement dictating the
+    design; patching here keeps the cost inside this file.
+    """
+    if not extra:
+        return
+    from gliner import GLiNER
+
+    original = GLiNER.from_pretrained
+
+    def patched(model_id, **kwargs):
+        return original(model_id, **{**kwargs, **extra})
+
+    GLiNER.from_pretrained = staticmethod(patched)
+
 
 # --------------------------------------------------------------------------- #
 # Child process: measure one model and print one JSON object
@@ -138,7 +174,8 @@ def _coverage_by_type(detector, cases, field: str = "memo") -> dict:
 
 
 def measure(model_id: str, revision: str, thresholds: list[float],
-            records: int, repeats: int, batch_size: int) -> dict:
+            records: int, repeats: int, batch_size: int,
+            load: str = "fp32") -> dict:
     import gc
     import tracemalloc
 
@@ -157,6 +194,8 @@ def measure(model_id: str, revision: str, thresholds: list[float],
 
     from pipelineguard.detectors.tier2_encoder import Tier2Detector
     from pipelineguard.generator.transactions import make_memo
+
+    _inject_load_kwargs(LOAD_CONFIGS[load])
 
     gc.collect()
     baseline = proc.memory_info().rss
@@ -200,6 +239,7 @@ def measure(model_id: str, revision: str, thresholds: list[float],
     return {
         "model": model_id,
         "revision": revision,
+        "load": load,
         "torch": torch.__version__,
         "baseline_mb": baseline / MB,
         "resting_mb": resting / MB,
@@ -218,14 +258,15 @@ def measure(model_id: str, revision: str, thresholds: list[float],
 # --------------------------------------------------------------------------- #
 # Parent process: run the children, print the comparison
 # --------------------------------------------------------------------------- #
-def run_child(model_id: str, revision: str, args) -> dict | None:
+def run_child(model_id: str, revision: str, args, load: str) -> dict | None:
     cmd = [sys.executable, str(Path(__file__).resolve()),
            "--measure", model_id, "--revision", revision,
            "--thresholds", args.thresholds,
            "--records", str(args.records),
            "--repeats", str(args.repeats),
-           "--batch-size", str(args.batch_size)]
-    print(f"  measuring {model_id} ...", flush=True)
+           "--batch-size", str(args.batch_size),
+           "--load", load]
+    print(f"  measuring {model_id} [{load}] ...", flush=True)
     done = subprocess.run(cmd, capture_output=True, text=True,
                           encoding="utf-8", errors="replace")
     for line in done.stdout.splitlines():
@@ -252,7 +293,7 @@ def report(results: list[dict], thresholds: list[float], limit_mb: float) -> Non
     for r in results:
         acc = r["accuracy"][f"{shipped:.2f}"]
         rows.append({
-            "model": r["model"].split("/")[-1],
+            "model": f"{r['model'].split('/')[-1]}  [{r.get('load', 'fp32')}]",
             "baseline": r["baseline_mb"],
             "resting": r["resting_mb"],
             "peak": r["peak_mb"],
@@ -321,7 +362,8 @@ def report(results: list[dict], thresholds: list[float], limit_mb: float) -> Non
                 person = acc.get("PERSON", {})
                 address = acc.get("ADDRESS", {})
                 sweep.add_row(
-                    r["model"].split("/")[-1], f"{threshold:.2f}",
+                    f"{r['model'].split('/')[-1]} [{r.get('load', 'fp32')}]",
+                    f"{threshold:.2f}",
                     f"{person.get('coverage', 0):.1f}",
                     f"{person.get('complete', 0):.1f}",
                     f"{address.get('coverage', 0):.1f}",
@@ -345,6 +387,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--measure", help=argparse.SUPPRESS)
     parser.add_argument("--revision", help=argparse.SUPPRESS)
+    parser.add_argument("--load", default="fp32",
+                        help="comma-separated load configs: "
+                             + ", ".join(LOAD_CONFIGS))
+    parser.add_argument("--models", default="",
+                        help="substring filter on the model id")
     parser.add_argument("--thresholds", default="0.55",
                         help="comma-separated, first one is the headline")
     parser.add_argument("--records", type=int, default=50,
@@ -361,13 +408,21 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.measure:
         print(json.dumps(measure(args.measure, args.revision, thresholds,
-                                 args.records, args.repeats, args.batch_size)))
+                                 args.records, args.repeats, args.batch_size,
+                                 args.load)))
         return 0
 
-    print(f"{len(MODELS)} models, {args.records} records per pass, "
-          f"{args.repeats} timed passes, CPU\n")
-    results = [r for _label, model_id, revision in MODELS
-               if (r := run_child(model_id, revision, args))]
+    loads = [name.strip() for name in args.load.split(",")]
+    unknown = [name for name in loads if name not in LOAD_CONFIGS]
+    if unknown:
+        parser.error(f"unknown load config {unknown}; "
+                     f"choose from {list(LOAD_CONFIGS)}")
+
+    models = [m for m in MODELS if args.models.lower() in m[1].lower()]
+    print(f"{len(models)} model(s) x {len(loads)} load config(s), "
+          f"{args.records} records per pass, {args.repeats} timed passes, CPU\n")
+    results = [r for _label, model_id, revision in models for load in loads
+               if (r := run_child(model_id, revision, args, load))]
     if not results:
         print("nothing measured")
         return 1

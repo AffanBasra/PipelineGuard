@@ -2950,3 +2950,60 @@ not exist.
 
 Streamlit Community Cloud is ruled out for the encoder build on this evidence.
 It is not ruled out for a rules-only build.
+
+### 27.5 bf16 fits; int8 destroys it
+
+§27.4 listed shrinking the model as the untested option. Measured, same
+instrument, same 237 cases, `gliner_small-v2.5`:
+
+| weights loaded as | resting | peak | ms/rec | PERSON cov | ADDRESS cov |
+|---|---:|---:|---:|---:|---:|
+| fp32 (shipped) | 1,456 MB | 1,465 MB | 50.5 | 99.3% | 100.0% |
+| fp32 + `low_cpu_mem_usage` | 1,273 MB | 1,332 MB | 51.7 | 99.3% | 100.0% |
+| **bf16** | **735 MB** | **768 MB** | 141.8 | 99.3% | 100.0% |
+| fp16 | 741 MB | 752 MB | 296.1 | 99.3% | 100.0% |
+| int8 (`quantize="int8"`) | 1,569 MB | 1,574 MB | 26.1 | **7.6%** | **4.9%** |
+
+**bf16 halves the weights and changes coverage by nothing measurable.** 1,100
+MB of weights becomes 379 MB, and both entity types score identically to fp32
+to one decimal place. The cost is 2.8x latency: CPUs do fp32 natively and
+convert bf16 on the fly.
+
+**fp16 is strictly dominated** -- the same memory as bf16 for twice the latency
+again. There is no configuration in which it is the right choice here.
+
+**int8 is not a trade-off, it is a failure.** §7 warned that stock
+DeBERTa-based models lose accuracy at int8 without quantization-aware training.
+Measured: coverage collapses to 7.6% and 4.9%, and it does not even save
+memory, because torchao's dynamic path holds the fp32 weights alongside the
+quantized ones. Fast and useless.
+
+`gliner_medium-v2.5` in bf16 fits as well, at 845 MB resting and 858 MB peak,
+with its fp32 coverage intact (99.4% / 100.0%) and 225 ms/record.
+
+### 27.6 The app is not free either
+
+The footprint figures are for a bare interpreter. A deployed app carries more:
+
+| | RSS |
+|---|---:|
+| bare interpreter | 16 MB |
+| + torch + gliner | 351 MB |
+| + streamlit | 364 MB |
+| + everything `ui.py` imports | 391 MB |
+| + pandas, pyarrow, altair (first `st.dataframe`) | 449 MB |
+
+**+96 MB over the probe's baseline**, and the last 85 MB of it does not appear
+until a dataframe is first rendered -- so an app that looks fine on the welcome
+screen can die on the batch tab.
+
+Against the 1,024 MB ceiling, with the model peak from §27.5:
+
+| build | peak + app | headroom |
+|---|---:|---:|
+| small bf16 | ~864 MB | **160 MB** |
+| medium bf16 | ~954 MB | **70 MB** |
+
+Both fit on paper. 70 MB is not enough margin to bet a public demo on, so the
+medium build would need its peak measured under a real session before it could
+be trusted, not a synthetic batch of short generated memos.
