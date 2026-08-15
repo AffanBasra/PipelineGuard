@@ -25,7 +25,10 @@ from pipelineguard.detectors.tier2_encoder import (
     Tier2Detector,
     bridge_address_spans,
     cached_base_revisions,
+    cached_main_revision,
     extend_address_span,
+    pin_main_ref,
+    prefetch_pinned,
 )
 from pipelineguard.models import Tier
 
@@ -355,6 +358,61 @@ def test_cached_base_revisions_lists_what_is_there(tmp_path):
     assert cached_base_revisions(_TUNED_FOR_BASE, cache_root=tmp_path) == [
         "aaa", "bbb"
     ]
+
+
+def _snapshot_only(cache_root, revision=_TUNED_FOR_BASE_REVISION):
+    """The state a fresh prefetch leaves behind: right commit, no `main` ref."""
+    snapshots = (cache_root / "models--microsoft--deberta-v3-base" / "snapshots")
+    (snapshots / revision).mkdir(parents=True)
+
+
+def test_cached_main_revision_is_none_when_only_the_snapshot_is_there(tmp_path):
+    """The exact state that broke the demo image: the pinned commit is cached,
+    yet a no-revision load has nothing to resolve and fails offline."""
+    _snapshot_only(tmp_path)
+    assert cached_base_revisions(_TUNED_FOR_BASE, cache_root=tmp_path) == [
+        _TUNED_FOR_BASE_REVISION
+    ]
+    assert cached_main_revision(_TUNED_FOR_BASE, cache_root=tmp_path) is None
+
+
+def test_pin_main_ref_makes_main_resolve_to_the_pinned_commit(tmp_path):
+    _snapshot_only(tmp_path)
+    pin_main_ref(_TUNED_FOR_BASE, _TUNED_FOR_BASE_REVISION, cache_root=tmp_path)
+    assert cached_main_revision(_TUNED_FOR_BASE,
+                                cache_root=tmp_path) == _TUNED_FOR_BASE_REVISION
+
+
+def test_prefetch_pinned_records_main_as_well_as_downloading(tmp_path,
+                                                             monkeypatch):
+    """Both halves in one step. Downloading the right commit without recording
+    the ref is exactly how the demo image shipped unloadable."""
+    import huggingface_hub
+
+    calls = []
+    monkeypatch.setattr(huggingface_hub, "snapshot_download",
+                        lambda repo_id, **kw: calls.append(
+                            (repo_id, kw.get("revision"))))
+    monkeypatch.setattr("huggingface_hub.constants.HF_HUB_CACHE", str(tmp_path))
+
+    prefetch_pinned(_TUNED_FOR, _TUNED_FOR_REVISION,
+                    _TUNED_FOR_BASE, _TUNED_FOR_BASE_REVISION)
+
+    assert calls == [(_TUNED_FOR, _TUNED_FOR_REVISION),
+                     (_TUNED_FOR_BASE, _TUNED_FOR_BASE_REVISION)]
+    assert cached_main_revision(_TUNED_FOR_BASE,
+                                cache_root=tmp_path) == _TUNED_FOR_BASE_REVISION
+
+
+def test_pin_main_ref_replaces_a_ref_left_by_an_earlier_download(tmp_path):
+    """A cache that once tracked `main` already holds a ref, and it is the stale
+    one that would silently win. Pinning has to overwrite, not skip."""
+    refs = tmp_path / "models--microsoft--deberta-v3-base" / "refs"
+    refs.mkdir(parents=True)
+    (refs / "main").write_text("0" * 40, encoding="utf-8")
+    pin_main_ref(_TUNED_FOR_BASE, _TUNED_FOR_BASE_REVISION, cache_root=tmp_path)
+    assert cached_main_revision(_TUNED_FOR_BASE,
+                                cache_root=tmp_path) == _TUNED_FOR_BASE_REVISION
 
 
 def test_an_explicit_revision_survives_a_model_change():

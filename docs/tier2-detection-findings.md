@@ -2688,6 +2688,58 @@ cache, not once per project.
 - **The backbone commit was read off a warm cache**, not chosen. It is whatever
   `main` served on 2026-08-12. Recording it makes it stable, not correct.
 
+### 25.6 The pin never worked; a stale ref was doing the job
+
+The first Docker image built from a cold cache could not load the encoder at
+all:
+
+```
+OSError: We couldn't connect to 'https://huggingface.co' to load the files,
+and couldn't find them in the cached files.
+```
+
+raised from `AutoConfig.from_pretrained(config.model_name)` — the exact call
+§25.1 identified, in the exact offline state §25.3 calls PINNED.
+
+**Cause.** `snapshot_download(repo, revision=<sha>)` writes the snapshot and
+nothing else. It does not write `refs/main`, because it was never asked about
+`main`. GLiNER requests the backbone with no revision, which means `main`, and
+a name is resolved through that ref before anything looks at snapshots. No ref,
+no resolution, and offline there is nowhere else to ask.
+
+**Why nothing caught it.** Every cache the prefetch had ever run against was
+already warm from an earlier unpinned download, so `refs/main` was there before
+the prefetch ran:
+
+| cache | `refs/main` | snapshots | load |
+|---|---|---|---|
+| developer `HF_HOME` | `8ccc9b6f3619` | `8ccc9b6f3619` | works |
+| compose `models` volume, reused | present | `8ccc9b6f3619` | works |
+| demo image, built cold | **absent — no `refs/` at all** | `8ccc9b6f3619` | **fails** |
+
+§25.4's zero-request measurements are still true. They were taken on caches
+that happened to carry the ref, so they measured the right thing about the
+wrong population.
+
+**Proof it is the only cause.** Writing that one 40-byte file into the running
+container, changing nothing else, loaded the model and returned findings.
+
+**Fix.** `prefetch_pinned` writes `refs/main` pointing at the pinned commit.
+That is not a weakening of the pin: the commit is fetched by hash first, the
+ref is written second, and the process goes offline third, so nothing can
+refresh it and whatever `main` means upstream is irrelevant.
+
+**Correction to §25.3.** "The cache holds exactly the pinned commit" was the
+wrong test for the prefetch: it passed, and the build shipped an unloadable
+cache. Reachable by hash is not the same as resolvable by name, and only the
+second is what GLiNER does. The prefetch now exits non-zero unless `refs/main`
+reads back as the pinned commit, which is what makes
+`RUN python -m pipelineguard.prefetch` a build gate rather than a download step.
+
+`_log_base_pin` keeps the snapshot-only test, and is left alone deliberately.
+It runs *after* a load has already succeeded, so resolution is a fact by then
+and the same condition is sound in that position.
+
 ---
 
 ## 26. The encoder was reading text a rule already owned

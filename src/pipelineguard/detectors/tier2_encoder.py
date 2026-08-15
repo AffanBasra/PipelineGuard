@@ -228,6 +228,40 @@ def cached_base_revisions(base_model: str,
     return sorted(p.name for p in snapshots.iterdir() if p.is_dir())
 
 
+def cached_main_revision(base_model: str,
+                         cache_root: str | Path | None = None) -> str | None:
+    """The commit `main` resolves to in the local cache, or None if unrecorded.
+
+    Holding the right snapshot is not enough. A no-revision request asks for
+    `main`, which is looked up through this ref, so an unrecorded ref fails
+    offline however complete the cache is. See findings §25.
+    """
+    if cache_root is None:
+        from huggingface_hub.constants import HF_HUB_CACHE
+
+        cache_root = HF_HUB_CACHE
+    ref = (Path(cache_root)
+           / f"models--{base_model.replace('/', '--')}" / "refs" / "main")
+    return ref.read_text(encoding="utf-8").strip() if ref.is_file() else None
+
+
+def pin_main_ref(base_model: str, revision: str,
+                 cache_root: str | Path | None = None) -> None:
+    """Point `main` at the pinned commit inside the local cache.
+
+    Downloading at an explicit commit writes no ref, so this is the step that
+    makes the pin usable rather than merely present. Safe only because the
+    process goes offline straight after: nothing can refresh it.
+    """
+    if cache_root is None:
+        from huggingface_hub.constants import HF_HUB_CACHE
+
+        cache_root = HF_HUB_CACHE
+    refs = Path(cache_root) / f"models--{base_model.replace('/', '--')}" / "refs"
+    refs.mkdir(parents=True, exist_ok=True)
+    (refs / "main").write_text(revision, encoding="utf-8")
+
+
 def prefetch_pinned(model: str, revision: str,
                     base_model: str, base_revision: str) -> None:
     """Populate the cache with exactly the pinned commits of both repos.
@@ -243,6 +277,7 @@ def prefetch_pinned(model: str, revision: str,
     # takes its weights and tokenizer from the checkpoint above.
     snapshot_download(base_model, revision=base_revision,
                       allow_patterns=["config.json"])
+    pin_main_ref(base_model, base_revision)
     log.info("prefetched %s@%s and %s@%s", model, revision[:12],
              base_model, base_revision[:12])
 
