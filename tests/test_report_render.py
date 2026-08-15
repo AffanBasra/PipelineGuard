@@ -219,6 +219,78 @@ def test_limitations_state_what_the_report_cannot_show() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Stream-only prose
+#
+# A file scan has no broker, no audit table and no review topic. Sentences
+# asserting those are false about it, and a governance document that overstates
+# its own coverage is the one failure mode the whole section exists to avoid.
+#
+# These are claims about *this run*. The compliance appendix names Kafka topics
+# too, but it is explicitly scoped to the pipeline, so it is checked separately
+# below rather than banned by keyword.
+# --------------------------------------------------------------------------- #
+_STREAM_ONLY = ["at-least-once", "queue itself is held in", "Kafka offsets",
+                "consumer lag", "what entered the pipeline",
+                "what reached the pipeline", "the pipeline saw and did"]
+
+
+@pytest.mark.parametrize("renderer", [report.render, report.render_summary])
+def test_a_file_scan_report_claims_no_broker_and_no_audit_trail(renderer) -> None:
+    out = renderer(make_data(from_stream=False))
+    present = [phrase for phrase in _STREAM_ONLY if phrase in out]
+    assert present == [], f"stream-only prose in a file-scan report: {present}"
+
+
+@pytest.mark.parametrize("renderer", [report.render, report.render_summary])
+def test_a_stream_report_still_says_all_of_it(renderer) -> None:
+    """The flag must narrow the file-scan document, not quietly thin the real
+    one -- the stream report is the artefact the CLI writes."""
+    out = renderer(make_data())
+    assert "at-least-once" in out
+    assert "pipeline" in out
+
+
+def test_a_file_scan_report_scopes_the_system_properties_to_the_pipeline() -> None:
+    """The compliance passages stay -- they explain why detection behaves as it
+    does -- but they describe the pipeline, and must say so unprompted."""
+    for out in (report.render(make_data(from_stream=False)),
+                report.render_summary(make_data(from_stream=False))):
+        assert "None of it describes what happened to the scanned file" in out
+
+
+def test_from_stream_defaults_to_true() -> None:
+    """Every existing caller builds stream data, so the default must not
+    silently reclassify the audit-trail report as a file scan."""
+    assert make_data().from_stream is True
+
+
+# --------------------------------------------------------------------------- #
+# Example stamping
+# --------------------------------------------------------------------------- #
+def test_stamp_example_marks_the_title_the_source_and_adds_a_banner() -> None:
+    out = report.stamp_example(report.render_summary(make_data()))
+    assert out.splitlines()[0].endswith("(example)")
+    assert "This is an example, not a report of your data." in out
+    assert "-- a stored example run" in out
+
+
+def test_stamp_example_banner_precedes_every_figure() -> None:
+    """It has to be readable before the numbers are, or someone skimming page
+    one has already believed the report by the time they reach it."""
+    out = report.stamp_example(report.render_summary(make_data()))
+    assert out.index("This is an example") < out.index("Records scanned")
+
+
+def test_stamp_example_keeps_the_body_intact() -> None:
+    """A stamp, not a rewrite: every section of the stored run must survive."""
+    original = report.render_summary(make_data())
+    stamped = report.stamp_example(original)
+    for line in original.splitlines():
+        if line.startswith("## "):
+            assert line in stamped
+
+
+# --------------------------------------------------------------------------- #
 # CLI wiring
 #
 # main() builds its own connection, so these patch psycopg.connect and

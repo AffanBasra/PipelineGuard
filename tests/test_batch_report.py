@@ -179,6 +179,23 @@ def test_report_names_the_uploaded_file_not_the_audit_trail():
     assert "audit trail (`messages_processed`" not in out
 
 
+def test_a_batch_is_marked_as_not_coming_from_the_stream():
+    """One flag drives every pipeline-only passage in both renderers, so this
+    is the single point where a file scan could start describing a broker it
+    does not have."""
+    assert build(result(finding("CNIC"))).from_stream is False
+
+
+@pytest.mark.parametrize("renderer", [report.render, report.render_summary])
+def test_neither_batch_document_describes_a_broker(renderer):
+    """The end of the wire, not the flag: whatever the UI hands a user must be
+    true of the file they uploaded."""
+    out = renderer(build(result(finding("CNIC")), result()))
+    assert "at-least-once" not in out
+    assert "Kafka offsets" not in out
+    assert "queue itself is held in" not in out
+
+
 def markdown(*results, **kwargs) -> str:
     source_name = kwargs.pop("source_name", "memos.csv")
     data = build(*results, source_name=source_name,

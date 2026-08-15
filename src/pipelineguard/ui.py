@@ -702,6 +702,12 @@ elif section == "Batch scan":
             )
 
         stem = name.rsplit(".", 1)[0]
+        st.caption(
+            "Two documents from the same scan. The redaction report is the "
+            "technical artefact and lists every row. The executive summary is "
+            "the governance view of the same figures, written for a reader who "
+            "needs the numbers first and the statute last."
+        )
         left, right = st.columns(2)
         left.download_button("Download Redaction Report (Markdown)", markdown,
                              file_name=f"{stem}-redaction-report.md",
@@ -714,35 +720,57 @@ elif section == "Batch scan":
         except ImportError:
             right.info("PDF export needs `pip install '.[ui]'`.")
 
+        summary = report.render_summary(data)
+        left, right = st.columns(2)
+        left.download_button("Download Executive Summary (Markdown)", summary,
+                             file_name=f"{stem}-executive-summary.md",
+                             mime="text/markdown", width="stretch")
+        try:
+            right.download_button(
+                "Download Executive Summary (PDF)",
+                batch_report.markdown_to_pdf(
+                    summary, title="Data Governance Summary",
+                    orientation="portrait"),
+                file_name=f"{stem}-executive-summary.pdf",
+                mime="application/pdf", width="stretch")
+        except ImportError:
+            right.info("PDF export needs `pip install '.[ui]'`.")
+
 elif section == "Governance report" and DEMO:
     # No broker and no database on the demo, so there is no live audit trail to
     # read. Showing a stored run is honest; a Connect button that always fails
     # would teach a visitor nothing.
-    st.subheader("Governance report")
+    st.subheader("Example governance report")
     st.caption(
         "Normally this reads the Postgres audit trail the running pipeline "
         "writes. The demo has no pipeline behind it, so this is a stored run "
         f"over {SAMPLE_RECORDS} synthetic records — real output, not a mockup."
     )
+    st.info("This is not your scan. For a report on the file you uploaded, "
+            "use **Batch scan**.", icon=":material/info:")
     sample = SAMPLE_SUMMARY.read_text(encoding="utf-8") if SAMPLE_SUMMARY.exists() else ""
     if not sample:
         st.warning("The stored example is missing from this build.")
     else:
+        # Stamped before it is handed to the download buttons, not only on the
+        # page: a file that leaves the browser must carry its own provenance,
+        # because whoever opens it later cannot see this caption.
+        stamped = report.stamp_example(sample)
         left, right = st.columns(2)
-        left.download_button("Download report (Markdown)", sample,
-                             file_name="governance-summary.md",
+        left.download_button("Download example (Markdown)", stamped,
+                             file_name="governance-summary-example.md",
                              mime="text/markdown", width="stretch")
         try:
             right.download_button(
-                "Download report (PDF)",
+                "Download example (PDF)",
                 batch_report.markdown_to_pdf(
-                    sample, title="Data Governance Summary",
+                    stamped, title="Data Governance Summary (example)",
                     orientation="portrait"),
-                file_name="governance-summary.pdf",
+                file_name="governance-summary-example.pdf",
                 mime="application/pdf", width="stretch")
         except ImportError:
             right.info("PDF export needs `pip install '.[ui]'`.")
-        st.markdown(sample.replace(report.PAGE_BREAK, "---"))
+        st.markdown(stamped.replace(report.PAGE_BREAK, "---"))
 
 elif section == "Governance report":
     st.subheader("Governance report from the audit trail")

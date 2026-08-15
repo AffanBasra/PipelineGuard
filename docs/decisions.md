@@ -225,6 +225,31 @@ without knowing what was scanned. An engineer reads the same lines as volume,
 lineage and tier economics. One set of facts, legible to both, rather than a
 compliance report with a dashboard bolted on.
 
+**A report says which of the two systems produced it.** *(settled)*
+`ReportData` carries `source` and `from_stream`. `source` fixed the header line;
+`from_stream` fixes the prose. The renderers were written against a Kafka run
+and asserted things a file scan does not do — that delivery is at-least-once,
+that the review queue sits in `txn.quarantine`, that the audit trail recorded
+what happened. All of that is false about a CSV dragged into the UI, and it was
+shipping in the batch report before this flag existed.
+
+The compliance passages are kept for a file scan rather than dropped: they
+explain why detection behaves as it does, and the scan runs the same detectors.
+What changes is that they are introduced as a description of the pipeline, not
+of the scan. The distinction is the whole point — a governance document that
+overstates its own coverage is worse than none, which its own Limitations
+section says.
+
+**The demo's stored governance report is stamped as an example inside the
+file.** *(settled)*
+The demo has no database, so its governance tab renders a stored run over 5,000
+synthetic records. A caption on the page is not enough: the download leaves the
+browser and is read later, out of context, by someone who never saw the caption.
+`report.stamp_example()` marks the title, the source line and adds a banner
+above the first figure. The session-scoped artefact — the one that *is* about
+the visitor's own upload — is the Batch scan tab, which now offers the same
+executive summary over their file.
+
 ---
 
 ## 2. Data generation
