@@ -2866,3 +2866,87 @@ addresses into separate fields; real remittance narration does not.
   entity-type accuracy is the product.
 - **`_MAX_BRIDGE` is still 32 characters and still unaware of context.** Two
   distinct addresses closer than that still merge into one span.
+
+---
+
+## 27. Neither checkpoint fits a 1 GB host
+
+Hugging Face paywalled Docker Spaces, so Streamlit Community Cloud became the
+candidate host for the public demo. It caps an app at roughly **1 GB of RAM**.
+The question asked was whether swapping `gliner_medium-v2.5` for
+`gliner_small-v2.5` buys enough headroom to fit.
+
+It does not, and the reason is not the checkpoint.
+
+### 27.1 Measured
+
+`scripts/probe_model_footprint.py`, run inside the demo image so the
+environment matches the target: Linux, Python 3.12, **torch 2.13.0+cpu**,
+gliner 0.2.28, CPU only. RSS via psutil, sampled on a thread at 5 ms because a
+forward pass allocates and frees inside one call. 50 generated memos per pass,
+three timed passes, median reported.
+
+| | medium-v2.5 | small-v2.5 |
+|---|---:|---:|
+| torch + gliner, no weights | 356 MB | 356 MB |
+| added by the weights | 1,424 MB | 1,100 MB |
+| **resting** | **1,780 MB** | **1,456 MB** |
+| peak during load | 2,143 MB | 1,819 MB |
+| peak during inference | 1,790 MB | 1,461 MB |
+| latency | 93.7 ms/rec | **55.3 ms/rec** |
+| headroom against 1,024 MB | **-766 MB** | **-437 MB** |
+
+The swap saves 329 MB and is still 437 MB over. It also **halves latency**,
+which is a real result -- just not one that answers this question.
+
+Coverage over the 237 locale cases from §12, scored with the same
+`char_coverage`, at four thresholds:
+
+| model | threshold | PERSON complete | ADDRESS complete |
+|---|---:|---:|---:|
+| medium | 0.55 (shipped) | 99.4% | 100.0% |
+| medium | 0.45 | 100.0% | 100.0% |
+| small | 0.55 | 98.8% | 100.0% |
+| small | 0.25 | 98.8% | 100.0% |
+
+`small` costs 0.6 points of complete PERSON redaction and nothing on ADDRESS.
+For a host that could hold it, that is a cheap trade for 1.7x the speed.
+
+### 27.2 The floor is torch, not the model
+
+**356 MB is spent before any checkpoint is chosen.** That is the interpreter
+with torch and gliner imported and no weights loaded, and no model swap moves
+it. The remaining budget for weights, the load spike, Streamlit's own runtime
+and the app is 668 MB; `small` alone wants 1,100 MB of it.
+
+Two measurement mistakes were made first and are recorded because both would
+have produced a confident wrong answer:
+
+- **The baseline was taken before torch was imported.** The project imports
+  torch lazily inside `load()`, so the entire torch import was charged to the
+  weights -- reporting a 44M-parameter backbone as 1.8 GB.
+- **Resting RSS was read immediately after `load()`**, which ends with a
+  warm-up batch. That is a high-water mark, not a resting one; Windows then
+  trimmed the working set and the later peak read *lower* than "resting",
+  producing a negative inference spike.
+
+### 27.3 Not allocator fragmentation
+
+`model_mb` at roughly twice the fp32 weight size suggested glibc arenas holding
+freed load buffers. Re-run with `MALLOC_ARENA_MAX=2`: **1,452 MB against 1,456
+MB**, inside noise. The allocation is real, so the cheap environment fix does
+not exist.
+
+### 27.4 What is left
+
+- **Rules only on the deployed demo.** Tier 1 is regex and fits trivially, but
+  Tier 2 is the half worth showing.
+- **Shrink the model.** `GLiNER.from_pretrained` accepts `dtype`, `variant`
+  (the repos ship `model.fp16.safetensors` and `model.bf16.safetensors`),
+  `low_cpu_mem_usage` and `quantize`. Unmeasured here. §7 already warns that
+  DeBERTa loses accuracy at int8 without quantization-aware training, so any of
+  these has to be scored on the same cases before it counts.
+- **A host with more memory.** The demo image already runs on one.
+
+Streamlit Community Cloud is ruled out for the encoder build on this evidence.
+It is not ruled out for a rules-only build.
