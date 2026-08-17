@@ -2,7 +2,12 @@
 
 Run from the repo root so Streamlit finds .streamlit/config.toml:
 
-    HF_HUB_OFFLINE=1 python -m streamlit run src/pipelineguard/ui.py
+    HF_HUB_OFFLINE=1 python -m streamlit run src/pipelineguard/ui.py \
+        --server.address localhost
+
+`--server.address localhost` is not decoration: Streamlit otherwise binds every
+interface and prints a LAN-reachable URL. It lives in the command rather than in
+.streamlit/config.toml because a hosted build reads that file too.
 
 Local only, by design. docs/decisions.md section 1 rules out a hosted service
 that accepts uploads: taking third-party documents would make this project a
@@ -53,9 +58,10 @@ SAMPLE_RECORDS = "5,000"
 # (docs/tier2-detection-findings.md sections 11 and 18). 500 rows is ~8 seconds;
 # 2000 would be ~32, which reads as a hang.
 #
-# The demo runs on a shared 2-vCPU box at ~95 ms/record, and detection takes a
-# global lock, so one big scan stalls every other visitor. 100 rows is ~10 s.
-MAX_ROWS = 100 if DEMO else 500
+# The demo runs bf16 on a shared CPU box at ~225 ms/record (findings §27.5), and
+# detection takes a global lock, so one big scan stalls every other visitor.
+# Half the fp32 rows for the same ~11 s wait: the memory saving costs latency.
+MAX_ROWS = 50 if DEMO else 500
 
 # A dead broker is not refused, it is unanswered, so psycopg waits out its
 # default timeout -- 10s of a UI that looks broken. Fail fast and say why.
@@ -605,7 +611,7 @@ elif section == "Batch scan":
     if DEMO:
         st.caption(
             f"Up to {MAX_ROWS:,} rows. On this shared machine the encoder runs "
-            "at about 95 ms per row, so a full batch takes roughly 10 seconds."
+            "at about 225 ms per row, so a full batch takes roughly 11 seconds."
         )
         st.info(PRIVACY_NOTICE, icon=":material/lock:")
     else:

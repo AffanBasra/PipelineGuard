@@ -107,11 +107,58 @@ people in the Union or monitoring them, which a demo aimed at neither does; the
 instruments that actually apply are the ones `compliance.py` already cites.
 
 The demo is a *different build*, not the same one exposed. `PG_DEMO=1` caps the
-batch at 100 rows, removes the threshold and widener controls, swaps the live
-governance tab for a stored run, and shows the privacy notice. The two removed
-controls are not cosmetic: `tier2_settings` takes a global lock only when a
-setting is overridden, so leaving them alone is what stops one visitor's scan
-queueing behind another's.
+batch, removes the threshold and widener controls, swaps the live governance tab
+for a stored run, and shows the privacy notice. The two removed controls are not
+cosmetic: `tier2_settings` takes a global lock only when a setting is
+overridden, so leaving them alone is what stops one visitor's scan queueing
+behind another's.
+
+**The demo runs bf16 on Streamlit Community Cloud, and the pin still holds.**
+*(settled, 2026-08-17)*
+Hugging Face paywalled the Docker and Gradio Space SDKs, so the free host is now
+Streamlit Community Cloud at roughly 1 GB of memory per app. The shipped fp32
+`gliner_medium-v2.5` needs 1,780 MB resident and does not fit. Three options
+were measured (findings §27):
+
+| | fits | same checkpoint | cost |
+|---|---|---|---|
+| `medium` bf16 | 845 MB, ~70 MB spare | **yes** | 2.4x latency |
+| `small` bf16 | 735 MB, ~160 MB spare | no | threshold must be re-swept |
+| `medium` fp32 on a paid host | yes | yes | a card, and slow cold starts |
+
+**`medium` bf16 wins because the precision is not the model.** fp32, fp16 and
+bf16 all live in the same commit, so the revision pin covers the bf16 weights
+exactly as it covers the fp32 ones. Coverage is identical to one decimal place
+on both entity types. Moving to `small` would be a checkpoint change, and §6.1's
+rule -- a threshold is an uncalibrated sigmoid cutoff and does not transfer --
+would make the shipped 0.55 meaningless without a re-sweep. Keeping the demo and
+the pipeline on the same weights is worth 90 MB of headroom.
+
+**70 MB of headroom is thin, and is recorded as thin.** It was measured against
+short generated memos; a single long pasted document is untested. The fallback
+is `small` bf16 with its own sweep, and the trigger is the host reporting
+resource limits.
+
+Rejected: int8. Coverage collapses to 7.6% PERSON and 4.9% ADDRESS, and it does
+not even save memory -- torchao's dynamic path keeps the fp32 weights alongside
+the quantized ones. Recorded because it was measured, not because it is a
+choice.
+
+Consequence for the code: Community Cloud has no build step, so
+`deploy/streamlit-cloud/app.py` does at boot what the Dockerfile does at build
+-- prefetch the pinned commits, then `prefetch.go_offline()`. That helper flips
+`huggingface_hub.constants` as well as the environment variable, because the
+library reads the variable into a module constant at import time and the app has
+to download before it can freeze. If the prefetch fails the app runs online and
+unpinned rather than not at all, and says so on the page.
+
+Also a consequence: `.streamlit/config.toml` no longer sets
+`server.address = "localhost"`. Streamlit reads that file from the working
+directory, so a hosted build read it too, and an app bound to loopback can be
+unreachable through a platform's proxy. Loopback moved into the documented local
+launch command, which is weaker -- a bare `streamlit run` now binds every
+interface -- and that is the accepted cost of not having a config that breaks
+the deployment it is committed alongside.
 
 Rejected: keeping the uploader but relying on a "do not upload real PII"
 banner alone. A disclaimer is a wish, not a control. It is still shown, because
@@ -249,6 +296,13 @@ browser and is read later, out of context, by someone who never saw the caption.
 above the first figure. The session-scoped artefact — the one that *is* about
 the visitor's own upload — is the Batch scan tab, which now offers the same
 executive summary over their file.
+
+The banner also carries the repository URL and the script that generated the
+file, and says to cite the repository rather than the document. Provenance and
+attribution are different problems: knowing a file is an example stops a reader
+believing it is about them, but it still leaves them holding a governance report
+with no way to check a figure or reference it. Only the first was solved
+originally.
 
 ---
 

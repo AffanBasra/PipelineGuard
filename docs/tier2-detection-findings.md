@@ -3007,3 +3007,35 @@ Against the 1,024 MB ceiling, with the model peak from §27.5:
 Both fit on paper. 70 MB is not enough margin to bet a public demo on, so the
 medium build would need its peak measured under a real session before it could
 be trusted, not a synthetic batch of short generated memos.
+
+### 27.7 The bf16 path works end to end, and the pin survives it
+
+§27.5 measured the weights. This checks the thing that actually ships: the
+pinned prefetch, `prefetch.go_offline()`, and a bf16 load in one process, which
+is the sequence a host with no build step has to run at every cold boot.
+
+```
+fast path: ref already pinned
+offline constant: True
+offline env     : 1
+weight dtype: torch.bfloat16
+  PERSON_NAME  0.96  'Ayesha Malik'
+  ADDRESS      0.93  'CNIC 42101-1234567-8, Plot E-379, Airport Road, Quetta'
+```
+
+Three things confirmed:
+
+- **The offline flip is real.** `huggingface_hub` reads `HF_HUB_OFFLINE` into a
+  module constant at import time, so setting only the environment variable after
+  the download does nothing. `go_offline()` sets both, and
+  `constants.is_offline_mode()` returns True afterwards -- which is what every
+  network path in the library consults.
+- **The pin resolves under bf16.** Same repo, same commit, different weight file.
+  `variant="bf16"` does not change what the revision points at.
+- **The known §24.5 wart is unchanged**, not introduced by the precision change:
+  the encoder sweeps the CNIC into the ADDRESS span. Redaction is unaffected,
+  because Tier 1 claims those characters exactly and `merge_spans` unions them.
+
+Run on the development machine, whose torch carries CUDA libraries, so the
+1,211 MB RSS observed there is not comparable to §27.5's container figures. The
+dtype and the detections are what this checks; the memory numbers are §27.5's.

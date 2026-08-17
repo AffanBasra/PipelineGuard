@@ -56,3 +56,24 @@ def test_prefetch_still_warns_about_an_extra_cached_commit(fake_cache):
     fake_cache(snapshots=["0" * 40, settings.tier2_base_revision],
                main_ref=settings.tier2_base_revision)
     assert prefetch.main([]) == 1
+
+
+def test_go_offline_closes_the_network_for_an_already_imported_library(
+        monkeypatch):
+    """The environment variable on its own is not enough once huggingface_hub is
+    imported: it reads the flag into a module constant at import time, and every
+    network path asks the constant. A host with no build step downloads and then
+    freezes inside one process, so the constant is the half that matters."""
+    from huggingface_hub import constants
+
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    monkeypatch.setattr(constants, "HF_HUB_OFFLINE", False)
+    assert constants.is_offline_mode() is False
+
+    prefetch.go_offline()
+
+    assert constants.is_offline_mode() is True
+    # The variable too, for child processes and for the UI's provenance panel,
+    # which reports what the environment says.
+    import os
+    assert os.environ["HF_HUB_OFFLINE"] == "1"

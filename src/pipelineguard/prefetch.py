@@ -32,6 +32,25 @@ from pipelineguard.observability import setup_logging  # noqa: E402
 log = logging.getLogger("pipelineguard.prefetch")
 
 
+def go_offline() -> None:
+    """Forbid the network for the rest of this process.
+
+    For a host with no build step, where the fetch and the freeze happen in one
+    process. Setting only the environment variable is too late by then:
+    huggingface_hub reads it into a module constant at import time, and every
+    network path consults the constant. So set both -- the constant for this
+    process, the variable for anything it spawns and for the UI to report.
+
+    Only correct straight after a successful prefetch. Before one it turns a
+    cold cache into a baffling error instead of a download.
+    """
+    from huggingface_hub import constants
+
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    constants.HF_HUB_OFFLINE = True
+    log.info("offline: the cache is now the only source the pin can resolve to")
+
+
 def main(argv: list[str] | None = None) -> int:
     setup_logging("INFO")
 

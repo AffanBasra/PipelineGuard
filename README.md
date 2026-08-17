@@ -94,7 +94,7 @@ pick one.
 | You want | Run | You get |
 |---|---|---|
 | **The pipeline** — Part 1 | `docker compose up -d` | Kafka, the processor, a Postgres audit trail, a governance report. No UI. |
-| **Just the detectors** — Part 2 | `streamlit run src/pipelineguard/ui.py` | Playground, batch file scan, exportable reports. **No broker, no database, nothing written to disk.** |
+| **Just the detectors** — Part 2 | `streamlit run src/pipelineguard/ui.py --server.address localhost` | Playground, batch file scan, exportable reports. **No broker, no database, nothing written to disk.** |
 
 ## Status
 
@@ -328,6 +328,74 @@ It prints the redacted output, every finding with its tier and confidence, and
 how the overlapping spans merge. Without `--tier2` you get the rules only, which
 match formats — a name or address in free text needs the encoder.
 
+### Which checkpoint, and why
+
+Four encoders were scored on the same cases before one was picked. Character
+coverage — the fraction of a gold span's characters the model claims — not
+classic recall, because a half-redacted address is a leak and precision/recall
+scores it as a hit.
+
+| model | licence | PERSON | ADDRESS |
+|---|---|---:|---:|
+| [**gliner-community/gliner_medium-v2.5**](https://huggingface.co/gliner-community/gliner_medium-v2.5) | Apache-2.0 | **100.0%** | **86.5%** |
+| [urchade/gliner_multi_pii-v1](https://huggingface.co/urchade/gliner_multi_pii-v1) | Apache-2.0 | 99.4% | 75.3% |
+| [nvidia/gliner-PII](https://huggingface.co/nvidia/gliner-PII) | NVIDIA OM | 91.1% | 74.7% |
+| [FacebookAI/xlm-roberta-large-…-conll03](https://huggingface.co/FacebookAI/xlm-roberta-large-finetuned-conll03-english) | MIT | 93.8% | 52.3% |
+
+PERSON is 165 synthetic name cases; ADDRESS is **91,663 real addresses across
+eight Pakistani cities**, fetched from OpenStreetMap via Overpass. Names stay
+synthetic because `decisions.md` §1 forbids processing real personal data, so
+those numbers are comparable to the tuning set rather than independent of it —
+a real limit on what the PERSON column proves (findings §15).
+
+Three things this table hides, and each of them changed a decision:
+
+- **The name a model is marketed under predicts nothing.** `nvidia/gliner-PII`
+  is the one built for PII and it placed third on both axes. The general-purpose
+  community checkpoint won.
+- **A checkpoint swap beat fine-tuning.** The gap between first and last here is
+  34 points of ADDRESS coverage. No fine-tune was attempted, because the
+  remaining residual turned out to be positional — separators, house numbers,
+  trailing cities — and four span rules reached it (findings §17, §18, §21, §23).
+- **The comparison is only valid per checkpoint at its own threshold.** The
+  cutoff is an uncalibrated sigmoid output, not a probability. Scoring every
+  model at one shared number measures the number, not the models.
+
+A fifth was measured for the demo host: [`gliner_small-v2.5`](https://huggingface.co/gliner-community/gliner_small-v2.5)
+costs 0.6 points of complete PERSON redaction and nothing on ADDRESS, for 1.7×
+the speed and 324 MB less memory. Not shipped in the pipeline, which has the
+memory; kept as the fallback if the demo host cannot hold `medium`.
+
+### Weight precision — fp32, bf16, fp16, int8
+
+The checkpoint ships fp32, fp16 and bf16 weights in the same commit, so the
+precision is a deployment choice rather than a different model — the pin still
+holds. Measured on CPU torch in a Linux container, 50 memos per pass
+(findings §27.5, `scripts/probe_model_footprint.py`):
+
+| weights | resting RAM | peak | ms/record | PERSON | ADDRESS |
+|---|---:|---:|---:|---:|---:|
+| `medium` fp32 — the pipeline | 1,780 MB | 1,790 MB | 94 | 99.4% | 100.0% |
+| **`medium` bf16 — the demo** | **845 MB** | **858 MB** | 225 | 99.4% | 100.0% |
+| `small` fp32 | 1,456 MB | 1,461 MB | 55 | 99.3% | 100.0% |
+| `small` bf16 | 735 MB | 768 MB | 142 | 99.3% | 100.0% |
+| `small` fp16 | 741 MB | 752 MB | 296 | 99.3% | 100.0% |
+| `small` int8 | 1,569 MB | 1,574 MB | **26** | **7.6%** | **4.9%** |
+
+- **bf16 halves the memory and costs nothing measurable in coverage.** Both
+  entity types score identically to fp32 to one decimal place. The price is
+  ~2.5× latency: CPUs do fp32 natively and convert bf16 on the fly.
+- **fp16 is strictly dominated.** Same memory as bf16, twice the latency again.
+  There is no configuration here where it is the right choice.
+- **int8 is not a trade-off, it is a failure.** Coverage collapses to 7.6% and
+  4.9%, and it does not even save memory — torchao's dynamic path holds the fp32
+  weights alongside the quantized ones. Fast and useless. It is in the table
+  because it was measured and rejected, not because it is an option.
+
+`TIER2_VARIANT=bf16` selects it; empty means fp32, which is what the pipeline
+runs. `low_cpu_mem_usage` is set alongside it, or torch materialises a
+full-precision copy while loading and the peak erases the saving.
+
 
 ## Observability
 
@@ -461,7 +529,8 @@ an uploaded CSV or TXT, and render the governance report from the audit trail.
 
 ```bash
 pip install -e ".[ui]"                 # into an env that already has [tier2]
-HF_HUB_OFFLINE=1 python -m streamlit run src/pipelineguard/ui.py
+HF_HUB_OFFLINE=1 python -m streamlit run src/pipelineguard/ui.py \
+    --server.address localhost
 ```
 
 Run it from the repo root, which is where Streamlit reads
@@ -469,10 +538,12 @@ Run it from the repo root, which is where Streamlit reads
 resolving `torch>=2.13` again can replace a working CUDA build with the CPU
 wheel from PyPI.
 
-**Local only, and enforced.** `.streamlit/config.toml` binds the server to
-`localhost`; without that Streamlit binds every interface and advertises a LAN
-URL. The demo build overrides it on the command line, which is the one
-deliberate exception — see [The public demo](#the-public-demo).
+**Local only.** `--server.address localhost` is part of the command, not
+decoration: without it Streamlit binds every interface and advertises a LAN URL.
+It is in the command rather than in `.streamlit/config.toml` because a hosted
+build reads that file from the same working directory, and an app bound to
+loopback can be unreachable through a platform's proxy. The hosted demo is the
+deliberate exception either way — see [The public demo](#the-public-demo).
 
 | Tab | What it does |
 |---|---|
@@ -524,15 +595,16 @@ Flagging fully-saturated redactions is the open mitigation.
      ![PipelineGuard scanning a memo](docs/demo.gif)
 -->
 
-A cut-down build is packaged as a container image for a Docker-SDK host such as
-a Hugging Face Space. **It is built and verified locally, and not deployed
-anywhere yet** — see the comment above for what is still missing. It is a
-different build, not the same one exposed: `PG_DEMO=1` changes five things, and
-they are the difference between "local tool" and "thing strangers can reach":
+A cut-down build, targeting **Streamlit Community Cloud**. **It is built and
+verified locally, and not deployed anywhere yet** — see the comment above for
+what is still missing. It is a different build, not the same one exposed:
+`PG_DEMO=1` changes five things, and they are the difference between "local
+tool" and "thing strangers can reach":
 
 | | local | demo |
 |---|---|---|
-| Batch cap | 500 rows | **100** — CPU is ~95 ms/row and scans serialise |
+| Batch cap | 500 rows | **50** — bf16 on CPU is ~225 ms/row and scans serialise |
+| Encoder precision | fp32 | **bf16** — 845 MB instead of 1,780, same coverage |
 | Threshold slider | shown | **removed** — any override takes the global lock, so leaving it alone lets visitors scan concurrently |
 | Span-widener toggle | shown | removed, same reason |
 | Governance tab | live Postgres | a stored run, `docs/sample-summary.md`, stamped as an example in the file itself |
@@ -542,7 +614,10 @@ The stamp on the stored report matters more than it looks. The tab explains
 that it is an example over 5,000 synthetic records, but a downloaded PDF is
 read later and out of context, by someone who never saw the tab.
 `report.stamp_example()` marks the title, the source line and puts a banner
-above the first figure, so the file carries its own provenance.
+above the first figure, so the file carries its own provenance. The banner names
+this repository and the script that generated it, and says to cite the
+repository rather than the document — a reader holding only the PDF otherwise
+has a governance report with no way to check a figure or attribute it.
 
 **The report about your own upload is in Batch scan**, not here. That one is
 built from the rows you submitted; this one is a recording of the pipeline.
@@ -553,44 +628,73 @@ a scan the rows are dropped from session state by `ScanResult.without_text()`,
 which keeps every figure already computed and discards the text. A test asserts
 the original cannot survive it.
 
-### Building it
+### Where it runs, and why there
+
+Hugging Face was the plan. Its Docker and Gradio SDKs now require a paid PRO
+account, so the free path there is gone and **Streamlit Community Cloud** is the
+target. Full instructions: [`deploy/streamlit-cloud/README.md`](deploy/streamlit-cloud/README.md).
+
+```
+Repository       AffanBasra/PipelineGuard
+Main file path   deploy/streamlit-cloud/app.py
+Advanced         nothing — app.py carries the whole configuration
+```
+
+That host costs two things.
+
+**A 1 GB memory ceiling**, which the shipped fp32 checkpoint misses by 766 MB.
+The bf16 weights in the same commit fit at 845 MB resting, with coverage
+unchanged — see [Weight precision](#weight-precision--fp32-bf16-fp16-int8).
+Add ~96 MB for Streamlit, pandas and Arrow and the total is ~950 MB against
+~1,024. **That is 70 MB of headroom and it is thin**; the untested case is one
+long pasted document rather than the short memos the probe measured. If it
+starts hitting resource limits the fallback is `gliner_small-v2.5` in bf16,
+which leaves 160 MB — a different checkpoint, so its threshold has to be
+re-swept before it can be trusted.
+
+**No build step.** Community Cloud installs a requirements file and runs one
+script, so the pin cannot be warmed at build time. GLiNER resolves its backbone
+config at `main` and accepts no revision, so the only way to pin it is to warm
+the cache with the right commit and then forbid the network (findings §25).
+`deploy/streamlit-cloud/app.py` does both at boot instead: prefetch, then
+`prefetch.go_offline()`, before anything imports huggingface_hub — which reads
+the offline flag into a module constant at import time, so the environment
+variable alone is too late. If the prefetch fails the app runs online and
+**unpinned**, and says so on the page and in the sidebar rather than dying.
+
+The boot download is ~415 MB, not the repo's 1.6 GB, because the checkpoint
+carries fp32, fp16 and bf16 side by side and this build reads one of them.
+
+### The container build
+
+Still supported, and the better option on any Docker host with more than 1 GB:
+it bakes the weights into the image, needs no boot-time download, and runs fp32.
 
 ```bash
 docker build -f deploy/hf-space/Dockerfile -t pipelineguard-demo .
 docker run --rm -p 7860:7860 pipelineguard-demo
 ```
 
-Docker SDK rather than the Streamlit SDK for one reason: a build step. GLiNER
-resolves its backbone config at `main` and passes no revision, so the only way
-to pin it is to warm the cache with the right commit and then forbid the
-network (findings §25). `python -m pipelineguard.prefetch` runs at build time
-and `HF_HUB_OFFLINE=1` is set for runtime. Without that the demo would run
-unpinned and its own sidebar would say so.
-
-The weights are baked into the image rather than fetched on first boot. A Space
-downloading 1.6 GB while someone watches is a bad first impression.
-
-`deploy/hf-space/README.md` is the Space card — copy it to the Space root along
-with the Dockerfile.
+`deploy/hf-space/README.md` is the Space card, for a Docker host that wants one.
 
 ### What it costs a visitor
 
-| | |
-|---|---|
-| First load after idle | 30–50 s: container wake plus a 15 s encoder load |
-| Playground scan | ~0.1 s once warm |
-| 100-row batch | ~10 s, during which other visitors queue |
-| Memory | ~1.9 GB, inside CPU Basic's 16 GB |
+| | Streamlit Cloud (bf16) | container (fp32) |
+|---|---|---|
+| First load after idle | 40–60 s: wake plus a ~20 s encoder load | 30–50 s |
+| Playground scan | ~0.2 s once warm | ~0.1 s |
+| Full batch | 50 rows, ~11 s, others queue | 100 rows, ~10 s |
+| Memory | ~950 MB against ~1,024 | ~1.9 GB |
 
 Tier 1 answers while the encoder is still loading, so the page is useful before
 it finishes.
 
 ### Keeping it awake
 
-A Space sleeps when idle, and the wake plus encoder load is the 30–50 s above.
-An uptime monitor pinging the Space URL on a schedule keeps it warm, at the
-cost of holding free compute you are not using. Point it at the Space root; any
-200 counts.
+Both hosts sleep when idle, and the wake plus encoder load is the first row
+above. An uptime monitor pinging the app URL on a schedule keeps it warm, at the
+cost of holding free compute you are not using. Point it at the root; any 200
+counts.
 
 ### Regenerating the stored report
 
@@ -759,11 +863,15 @@ a copy of it.
 [1] db/init.sql                      audit schema (idempotent upserts by message_id)
 [1] scripts/create_topics.py         explicit topic creation + retention (auto-create disabled)
 [1] scripts/peek_topic.py            print recent messages on a topic (reads from the END)
-[2] deploy/hf-space/Dockerfile       the public demo image (CPU torch, weights baked in, pinned)
+[2] deploy/streamlit-cloud/app.py    the demo entry point — prefetch, go offline, hand over
+[2] deploy/streamlit-cloud/requirements.txt   what the host installs (CPU torch)
+[2] deploy/hf-space/Dockerfile       the demo image (CPU torch, weights baked in, pinned)
 [2] deploy/hf-space/README.md        the Space card
 [2] scripts/make_favicon.py          raster the shield for the browser tab
 [=] scripts/probe_ner_*.py           the Tier 2 measurement suite — model, threshold,
                                      runtime, precision, redaction damage
+[=] scripts/probe_model_footprint.py resident/peak RAM and coverage per checkpoint
+                                     and per weight precision
 [=] scripts/make_sample_summary.py   regenerate the stored report the demo renders
     src/pipelineguard/
 [=]   config.py                      env-driven settings

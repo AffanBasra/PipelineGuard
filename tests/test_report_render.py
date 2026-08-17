@@ -274,6 +274,15 @@ def test_stamp_example_marks_the_title_the_source_and_adds_a_banner() -> None:
     assert "-- a stored example run" in out
 
 
+def test_stamp_example_names_the_repository_it_came_from() -> None:
+    """A downloaded file is read away from the page that explained it. Without
+    the link the reader has a governance report and no way to check a figure or
+    cite it correctly."""
+    out = report.stamp_example(report.render_summary(make_data()))
+    assert report._EXAMPLE_REPO in out
+    assert out.index(report._EXAMPLE_REPO) < out.index("Records scanned")
+
+
 def test_stamp_example_banner_precedes_every_figure() -> None:
     """It has to be readable before the numbers are, or someone skimming page
     one has already believed the report by the time they reach it."""
