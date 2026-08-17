@@ -42,7 +42,7 @@ from pipelineguard.config import settings  # noqa: E402
 from pipelineguard.detectors.tier1_rules import RulesDetector  # noqa: E402
 from pipelineguard.models import Tier  # noqa: E402
 
-# Public demo build. Set on the hosted Space and nowhere else; every difference
+# Public demo build. Set on the hosted app and nowhere else; every difference
 # it makes is listed in decisions.md rather than scattered through this file.
 DEMO = os.getenv("PG_DEMO", "").strip().lower() in {"1", "true", "yes"}
 
@@ -485,7 +485,14 @@ with st.sidebar:
                            f"expected {settings.tier2_base_revision[:12]}.")
 
     st.divider()
+    # "This machine" is the visitor's laptop locally and a rented container on
+    # the demo, and only one of those is a privacy claim the visitor can check.
+    # decisions.md section 1 accepts that boundary; it must not be blurred here.
     st.caption(
+        "Read in memory on the server, scanned, and dropped when the scan "
+        "finishes. Nothing is written to disk, logged, or added to the audit "
+        "database — but the server is shared free hosting we do not own."
+        if DEMO else
         "Runs entirely on this machine. Nothing you type or upload leaves it, "
         "and nothing is written to the audit database from here."
     )
