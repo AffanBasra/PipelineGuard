@@ -404,6 +404,87 @@ def test_prefetch_pinned_records_main_as_well_as_downloading(tmp_path,
                                 cache_root=tmp_path) == _TUNED_FOR_BASE_REVISION
 
 
+def _load_with_fake_gliner(monkeypatch, **detector_kwargs) -> dict:
+    """Run `load()` against a stand-in GLiNER and return the kwargs it received.
+
+    A fake module rather than the real one so this stays runnable without the
+    tier2 extra, and so the assertion is about the call, not about weights.
+    """
+    import sys
+    import types
+
+    seen: dict = {}
+
+    def from_pretrained(model_id, **kwargs):
+        seen.update(kwargs)
+        return FakeGLiNER()
+
+    fake = types.ModuleType("gliner")
+    fake.GLiNER = types.SimpleNamespace(from_pretrained=from_pretrained)
+    monkeypatch.setitem(sys.modules, "gliner", fake)
+    monkeypatch.setattr(
+        "pipelineguard.detectors.tier2_encoder.resolve_device", lambda _: "cpu")
+
+    Tier2Detector(_TUNED_FOR, revision=_TUNED_FOR_REVISION, batch_size=1,
+                  **detector_kwargs).load()
+    return seen
+
+
+def test_load_asks_for_the_half_precision_weights_when_a_variant_is_set(
+        monkeypatch):
+    """bf16 is what makes the demo fit a 1 GB host (findings §27.5), and
+    low_cpu_mem_usage is not optional decoration: without it torch builds a
+    full-precision copy on the way in and the peak erases the saving."""
+    seen = _load_with_fake_gliner(monkeypatch, variant="bf16")
+    assert seen["variant"] == "bf16"
+    assert seen["low_cpu_mem_usage"] is True
+    assert seen["revision"] == _TUNED_FOR_REVISION
+
+
+def test_load_without_a_variant_asks_for_no_precision_override(monkeypatch):
+    """The pipeline still runs full precision. A variant leaking into the
+    default path would change the shipped detector without anyone choosing it."""
+    seen = _load_with_fake_gliner(monkeypatch)
+    assert "variant" not in seen
+    assert "low_cpu_mem_usage" not in seen
+
+
+def test_prefetch_skips_the_weight_files_a_variant_never_opens(tmp_path,
+                                                               monkeypatch):
+    """1.6 GB of weights for one 400 MB file that gets read. On a host that
+    downloads at boot rather than at build, that is the whole cold start."""
+    import huggingface_hub
+
+    calls = []
+    monkeypatch.setattr(huggingface_hub, "snapshot_download",
+                        lambda repo_id, **kw: calls.append((repo_id, kw)))
+    monkeypatch.setattr("huggingface_hub.constants.HF_HUB_CACHE", str(tmp_path))
+
+    prefetch_pinned(_TUNED_FOR, _TUNED_FOR_REVISION, _TUNED_FOR_BASE,
+                    _TUNED_FOR_BASE_REVISION, variant="bf16")
+
+    ignored = calls[0][1]["ignore_patterns"]
+    assert "model.bf16.safetensors" not in ignored
+    assert set(ignored) == {"model.fp16.safetensors", "pytorch_model.bin"}
+
+
+def test_prefetch_without_a_variant_fetches_every_weight_file(tmp_path,
+                                                              monkeypatch):
+    """The default build is unchanged. Filtering it would strip the fp32
+    weights the pipeline actually loads."""
+    import huggingface_hub
+
+    calls = []
+    monkeypatch.setattr(huggingface_hub, "snapshot_download",
+                        lambda repo_id, **kw: calls.append((repo_id, kw)))
+    monkeypatch.setattr("huggingface_hub.constants.HF_HUB_CACHE", str(tmp_path))
+
+    prefetch_pinned(_TUNED_FOR, _TUNED_FOR_REVISION, _TUNED_FOR_BASE,
+                    _TUNED_FOR_BASE_REVISION)
+
+    assert calls[0][1]["ignore_patterns"] is None
+
+
 def test_pin_main_ref_replaces_a_ref_left_by_an_earlier_download(tmp_path):
     """A cache that once tracked `main` already holds a ref, and it is the stale
     one that would silently win. Pinning has to overwrite, not skip."""

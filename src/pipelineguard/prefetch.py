@@ -50,7 +50,8 @@ def main(argv: list[str] | None = None) -> int:
 
     log.info("cache: %s", os.getenv("HF_HOME") or "(default)")
     prefetch_pinned(settings.tier2_model, settings.tier2_model_revision,
-                    settings.tier2_base_model, settings.tier2_base_revision)
+                    settings.tier2_base_model, settings.tier2_base_revision,
+                    variant=settings.tier2_variant)
 
     cached = cached_base_revisions(settings.tier2_base_model)
     main_ref = cached_main_revision(settings.tier2_base_model)

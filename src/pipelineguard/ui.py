@@ -241,7 +241,8 @@ def load_tier1() -> RulesDetector:
 
 
 @st.cache_resource(show_spinner=False)
-def encoder_slot(model: str, revision: str, device: str) -> dict:
+def encoder_slot(model: str, revision: str, device: str,
+                 variant: str | None) -> dict:
     """One mutable holder shared by every session and by the loader thread.
 
     cache_resource rather than a module global: Streamlit re-executes this file
@@ -252,7 +253,8 @@ def encoder_slot(model: str, revision: str, device: str) -> dict:
             "lock": threading.Lock()}
 
 
-def start_encoder(slot: dict, model: str, revision: str, device: str) -> None:
+def start_encoder(slot: dict, model: str, revision: str, device: str,
+                  variant: str | None) -> None:
     """Kick off the ~20 s load off the main thread, so Tier 1 stays usable.
 
     The worker must never touch `st`. Streamlit binds a script context to the
@@ -271,7 +273,7 @@ def start_encoder(slot: dict, model: str, revision: str, device: str) -> None:
             detector = Tier2Detector(model, threshold=settings.tier2_threshold,
                                      device=device,
                                      batch_size=settings.tier2_batch_size,
-                                     revision=revision)
+                                     revision=revision, variant=variant)
             detector.load()
             slot["detector"] = detector
             slot["state"] = "ready"
@@ -290,7 +292,7 @@ def encoder_heartbeat() -> None:
     once the app rerun below sees a settled state.
     """
     slot = encoder_slot(settings.tier2_model, settings.tier2_model_revision,
-                        settings.tier2_device)
+                        settings.tier2_device, settings.tier2_variant)
     if slot["state"] != "loading":
         st.rerun(scope="app")
 
@@ -382,7 +384,7 @@ with st.sidebar:
     tier1 = load_tier1()
     tier2 = None
     slot = encoder_slot(settings.tier2_model, settings.tier2_model_revision,
-                        settings.tier2_device)
+                        settings.tier2_device, settings.tier2_variant)
 
     use_tier2 = st.toggle(
         "Tier 2 encoder", value=True,
@@ -392,7 +394,8 @@ with st.sidebar:
     )
     if use_tier2:
         start_encoder(slot, settings.tier2_model,
-                      settings.tier2_model_revision, settings.tier2_device)
+                      settings.tier2_model_revision, settings.tier2_device,
+                      settings.tier2_variant)
     encoder_ready = use_tier2 and slot["state"] == "ready"
     if encoder_ready:
         tier2 = slot["detector"]
@@ -457,6 +460,7 @@ with st.sidebar:
             offline = os.getenv("HF_HUB_OFFLINE", "").strip().lower() in {"1", "true"}
             st.write(f"**Checkpoint** `{tier2.model_id}`")
             st.write(f"**Revision** `{(tier2.resolved_revision() or 'main')[:12]}`")
+            st.write(f"**Precision** `{tier2.variant or 'fp32'}`")
             st.write(f"**Device** `{tier2.device}`")
             st.write(f"**Offline** `{offline}`")
             try:
