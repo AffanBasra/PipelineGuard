@@ -4,7 +4,8 @@
 
 [![Live demo](https://img.shields.io/badge/live%20demo-try%20it%20now-FF4B4B?logo=streamlit&logoColor=white)](https://pipelineguard-g8rdu5ebpuxtq4bimlouyz.streamlit.app/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
-[![Tests](https://img.shields.io/badge/tests-509%20passing-3FB950?logo=pytest&logoColor=white)](#tests)
+[![CI](https://github.com/AffanBasra/PipelineGuard/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/AffanBasra/PipelineGuard/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Kafka](https://img.shields.io/badge/Kafka-3.8%20KRaft-231F20?logo=apachekafka&logoColor=white)](docker-compose.yml)
 [![Postgres](https://img.shields.io/badge/Postgres-16-4169E1?logo=postgresql&logoColor=white)](db/init.sql)
 
@@ -974,6 +975,14 @@ pytest                      # no Kafka or Postgres needed
 pytest -m integration       # the report's SQL, against a real Postgres
 pytest --cov=pipelineguard  # coverage report
 ```
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs both on every pull
+request and on every push to `master`, across Python 3.10 and 3.12 — the floor
+`pyproject.toml` declares and the version the Dockerfile ships, so
+`requires-python` is a tested claim rather than an assertion. The integration
+job brings up the same `postgres:16-alpine` the compose stack uses, loads
+`db/init.sql`, and **fails if those tests skip** — they skip themselves when no
+database answers, so a green run would otherwise prove nothing about the SQL.
 
 The detection and routing logic is written as pure functions — `RulesDetector.detect`,
 `processor.process_message`, `processor.redact` — specifically so it can be tested
