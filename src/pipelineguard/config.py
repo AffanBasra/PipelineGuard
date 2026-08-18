@@ -55,6 +55,10 @@ class Settings:
         "TIER2_BASE_REVISION", "8ccc9b6f36199bec6961081d44eb72fb3f7353f3"
     )
     tier2_threshold: float = float(os.getenv("TIER2_THRESHOLD", "0.55"))
+    # "bf16" or "fp16" load the half-precision weights this checkpoint ships
+    # alongside the fp32 ones. Halves resident memory, which is what makes the
+    # demo fit a 1 GB host (findings §27.5). Empty means full precision.
+    tier2_variant: str | None = os.getenv("TIER2_VARIANT", "").strip() or None
     tier2_device: str = os.getenv("TIER2_DEVICE", "auto")
     tier2_batch_size: int = int(os.getenv("TIER2_BATCH_SIZE", "8"))
 

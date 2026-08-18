@@ -228,8 +228,50 @@ def cached_base_revisions(base_model: str,
     return sorted(p.name for p in snapshots.iterdir() if p.is_dir())
 
 
+def cached_main_revision(base_model: str,
+                         cache_root: str | Path | None = None) -> str | None:
+    """The commit `main` resolves to in the local cache, or None if unrecorded.
+
+    Holding the right snapshot is not enough. A no-revision request asks for
+    `main`, which is looked up through this ref, so an unrecorded ref fails
+    offline however complete the cache is. See findings §25.
+    """
+    if cache_root is None:
+        from huggingface_hub.constants import HF_HUB_CACHE
+
+        cache_root = HF_HUB_CACHE
+    ref = (Path(cache_root)
+           / f"models--{base_model.replace('/', '--')}" / "refs" / "main")
+    return ref.read_text(encoding="utf-8").strip() if ref.is_file() else None
+
+
+def pin_main_ref(base_model: str, revision: str,
+                 cache_root: str | Path | None = None) -> None:
+    """Point `main` at the pinned commit inside the local cache.
+
+    Downloading at an explicit commit writes no ref, so this is the step that
+    makes the pin usable rather than merely present. Safe only because the
+    process goes offline straight after: nothing can refresh it.
+    """
+    if cache_root is None:
+        from huggingface_hub.constants import HF_HUB_CACHE
+
+        cache_root = HF_HUB_CACHE
+    refs = Path(cache_root) / f"models--{base_model.replace('/', '--')}" / "refs"
+    refs.mkdir(parents=True, exist_ok=True)
+    (refs / "main").write_text(revision, encoding="utf-8")
+
+
+# The three weight files this checkpoint family ships side by side, keyed by the
+# `variant` that opens each. Only one is ever read.
+_VARIANT_WEIGHTS = {"fp16": "model.fp16.safetensors",
+                    "bf16": "model.bf16.safetensors",
+                    None: "pytorch_model.bin"}
+
+
 def prefetch_pinned(model: str, revision: str,
-                    base_model: str, base_revision: str) -> None:
+                    base_model: str, base_revision: str,
+                    variant: str | None = None) -> None:
     """Populate the cache with exactly the pinned commits of both repos.
 
     Run once against a warm network, then set HF_HUB_OFFLINE=1. That pair is
@@ -238,11 +280,17 @@ def prefetch_pinned(model: str, revision: str,
     """
     from huggingface_hub import snapshot_download
 
-    snapshot_download(model, revision=revision)
+    # A variant build reads one 400 MB file out of 1.6 GB, so fetching the other
+    # two is dead weight on a host that downloads at boot. Left unfiltered
+    # without a variant, so the default build is unchanged.
+    ignore = ([name for key, name in _VARIANT_WEIGHTS.items() if key != variant]
+              if variant else None)
+    snapshot_download(model, revision=revision, ignore_patterns=ignore)
     # Only the config: GLiNER reads the backbone architecture from here and
     # takes its weights and tokenizer from the checkpoint above.
     snapshot_download(base_model, revision=base_revision,
                       allow_patterns=["config.json"])
+    pin_main_ref(base_model, base_revision)
     log.info("prefetched %s@%s and %s@%s", model, revision[:12],
              base_model, base_revision[:12])
 
@@ -271,9 +319,13 @@ class Tier2Detector:
                  device: str = "auto", batch_size: int = 8,
                  label_groups: dict[str, list[str]] | None = None,
                  extend_addresses: bool = True,
-                 revision: str | None = None) -> None:
+                 revision: str | None = None,
+                 variant: str | None = None) -> None:
         self.model_id = model_id
         self.revision = revision
+        # "bf16"/"fp16" pick the half-precision weights in the same commit. The
+        # pin still holds: same repo, same revision, fewer bits (findings §27.5).
+        self.variant = variant
         self.threshold = threshold
         self.requested_device = device
         self.batch_size = max(1, batch_size)
@@ -294,9 +346,13 @@ class Tier2Detector:
         self.device = resolve_device(self.requested_device)
         revision = self.resolved_revision()
         log.info("loading %s@%s on %s", self.model_id, revision or "main", self.device)
-        self._model = GLiNER.from_pretrained(
-            self.model_id, revision=revision, map_location=self.device
-        )
+        kwargs: dict = {"revision": revision, "map_location": self.device}
+        if self.variant:
+            # low_cpu_mem_usage as well, or torch materialises a full-precision
+            # copy while loading and the peak defeats the point.
+            kwargs["variant"] = self.variant
+            kwargs["low_cpu_mem_usage"] = True
+        self._model = GLiNER.from_pretrained(self.model_id, **kwargs)
         self._model.eval()
         self._predict([_WARMUP_TEXT] * self.batch_size)
         # Model, revision and threshold are logged together on purpose. The
@@ -306,10 +362,10 @@ class Tier2Detector:
         # model or its revision means re-running scripts/probe_ner_sweep.py, not
         # reusing this number.
         log.info(
-            "tier 2 ready: model=%s revision=%s threshold=%.2f labels=%s "
-            "batch=%d device=%s",
-            self.model_id, revision or "main (UNPINNED)", self.threshold,
-            list(self.label_groups), self.batch_size, self.device,
+            "tier 2 ready: model=%s revision=%s variant=%s threshold=%.2f "
+            "labels=%s batch=%d device=%s",
+            self.model_id, revision or "main (UNPINNED)", self.variant or "fp32",
+            self.threshold, list(self.label_groups), self.batch_size, self.device,
         )
         if self.model_id != _TUNED_FOR:
             log.warning(

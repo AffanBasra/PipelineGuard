@@ -32,6 +32,25 @@ from pipelineguard.observability import setup_logging  # noqa: E402
 log = logging.getLogger("pipelineguard.prefetch")
 
 
+def go_offline() -> None:
+    """Forbid the network for the rest of this process.
+
+    For a host with no build step, where the fetch and the freeze happen in one
+    process. Setting only the environment variable is too late by then:
+    huggingface_hub reads it into a module constant at import time, and every
+    network path consults the constant. So set both -- the constant for this
+    process, the variable for anything it spawns and for the UI to report.
+
+    Only correct straight after a successful prefetch. Before one it turns a
+    cold cache into a baffling error instead of a download.
+    """
+    from huggingface_hub import constants
+
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    constants.HF_HUB_OFFLINE = True
+    log.info("offline: the cache is now the only source the pin can resolve to")
+
+
 def main(argv: list[str] | None = None) -> int:
     setup_logging("INFO")
 
@@ -42,7 +61,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         from pipelineguard.detectors.tier2_encoder import (
-            cached_base_revisions, prefetch_pinned,
+            cached_base_revisions, cached_main_revision, prefetch_pinned,
         )
     except ImportError:
         log.error("needs the tier2 extra: pip install '.[tier2]'")
@@ -50,20 +69,33 @@ def main(argv: list[str] | None = None) -> int:
 
     log.info("cache: %s", os.getenv("HF_HOME") or "(default)")
     prefetch_pinned(settings.tier2_model, settings.tier2_model_revision,
-                    settings.tier2_base_model, settings.tier2_base_revision)
+                    settings.tier2_base_model, settings.tier2_base_revision,
+                    variant=settings.tier2_variant)
 
     cached = cached_base_revisions(settings.tier2_base_model)
+    main_ref = cached_main_revision(settings.tier2_base_model)
+
+    # Both, not just the snapshot. A cache holding the right commit with no
+    # `main` ref fails offline anyway, which is what broke the demo image
+    # (findings §25.6) -- and only a check of the ref can see it.
+    if main_ref != settings.tier2_base_revision:
+        log.error("backbone cache resolves main to %s, expected %s. GLiNER "
+                  "asks for the backbone with no revision, so offline mode "
+                  "will fail to resolve it at all.",
+                  (main_ref or "nothing")[:12],
+                  settings.tier2_base_revision[:12])
+        return 1
+
     if cached == [settings.tier2_base_revision]:
-        log.info("backbone cache holds exactly the pinned commit -- "
-                 "set HF_HUB_OFFLINE=1 and the pin is enforced")
+        log.info("backbone cache holds exactly the pinned commit and main "
+                 "resolves to it -- set HF_HUB_OFFLINE=1 and the pin is enforced")
         return 0
 
-    # Not fatal: an extra commit is usually an older cache, and offline mode
-    # will still resolve. But it means the cache no longer proves WHICH one a
-    # load picks, so the operator has to be told.
-    log.warning("backbone cache holds %s, expected exactly [%s]. Offline mode "
-                "will resolve one of them, and which is not guaranteed. Delete "
-                "the repo from the cache and re-run to make the pin exact.",
+    # Not fatal: an extra commit is usually an older cache, and main now points
+    # at the pinned one. But the cache no longer proves that nothing else can
+    # be reached by commit, so the operator has to be told.
+    log.warning("backbone cache holds %s, expected exactly [%s]. Delete the "
+                "repo from the cache and re-run to make the pin exact.",
                 [r[:12] for r in cached], settings.tier2_base_revision[:12])
     return 1
 

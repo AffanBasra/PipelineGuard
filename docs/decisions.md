@@ -43,7 +43,9 @@ sidestepped:
   matters. `.streamlit/config.toml` sets `server.address = "localhost"`, so the
   app is not reachable off the machine even by accident; without it Streamlit
   binds every interface and prints a LAN URL. The rule is enforced by
-  configuration, not by convention. It must not be deployed.
+  configuration, not by convention. **Superseded for a separate demo build --
+  see "A public demo build, and what it actually costs" below.** The default
+  build is unchanged and still binds loopback.
 * *A metrics dashboard demonstrates plumbing rather than domain understanding.*
   So the UI invents no charts and no counters. Tabs 1 and 2 show spans, tiers
   and confidences — the detectors' actual output. Tab 3 renders
@@ -74,6 +76,94 @@ pill until it finishes. This is not decoration: `psycopg.connect` against a
 stopped database waits out its default timeout, which is ten seconds of a UI
 that looks broken. The connect timeout is now explicit, and the failure is
 reported with its cause and a pointer to `docker compose`.
+
+**A public demo build, and what it actually costs.** *(settled)*
+This supersedes "it must not be deployed" for one build, and the honest version
+of the reasoning matters more than the outcome.
+
+The original rule was written against *uploads*: accepting third-party
+documents brings retention and breach-notification duties. Two things about
+that turned out to be true and one turned out to be overstated.
+
+True: the app stores nothing. Streamlit hands an upload over as bytes in
+memory, the UI writes nothing to disk, and it writes nothing to the audit
+database. `ScanResult.without_text()` now drops the scanned rows from session
+state once the figures are computed, so "gone when the scan finishes" is a
+property rather than a promise.
+
+True: the guarantee stops being ours at the container boundary. The demo runs
+on infrastructure we do not own, on a free tier with no data processing
+agreement. If a visitor uploads something real and it reaches a platform log,
+our no-storage claim was true of our code and false of the system delivering
+it. That risk is accepted, not solved.
+
+Overstated: "would make this a data controller with retention obligations". No
+storage removes the retention and most of the breach exposure, but not
+controller status -- processing under GDPR Art. 4(2) includes consultation and
+use. What survives is small: a lawful basis, a privacy notice, and being
+contactable. All three are now in the app. Separately, GDPR's territorial scope
+(Art. 3) reaches a Pakistan-based operator only when offering services to
+people in the Union or monitoring them, which a demo aimed at neither does; the
+instruments that actually apply are the ones `compliance.py` already cites.
+
+The demo is a *different build*, not the same one exposed. `PG_DEMO=1` caps the
+batch, removes the threshold and widener controls, swaps the live governance tab
+for a stored run, and shows the privacy notice. The two removed controls are not
+cosmetic: `tier2_settings` takes a global lock only when a setting is
+overridden, so leaving them alone is what stops one visitor's scan queueing
+behind another's.
+
+**The demo runs bf16 on Streamlit Community Cloud, and the pin still holds.**
+*(settled, 2026-08-17)*
+Hugging Face paywalled the Docker and Gradio Space SDKs, so the free host is now
+Streamlit Community Cloud at roughly 1 GB of memory per app. The shipped fp32
+`gliner_medium-v2.5` needs 1,780 MB resident and does not fit. Three options
+were measured (findings §27):
+
+| | fits | same checkpoint | cost |
+|---|---|---|---|
+| `medium` bf16 | 845 MB, ~70 MB spare | **yes** | 2.4x latency |
+| `small` bf16 | 735 MB, ~160 MB spare | no | threshold must be re-swept |
+| `medium` fp32 on a paid host | yes | yes | a card, and slow cold starts |
+
+**`medium` bf16 wins because the precision is not the model.** fp32, fp16 and
+bf16 all live in the same commit, so the revision pin covers the bf16 weights
+exactly as it covers the fp32 ones. Coverage is identical to one decimal place
+on both entity types. Moving to `small` would be a checkpoint change, and §6.1's
+rule -- a threshold is an uncalibrated sigmoid cutoff and does not transfer --
+would make the shipped 0.55 meaningless without a re-sweep. Keeping the demo and
+the pipeline on the same weights is worth 90 MB of headroom.
+
+**70 MB of headroom is thin, and is recorded as thin.** It was measured against
+short generated memos; a single long pasted document is untested. The fallback
+is `small` bf16 with its own sweep, and the trigger is the host reporting
+resource limits.
+
+Rejected: int8. Coverage collapses to 7.6% PERSON and 4.9% ADDRESS, and it does
+not even save memory -- torchao's dynamic path keeps the fp32 weights alongside
+the quantized ones. Recorded because it was measured, not because it is a
+choice.
+
+Consequence for the code: Community Cloud has no build step, so
+`deploy/streamlit-cloud/app.py` does at boot what the Dockerfile does at build
+-- prefetch the pinned commits, then `prefetch.go_offline()`. That helper flips
+`huggingface_hub.constants` as well as the environment variable, because the
+library reads the variable into a module constant at import time and the app has
+to download before it can freeze. If the prefetch fails the app runs online and
+unpinned rather than not at all, and says so on the page.
+
+Also a consequence: `.streamlit/config.toml` no longer sets
+`server.address = "localhost"`. Streamlit reads that file from the working
+directory, so a hosted build read it too, and an app bound to loopback can be
+unreachable through a platform's proxy. Loopback moved into the documented local
+launch command, which is weaker -- a bare `streamlit run` now binds every
+interface -- and that is the accepted cost of not having a config that breaks
+the deployment it is committed alongside.
+
+Rejected: keeping the uploader but relying on a "do not upload real PII"
+banner alone. A disclaimer is a wish, not a control. It is still shown, because
+saying so is better than not, but the retention properties above are what the
+decision rests on.
 
 **The encoder never reads what a rule already claimed.** *(settled)*
 Tier 2 used to run on the raw value, so it read an email's local part as a name
@@ -181,6 +271,38 @@ officer needs that to know the scan's coverage — a finding count is meaningles
 without knowing what was scanned. An engineer reads the same lines as volume,
 lineage and tier economics. One set of facts, legible to both, rather than a
 compliance report with a dashboard bolted on.
+
+**A report says which of the two systems produced it.** *(settled)*
+`ReportData` carries `source` and `from_stream`. `source` fixed the header line;
+`from_stream` fixes the prose. The renderers were written against a Kafka run
+and asserted things a file scan does not do — that delivery is at-least-once,
+that the review queue sits in `txn.quarantine`, that the audit trail recorded
+what happened. All of that is false about a CSV dragged into the UI, and it was
+shipping in the batch report before this flag existed.
+
+The compliance passages are kept for a file scan rather than dropped: they
+explain why detection behaves as it does, and the scan runs the same detectors.
+What changes is that they are introduced as a description of the pipeline, not
+of the scan. The distinction is the whole point — a governance document that
+overstates its own coverage is worse than none, which its own Limitations
+section says.
+
+**The demo's stored governance report is stamped as an example inside the
+file.** *(settled)*
+The demo has no database, so its governance tab renders a stored run over 5,000
+synthetic records. A caption on the page is not enough: the download leaves the
+browser and is read later, out of context, by someone who never saw the caption.
+`report.stamp_example()` marks the title, the source line and adds a banner
+above the first figure. The session-scoped artefact — the one that *is* about
+the visitor's own upload — is the Batch scan tab, which now offers the same
+executive summary over their file.
+
+The banner also carries the repository URL and the script that generated the
+file, and says to cite the repository rather than the document. Provenance and
+attribution are different problems: knowing a file is an example stops a reader
+believing it is about them, but it still leaves them holding a governance report
+with no way to check a figure or reference it. Only the first was solved
+originally.
 
 ---
 

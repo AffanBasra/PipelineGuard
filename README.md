@@ -6,6 +6,31 @@ Raw events flow through a tiered detection pipeline; PII is redacted in-stream,
 uncertain records are quarantined for review, and every decision is written to
 a Postgres audit trail from which a governance report is generated.
 
+```mermaid
+flowchart TD
+    P["producer<br/>synthetic PK transactions"] --> RAW["txn.raw<br/>unredacted · 24h"]
+    RAW --> D{"dispatch by field<br/>not escalation"}
+
+    D -->|"declared fields<br/>cnic · iban · phone · email"| T1["Tier 1 — rules<br/>regex + checksum<br/>exact, microseconds"]
+    D -->|"free text<br/>memo"| T1
+    D -->|"free text<br/>memo"| T2["Tier 2 — GLiNER encoder<br/>names + addresses<br/>one pass per label group"]
+
+    T1 --> M["shield · combine · merge spans"]
+    T2 --> M
+    M --> R{"route"}
+
+    R -->|"no findings"| CLEAN["txn.clean<br/>redacted · 168h"]
+    R -->|"redacted"| CLEAN
+    R -->|"rule finding below 1.0"| Q["txn.quarantine<br/>unredacted · 72h"]
+
+    M -.->|"audit before emit"| DB[("Postgres audit trail<br/>type · field · span · tier · confidence<br/>never the value")]
+    DB --> REP["governance report"]
+    DB --> UI["inspection UI"]
+```
+
+The same flow in more detail, including the batching that makes Tier 2 pay for
+itself:
+
 ```
   ┌────────────┐
   │  producer  │   synthetic PK bank transactions, ~40% with no memo
@@ -60,6 +85,17 @@ span, promoted on uncertainty.
 > Delivery semantics are **at-least-once with idempotent audit writes** — see
 > [Design decisions](#design-decisions) for why not exactly-once.
 
+
+## Two ways to run this
+
+They share the detection and redaction code. Everything around it differs, so
+pick one.
+
+| You want | Run | You get |
+|---|---|---|
+| **The pipeline** — Part 1 | `docker compose up -d` | Kafka, the processor, a Postgres audit trail, a governance report. No UI. |
+| **Just the detectors** — Part 2 | `streamlit run src/pipelineguard/ui.py --server.address localhost` | Playground, batch file scan, exportable reports. **No broker, no database, nothing written to disk.** |
+
 ## Status
 
 - [x] Docker Compose stack (Kafka 3.8 KRaft, Postgres 16)
@@ -74,8 +110,11 @@ span, promoted on uncertainty.
 - [x] Tier 2: encoder NER over free text, batched, GPU-optional
 - [x] Tier 2 verified end to end against a live Kafka broker (findings §24),
       which found a leak eleven sections of offline probing had missed
-- [x] Local inspection UI (Streamlit): playground, batch file scan with an
-      exportable report, and the governance report from the audit trail
+- [x] Local inspection UI (Streamlit): playground, batch file scan exporting
+      both a redaction report and an executive summary, and the governance
+      report from the audit trail
+- [x] A separate cut-down demo build (`PG_DEMO=1`), packaged for a container
+      host — built and verified locally, not yet deployed anywhere
 - [~] Tier 2 locale fine-tune -- **measured and declined** (findings §21, §23):
       the residual is positional, not semantic, and span rules closed most of it
       -- four times running, most recently for +2.6 points
@@ -86,20 +125,38 @@ span, promoted on uncertainty.
 - [ ] Support-chat free-text topic
 - [ ] Airflow batch-scan mode
 
+
+---
+
+# Part 1 — The pipeline
+
+Kafka in, redacted Kafka out, with every decision written to Postgres. This is
+the product. It needs Docker; it does not need the UI.
+
 ## Quick start
 
 ```bash
-docker compose up -d                                       # broker, database, topics, firewall
-docker compose run --rm producer --rate 50 --count 1000    # feed txn.raw
-docker compose logs -f processor                           # watch it work
+docker compose up -d          # everything: broker, database, topics, firewall, and 1,000 records
 ```
 
-That is the whole thing — no local Python needed. `up` brings the stack to a
-running pipeline idling on an empty topic: Kafka and Postgres come up, a
-one-shot `topics-init` container creates the topics (broker auto-create is
-disabled), and the processor starts only once that container has *exited
-successfully*, so "the topics probably exist by now" is an ordering guarantee
-rather than a hope.
+One command, no local Python. It brings up Kafka and Postgres, runs a one-shot
+`topics-init` container to create the topics (broker auto-create is disabled),
+starts the processor only once that container has *exited successfully* — so
+"the topics probably exist by now" is an ordering guarantee rather than a hope
+— and then feeds a bounded batch through it.
+
+```bash
+docker compose logs -f processor    # watch it work
+```
+
+The seed is deliberately bounded and one-shot. Change it, or turn it off once
+the volume already holds data:
+
+```bash
+SEED_COUNT=5000 docker compose up -d      # a bigger batch
+SEED_COUNT=0 docker compose up -d         # no new records
+docker compose run --rm producer --rate 50 --count 200   # ad hoc, any time
+```
 
 ```bash
 docker compose run --rm report                             # governance report to stdout
@@ -198,6 +255,7 @@ which is a question about consumer lag that no audit table can answer.
 | `--exit-after` | 0 | stop after N messages (0 = run until interrupted); makes benchmark runs reproducible |
 | `--log-level` | INFO | `DEBUG` logs every message — never use it while benchmarking |
 
+
 ## Tier 2 — the encoder
 
 Tier 1 cannot find a name. No rule can: a name has no format to match. That is
@@ -270,6 +328,200 @@ It prints the redacted output, every finding with its tier and confidence, and
 how the overlapping spans merge. Without `--tier2` you get the rules only, which
 match formats — a name or address in free text needs the encoder.
 
+### Which checkpoint, and why
+
+Four encoders were scored on the same cases before one was picked. Character
+coverage — the fraction of a gold span's characters the model claims — not
+classic recall, because a half-redacted address is a leak and precision/recall
+scores it as a hit.
+
+| model | licence | PERSON | ADDRESS |
+|---|---|---:|---:|
+| [**gliner-community/gliner_medium-v2.5**](https://huggingface.co/gliner-community/gliner_medium-v2.5) | Apache-2.0 | **100.0%** | **86.5%** |
+| [urchade/gliner_multi_pii-v1](https://huggingface.co/urchade/gliner_multi_pii-v1) | Apache-2.0 | 99.4% | 75.3% |
+| [nvidia/gliner-PII](https://huggingface.co/nvidia/gliner-PII) | NVIDIA OM | 91.1% | 74.7% |
+| [FacebookAI/xlm-roberta-large-…-conll03](https://huggingface.co/FacebookAI/xlm-roberta-large-finetuned-conll03-english) | MIT | 93.8% | 52.3% |
+
+PERSON is 165 synthetic name cases; ADDRESS is **91,663 real addresses across
+eight Pakistani cities**, fetched from OpenStreetMap via Overpass. Names stay
+synthetic because `decisions.md` §1 forbids processing real personal data, so
+those numbers are comparable to the tuning set rather than independent of it —
+a real limit on what the PERSON column proves (findings §15).
+
+Three things this table hides, and each of them changed a decision:
+
+- **The name a model is marketed under predicts nothing.** `nvidia/gliner-PII`
+  is the one built for PII and it placed third on both axes. The general-purpose
+  community checkpoint won.
+- **A checkpoint swap beat fine-tuning.** The gap between first and last here is
+  34 points of ADDRESS coverage. No fine-tune was attempted, because the
+  remaining residual turned out to be positional — separators, house numbers,
+  trailing cities — and four span rules reached it (findings §17, §18, §21, §23).
+- **The comparison is only valid per checkpoint at its own threshold.** The
+  cutoff is an uncalibrated sigmoid output, not a probability. Scoring every
+  model at one shared number measures the number, not the models.
+
+A fifth was measured for the demo host: [`gliner_small-v2.5`](https://huggingface.co/gliner-community/gliner_small-v2.5)
+costs 0.6 points of complete PERSON redaction and nothing on ADDRESS, for 1.7×
+the speed and 324 MB less memory. Not shipped in the pipeline, which has the
+memory; kept as the fallback if the demo host cannot hold `medium`.
+
+### Weight precision — fp32, bf16, fp16, int8
+
+The checkpoint ships fp32, fp16 and bf16 weights in the same commit, so the
+precision is a deployment choice rather than a different model — the pin still
+holds. Measured on CPU torch in a Linux container, 50 memos per pass
+(findings §27.5, `scripts/probe_model_footprint.py`):
+
+| weights | resting RAM | peak | ms/record | PERSON | ADDRESS |
+|---|---:|---:|---:|---:|---:|
+| `medium` fp32 — the pipeline | 1,780 MB | 1,790 MB | 94 | 99.4% | 100.0% |
+| **`medium` bf16 — the demo** | **845 MB** | **858 MB** | 225 | 99.4% | 100.0% |
+| `small` fp32 | 1,456 MB | 1,461 MB | 55 | 99.3% | 100.0% |
+| `small` bf16 | 735 MB | 768 MB | 142 | 99.3% | 100.0% |
+| `small` fp16 | 741 MB | 752 MB | 296 | 99.3% | 100.0% |
+| `small` int8 | 1,569 MB | 1,574 MB | **26** | **7.6%** | **4.9%** |
+
+- **bf16 halves the memory and costs nothing measurable in coverage.** Both
+  entity types score identically to fp32 to one decimal place. The price is
+  ~2.5× latency: CPUs do fp32 natively and convert bf16 on the fly.
+- **fp16 is strictly dominated.** Same memory as bf16, twice the latency again.
+  There is no configuration here where it is the right choice.
+- **int8 is not a trade-off, it is a failure.** Coverage collapses to 7.6% and
+  4.9%, and it does not even save memory — torchao's dynamic path holds the fp32
+  weights alongside the quantized ones. Fast and useless. It is in the table
+  because it was measured and rejected, not because it is an option.
+
+`TIER2_VARIANT=bf16` selects it; empty means fp32, which is what the pipeline
+runs. `low_cpu_mem_usage` is set alongside it, or torch materialises a
+full-precision copy while loading and the peak erases the saving.
+
+
+## Observability
+
+The producer shows a progress bar (bounded work). The processor consumes an
+unbounded stream, so it emits a periodic stats line instead — which doubles as
+the source of the benchmark numbers below:
+
+```
+12:04:31 INFO    pipelineguard.processor  processed=12,480 clean=0 redacted=11,982
+                 quarantined=495 failed=3 | rate=842/s p50=1.10ms p95=2.40ms p99=6.80ms
+```
+
+Per-message logging is DEBUG-only by design: at the rates this pipeline
+reaches, logging every message makes stdout the bottleneck and the benchmark
+measures the terminal rather than the pipeline.
+
+
+## Benchmarks
+
+Batch size sweep, 20,000 synthetic transactions per run. Every run reprocesses
+the same messages from offset 0 under a fresh consumer group.
+
+| `--batch-size` | throughput | per-record | detection p50 / p95 / p99 |
+|---:|---:|---:|---:|
+| 1 | 8 /s | 125 ms | 0.28 / 0.50 / 0.64 ms |
+| 8 | 57 /s | 17.5 ms | 0.14 / 0.35 / 0.50 ms |
+| 32 | 291 /s | 3.44 ms | 0.10 / 0.19 / 0.26 ms |
+| 64 | 368 /s | 2.72 ms | 0.10 / 0.18 / 0.26 ms |
+| 128 | 892 /s | 1.12 ms | 0.10 / 0.15 / 0.22 ms |
+| 256 | 898 /s | 1.11 ms | 0.11 / 0.18 / 0.23 ms |
+| **512** | **1,267 /s** | **0.79 ms** | 0.10 / 0.16 / 0.21 ms |
+| 1024 | 1,361 /s | 0.735 ms | 0.10 / 0.13 / 0.19 ms |
+| 2048 | 1,450 /s | 0.69 ms | 0.11 / 0.15 / 0.20 ms |
+
+**Batching is worth ~180× on this workload** — 8 msg/s committing per message,
+1,450 msg/s at a 2048-message batch. That is the entire justification for the
+added complexity, and it comes from amortising three fixed costs (a Postgres
+WAL fsync, a producer flush waiting on broker acknowledgement, and an offset
+commit round trip) across N records instead of paying them per record.
+
+**512 is the default because the curve flattens there.** It reaches 87% of the
+best observed throughput; 1024 buys 7 more points for double the replay window
+and 2048 another 6 for quadruple. Since a failed batch replays in full, batch
+size is bought with replay cost, and the marginal return collapses past 512.
+
+**Detection is not the bottleneck, and that is the interesting result.** p50
+detection latency sat at 0.10–0.11 ms in every configuration across both
+sweeps — nine runs, two orderings — while per-record cost at the best batch
+size is 0.69 ms. **Roughly 85% of per-record time is spent somewhere other
+than detection**: producing, auditing, and moving bytes across the broker and
+database boundaries. Tier 1's rules are effectively free relative to the
+plumbing around them, which is worth knowing before Tier 2 adds ~20 ms of
+model inference to that budget.
+
+### Methodology and caveats
+
+Hardware: Intel i7-11800H (8 cores / 16 threads), 31.7 GB RAM, Windows +
+Docker Desktop (WSL2 backend, 16 CPUs / 15.5 GB allocated). **Kafka, Postgres
+and the processor all ran on the same laptop**, so these are relative
+comparisons between configurations, not absolute capacity claims — a
+dedicated broker over a real network would look different in both directions.
+
+Message shape: 9-field synthetic bank transaction, ~500 bytes, averaging 5.4
+detected entities each (2 IBAN, 1.2 phone, 1.1 email, 1.1 CNIC). The producer
+ran unthrottled (`--rate 0`) so that batch size, not arrival rate, was the
+binding constraint — throttling below `batch_size / batch_timeout` would close
+batches on the clock and flatten the curve for the wrong reason.
+
+Runs used `--exit-after 20000` for a deterministic stopping point; timing a
+long-running consumer by hand biases the rate downward by however long it
+idles after draining. The audit tables were truncated between runs.
+
+**The latency columns measure detection only.** The timer starts immediately
+before `process_message` and stops after it, so consume, batch linger, audit,
+produce and flush are all excluded. End-to-end latency is not yet measured.
+
+**Low-batch-size numbers are not stable on this hardware.** The sweep was run
+twice, forward and in reverse. Results at 256 and above agreed within 4%, but
+`--batch-size 128` measured 307 /s in the forward sweep and 892 /s in reverse —
+2.9× apart. In the forward run its throughput degraded monotonically within
+the run (586 → 431 → 327 → … → 174 /s); in reverse it held steady at ~1,050 /s.
+The forward sweep had spent ~47 minutes under sustained load before reaching
+that point, the reverse sweep 70 seconds.
+
+Two hypotheses were tested by re-running the sweep in reverse order. Index
+growth in `findings` was ruled out — the table grows identically within every
+run, including the reverse one that showed no degradation. The remaining
+explanation is the measurement environment: a laptop running all three
+components, where sustained load degrades over tens of minutes. The reverse
+sweep is reported above because it completed in 3.6 minutes with flat interval
+rates throughout. The anomaly is documented rather than smoothed away, and it
+does not affect the design conclusion.
+
+Correctness held across every run: 19,227 redacted and 773 quarantined of
+20,000 (3.87% quarantine rate, against 3.96% predicted from the generator's
+2%-per-IBAN corruption and two IBANs per message), zero fail-closed failures,
+and exactly 40,000 IBAN detections — precisely two per message.
+
+
+---
+
+# Part 2 — The inspection UI and the public demo
+
+A way to watch the same detectors work on text you choose. It runs the code
+Part 1 runs — `scan.py` calls `processor.redact` rather than reimplementing it,
+and a test asserts the two agree — but there is no broker behind it, no audit
+database, and nothing is written to disk.
+
+```mermaid
+flowchart TD
+    U["you<br/>one memo, or a CSV"] --> UI["Streamlit UI<br/>bytes in memory, never on disk"]
+    UI --> S["scan.py<br/>calls processor.py: shield · combine · merge · redact"]
+    S --> T1["Tier 1 — rules<br/>same code as the pipeline"]
+    S --> T2["Tier 2 — GLiNER encoder<br/>same model, same revision"]
+    T1 --> O["redacted text + findings"]
+    T2 --> O
+    O --> R["redaction report · executive summary<br/>Markdown / PDF"]
+    O --> X["text dropped from session state<br/>once the scan finishes"]
+```
+
+Everything Part 1 has and this does not: `txn.raw`, `txn.quarantine`,
+`txn.clean`, the `messages_processed` and `findings` tables, offset commits,
+crash-and-replay. A report produced here says so — see
+[Design decisions](#design-decisions), *"A report says which of the two systems
+produced it"*.
+
 ## The inspection UI
 
 A local Streamlit app over the same detectors. Three tabs: scan one memo, scan
@@ -277,7 +529,8 @@ an uploaded CSV or TXT, and render the governance report from the audit trail.
 
 ```bash
 pip install -e ".[ui]"                 # into an env that already has [tier2]
-HF_HUB_OFFLINE=1 python -m streamlit run src/pipelineguard/ui.py
+HF_HUB_OFFLINE=1 python -m streamlit run src/pipelineguard/ui.py \
+    --server.address localhost
 ```
 
 Run it from the repo root, which is where Streamlit reads
@@ -285,15 +538,17 @@ Run it from the repo root, which is where Streamlit reads
 resolving `torch>=2.13` again can replace a working CUDA build with the CPU
 wheel from PyPI.
 
-**Local only, and enforced.** `docs/decisions.md` §1 rules out a hosted service
-that accepts uploads, so the config binds the server to `localhost`. Without
-that, Streamlit binds every interface and advertises a LAN URL. Do not deploy
-it.
+**Local only.** `--server.address localhost` is part of the command, not
+decoration: without it Streamlit binds every interface and advertises a LAN URL.
+It is in the command rather than in `.streamlit/config.toml` because a hosted
+build reads that file from the same working directory, and an app bound to
+loopback can be unreachable through a platform's proxy. The hosted demo is the
+deliberate exception either way — see [The public demo](#the-public-demo).
 
 | Tab | What it does |
 |---|---|
 | Playground | One memo. Highlighted spans, the redacted output, and every finding with its tier, confidence and regulatory category |
-| Batch scan | Up to 500 rows (~8 s at the measured 16 ms/row). Exports the governance report as Markdown or PDF |
+| Batch scan | Up to 500 rows (~8 s at the measured 16 ms/row). Two exports of the same scan: the redaction report (technical, every row) and the executive summary (governance view), each as Markdown or PDF |
 | Governance report | `report.fetch()` + `report.render_summary()` against Postgres — the three-page summary view. `python -m pipelineguard.report` still writes the full technical version |
 
 On a cold start the encoder loads on a background thread, so Tier 1 rules are
@@ -308,13 +563,18 @@ not filtered afterwards: address spans are bridged during detection and a
 bridge keeps the highest score of the spans it joins, so a post-hoc filter
 would show spans the pipeline never produces.
 
-**What the batch export is not.** It is a scan of a file, and the report says
-so — `ReportData.source` names the upload instead of the audit trail. It is not
-called "audit cleared", because `compliance.py` states the report is not a
-compliance determination. The exported rows are redacted output only; original
-text and matched values never leave the playground tab. Address redaction is
-routinely incomplete rather than binary, and the report carries that caveat
-beside the rows.
+**What the batch export is not.** It is a scan of a file, and both documents say
+so on every page. `ReportData.source` names the upload instead of the audit
+trail, and `from_stream=False` swaps the passages that would otherwise assert
+at-least-once delivery, a `txn.quarantine` review queue and an audit trail that
+recorded the run — none of which exist for a CSV. The compliance passages stay,
+because the scan runs the same detectors, but they are introduced as a
+description of the pipeline rather than of the scan. Neither report is called
+"audit cleared", because `compliance.py` states the report is not a compliance
+determination. The exported rows are redacted output only; original text and
+matched values never leave the playground tab. Address redaction is routinely
+incomplete rather than binary, and the report carries that caveat beside the
+rows.
 
 **Over-redaction is the accepted cost.** At this threshold ~38% of clean
 Roman-Urdu memos fire, and some are destroyed whole (`Zakat contribution` →
@@ -322,6 +582,131 @@ Roman-Urdu memos fire, and some are destroyed whole (`Zakat contribution` →
 address). Coverage was deliberately not traded away to fix it, and the false
 positives score up to 0.98 — high enough that no threshold change removes them.
 Flagging fully-saturated redactions is the open mitigation.
+
+
+## The public demo
+
+<!-- TODO, needs a human: the Space does not exist yet and no recording has been
+     made. Once it is live, put its URL on the line below, drop a screen
+     recording at docs/demo.gif, and uncomment the image.
+
+     **[Try it](https://huggingface.co/spaces/<user>/<space>)**
+
+     ![PipelineGuard scanning a memo](docs/demo.gif)
+-->
+
+A cut-down build, targeting **Streamlit Community Cloud**. **It is built and
+verified locally, and not deployed anywhere yet** — see the comment above for
+what is still missing. It is a different build, not the same one exposed:
+`PG_DEMO=1` changes five things, and they are the difference between "local
+tool" and "thing strangers can reach":
+
+| | local | demo |
+|---|---|---|
+| Batch cap | 500 rows | **50** — bf16 on CPU is ~225 ms/row and scans serialise |
+| Encoder precision | fp32 | **bf16** — 845 MB instead of 1,780, same coverage |
+| Threshold slider | shown | **removed** — any override takes the global lock, so leaving it alone lets visitors scan concurrently |
+| Span-widener toggle | shown | removed, same reason |
+| Governance tab | live Postgres | a stored run, `docs/sample-summary.md`, stamped as an example in the file itself |
+| Privacy notice | not shown | shown on the welcome screen and the batch tab |
+
+The stamp on the stored report matters more than it looks. The tab explains
+that it is an example over 5,000 synthetic records, but a downloaded PDF is
+read later and out of context, by someone who never saw the tab.
+`report.stamp_example()` marks the title, the source line and puts a banner
+above the first figure, so the file carries its own provenance. The banner names
+this repository and the script that generated it, and says to cite the
+repository rather than the document — a reader holding only the PDF otherwise
+has a governance report with no way to check a figure or attribute it.
+
+**The report about your own upload is in Batch scan**, not here. That one is
+built from the rows you submitted; this one is a recording of the pipeline.
+
+**Nothing uploaded is retained.** Streamlit hands the file over as bytes in
+memory; the UI writes nothing to disk and nothing to the audit database. After
+a scan the rows are dropped from session state by `ScanResult.without_text()`,
+which keeps every figure already computed and discards the text. A test asserts
+the original cannot survive it.
+
+### Where it runs, and why there
+
+Hugging Face was the plan. Its Docker and Gradio SDKs now require a paid PRO
+account, so the free path there is gone and **Streamlit Community Cloud** is the
+target. Full instructions: [`deploy/streamlit-cloud/README.md`](deploy/streamlit-cloud/README.md).
+
+```
+Repository       AffanBasra/PipelineGuard
+Main file path   deploy/streamlit-cloud/app.py
+Advanced         nothing — app.py carries the whole configuration
+```
+
+That host costs two things.
+
+**A 1 GB memory ceiling**, which the shipped fp32 checkpoint misses by 766 MB.
+The bf16 weights in the same commit fit at 845 MB resting, with coverage
+unchanged — see [Weight precision](#weight-precision--fp32-bf16-fp16-int8).
+Add ~96 MB for Streamlit, pandas and Arrow and the total is ~950 MB against
+~1,024. **That is 70 MB of headroom and it is thin**; the untested case is one
+long pasted document rather than the short memos the probe measured. If it
+starts hitting resource limits the fallback is `gliner_small-v2.5` in bf16,
+which leaves 160 MB — a different checkpoint, so its threshold has to be
+re-swept before it can be trusted.
+
+**No build step.** Community Cloud installs a requirements file and runs one
+script, so the pin cannot be warmed at build time. GLiNER resolves its backbone
+config at `main` and accepts no revision, so the only way to pin it is to warm
+the cache with the right commit and then forbid the network (findings §25).
+`deploy/streamlit-cloud/app.py` does both at boot instead: prefetch, then
+`prefetch.go_offline()`, before anything imports huggingface_hub — which reads
+the offline flag into a module constant at import time, so the environment
+variable alone is too late. If the prefetch fails the app runs online and
+**unpinned**, and says so on the page and in the sidebar rather than dying.
+
+The boot download is ~415 MB, not the repo's 1.6 GB, because the checkpoint
+carries fp32, fp16 and bf16 side by side and this build reads one of them.
+
+### The container build
+
+Still supported, and the better option on any Docker host with more than 1 GB:
+it bakes the weights into the image, needs no boot-time download, and runs fp32.
+
+```bash
+docker build -f deploy/hf-space/Dockerfile -t pipelineguard-demo .
+docker run --rm -p 7860:7860 pipelineguard-demo
+```
+
+`deploy/hf-space/README.md` is the Space card, for a Docker host that wants one.
+
+### What it costs a visitor
+
+| | Streamlit Cloud (bf16) | container (fp32) |
+|---|---|---|
+| First load after idle | 40–60 s: wake plus a ~20 s encoder load | 30–50 s |
+| Playground scan | ~0.2 s once warm | ~0.1 s |
+| Full batch | 50 rows, ~11 s, others queue | 100 rows, ~10 s |
+| Memory | ~950 MB against ~1,024 | ~1.9 GB |
+
+Tier 1 answers while the encoder is still loading, so the page is useful before
+it finishes.
+
+### Keeping it awake
+
+Both hosts sleep when idle, and the wake plus encoder load is the first row
+above. An uptime monitor pinging the app URL on a schedule keeps it warm, at the
+cost of holding free compute you are not using. Point it at the root; any 200
+counts.
+
+### Regenerating the stored report
+
+```bash
+docker compose up -d
+venv/Scripts/python.exe scripts/make_sample_summary.py
+```
+
+
+---
+
+# Both parts
 
 ## Design decisions
 
@@ -426,6 +811,7 @@ non-obvious choice in the project — including provisional values still
 pending measurement and open questions not yet decided — see
 [docs/decisions.md](docs/decisions.md).
 
+
 ## Tests
 
 ```bash
@@ -464,129 +850,55 @@ inner join for the uncertain queue, `avg` for `min` confidence, non-`DISTINCT`
 record counts, a queue total collapsed to its capped listing, and silently
 dropped unclassified entity types — were caught by exactly the intended test.
 
-## Observability
-
-The producer shows a progress bar (bounded work). The processor consumes an
-unbounded stream, so it emits a periodic stats line instead — which doubles as
-the source of the benchmark numbers below:
-
-```
-12:04:31 INFO    pipelineguard.processor  processed=12,480 clean=0 redacted=11,982
-                 quarantined=495 failed=3 | rate=842/s p50=1.10ms p95=2.40ms p99=6.80ms
-```
-
-Per-message logging is DEBUG-only by design: at the rates this pipeline
-reaches, logging every message makes stdout the bottleneck and the benchmark
-measures the terminal rather than the pipeline.
-
-## Benchmarks
-
-Batch size sweep, 20,000 synthetic transactions per run. Every run reprocesses
-the same messages from offset 0 under a fresh consumer group.
-
-| `--batch-size` | throughput | per-record | detection p50 / p95 / p99 |
-|---:|---:|---:|---:|
-| 1 | 8 /s | 125 ms | 0.28 / 0.50 / 0.64 ms |
-| 8 | 57 /s | 17.5 ms | 0.14 / 0.35 / 0.50 ms |
-| 32 | 291 /s | 3.44 ms | 0.10 / 0.19 / 0.26 ms |
-| 64 | 368 /s | 2.72 ms | 0.10 / 0.18 / 0.26 ms |
-| 128 | 892 /s | 1.12 ms | 0.10 / 0.15 / 0.22 ms |
-| 256 | 898 /s | 1.11 ms | 0.11 / 0.18 / 0.23 ms |
-| **512** | **1,267 /s** | **0.79 ms** | 0.10 / 0.16 / 0.21 ms |
-| 1024 | 1,361 /s | 0.735 ms | 0.10 / 0.13 / 0.19 ms |
-| 2048 | 1,450 /s | 0.69 ms | 0.11 / 0.15 / 0.20 ms |
-
-**Batching is worth ~180× on this workload** — 8 msg/s committing per message,
-1,450 msg/s at a 2048-message batch. That is the entire justification for the
-added complexity, and it comes from amortising three fixed costs (a Postgres
-WAL fsync, a producer flush waiting on broker acknowledgement, and an offset
-commit round trip) across N records instead of paying them per record.
-
-**512 is the default because the curve flattens there.** It reaches 87% of the
-best observed throughput; 1024 buys 7 more points for double the replay window
-and 2048 another 6 for quadruple. Since a failed batch replays in full, batch
-size is bought with replay cost, and the marginal return collapses past 512.
-
-**Detection is not the bottleneck, and that is the interesting result.** p50
-detection latency sat at 0.10–0.11 ms in every configuration across both
-sweeps — nine runs, two orderings — while per-record cost at the best batch
-size is 0.69 ms. **Roughly 85% of per-record time is spent somewhere other
-than detection**: producing, auditing, and moving bytes across the broker and
-database boundaries. Tier 1's rules are effectively free relative to the
-plumbing around them, which is worth knowing before Tier 2 adds ~20 ms of
-model inference to that budget.
-
-### Methodology and caveats
-
-Hardware: Intel i7-11800H (8 cores / 16 threads), 31.7 GB RAM, Windows +
-Docker Desktop (WSL2 backend, 16 CPUs / 15.5 GB allocated). **Kafka, Postgres
-and the processor all ran on the same laptop**, so these are relative
-comparisons between configurations, not absolute capacity claims — a
-dedicated broker over a real network would look different in both directions.
-
-Message shape: 9-field synthetic bank transaction, ~500 bytes, averaging 5.4
-detected entities each (2 IBAN, 1.2 phone, 1.1 email, 1.1 CNIC). The producer
-ran unthrottled (`--rate 0`) so that batch size, not arrival rate, was the
-binding constraint — throttling below `batch_size / batch_timeout` would close
-batches on the clock and flatten the curve for the wrong reason.
-
-Runs used `--exit-after 20000` for a deterministic stopping point; timing a
-long-running consumer by hand biases the rate downward by however long it
-idles after draining. The audit tables were truncated between runs.
-
-**The latency columns measure detection only.** The timer starts immediately
-before `process_message` and stops after it, so consume, batch linger, audit,
-produce and flush are all excluded. End-to-end latency is not yet measured.
-
-**Low-batch-size numbers are not stable on this hardware.** The sweep was run
-twice, forward and in reverse. Results at 256 and above agreed within 4%, but
-`--batch-size 128` measured 307 /s in the forward sweep and 892 /s in reverse —
-2.9× apart. In the forward run its throughput degraded monotonically within
-the run (586 → 431 → 327 → … → 174 /s); in reverse it held steady at ~1,050 /s.
-The forward sweep had spent ~47 minutes under sustained load before reaching
-that point, the reverse sweep 70 seconds.
-
-Two hypotheses were tested by re-running the sweep in reverse order. Index
-growth in `findings` was ruled out — the table grows identically within every
-run, including the reverse one that showed no degradation. The remaining
-explanation is the measurement environment: a laptop running all three
-components, where sustained load degrades over tens of minutes. The reverse
-sweep is reported above because it completed in 3.6 minutes with flat interval
-rates throughout. The anomaly is documented rather than smoothed away, and it
-does not affect the design conclusion.
-
-Correctness held across every run: 19,227 redacted and 773 quarantined of
-20,000 (3.87% quarantine rate, against 3.96% predicted from the generator's
-2%-per-IBAN corruption and two IBANs per message), zero fail-closed failures,
-and exactly 40,000 IBAN detections — precisely two per message.
 
 ## Project layout
 
+`[1]` Part 1 only · `[2]` Part 2 only · `[=]` shared by both. The shared column
+is the point: the UI is worth showing because it runs the pipeline's code, not
+a copy of it.
+
 ```
-Dockerfile                       one image, four entry points (processor, topics, producer, report)
-docker-compose.yml               broker, database, topic init, processor, on-demand tools
-db/init.sql                      audit schema (idempotent upserts by message_id)
-scripts/create_topics.py         explicit topic creation + retention (auto-create disabled)
-scripts/peek_topic.py            print recent messages on a topic (reads from the END)
-scripts/probe_ner_*.py           the Tier 2 measurement suite — model, threshold,
-                                 runtime, precision, redaction damage
-src/pipelineguard/
-  config.py                      env-driven settings
-  models.py                      Envelope, Finding, Tier
-  generator/transactions.py      synthetic PK-locale transaction generator
-  producer.py                    rate-controlled producer with delivery callbacks
-  detectors/base.py              Detector protocol
-  detectors/tier1_rules.py       Tier 1 rules engine
-  detectors/schema_rules.py      declared-PII fields + the free-text registry
-  detectors/tier2_encoder.py     Tier 2 encoder, batched, GPU-optional
-  processor.py                   the stream processor (consume→detect→route→audit)
-  audit.py                       idempotent Postgres audit writer
-  compliance.py                  entity type → regulatory classification
-  report.py                      governance report (SQL over the audit trail → Markdown)
-  scan.py                        detect + redact + highlight for the UI (pure, tested)
-  batch_report.py                a scanned batch → ReportData → Markdown → PDF
-  ui.py                          local Streamlit app — presentation only, no logic
-  observability.py               console logging + rolling throughput/latency stats
-.streamlit/config.toml           UI theme, and the localhost bind that keeps it local
-docs/sample-report.md            a generated report, committed as an example
+[1] Dockerfile                       one image, four entry points (processor, topics, producer, report)
+[1] docker-compose.yml               broker, database, topic init, processor, seed, on-demand tools
+[1] db/init.sql                      audit schema (idempotent upserts by message_id)
+[1] scripts/create_topics.py         explicit topic creation + retention (auto-create disabled)
+[1] scripts/peek_topic.py            print recent messages on a topic (reads from the END)
+[2] deploy/streamlit-cloud/app.py    the demo entry point — prefetch, go offline, hand over
+[2] deploy/streamlit-cloud/requirements.txt   what the host installs (CPU torch)
+[2] deploy/hf-space/Dockerfile       the demo image (CPU torch, weights baked in, pinned)
+[2] deploy/hf-space/README.md        the Space card
+[2] scripts/make_favicon.py          raster the shield for the browser tab
+[=] scripts/probe_ner_*.py           the Tier 2 measurement suite — model, threshold,
+                                     runtime, precision, redaction damage
+[=] scripts/probe_model_footprint.py resident/peak RAM and coverage per checkpoint
+                                     and per weight precision
+[=] scripts/make_sample_summary.py   regenerate the stored report the demo renders
+    src/pipelineguard/
+[=]   config.py                      env-driven settings
+[=]   models.py                      Envelope, Finding, Tier
+[1]   generator/transactions.py      synthetic PK-locale transaction generator
+[1]   producer.py                    rate-controlled producer with delivery callbacks
+[=]   detectors/base.py              Detector protocol
+[=]   detectors/tier1_rules.py       Tier 1 rules engine
+[=]   detectors/schema_rules.py      declared-PII fields + the free-text registry
+[=]   detectors/tier2_encoder.py     Tier 2 encoder, batched, GPU-optional
+[=]   processor.py                   the stream processor — and `shield`, `combine`,
+                                     `merge_spans`, `redact`, which the UI imports
+[1]   audit.py                       idempotent Postgres audit writer
+[=]   compliance.py                  entity type → regulatory classification
+[=]   report.py                      both renderers; `fetch()` is the Part 1 half
+[2]   scan.py                        detect + redact + highlight for the UI (pure, tested)
+[2]   batch_report.py                a scanned batch → ReportData → Markdown → PDF
+[2]   ui.py                          Streamlit app — presentation only, no logic
+[1]   observability.py               console logging + rolling throughput/latency stats
+[=]   prefetch.py                    warm the model cache with the pinned commits
+[2] .streamlit/config.toml           UI theme, and the localhost bind that keeps it local
+[1] docs/sample-report.md            a generated report, committed as an example
+[=] docs/sample-summary.md           the executive view of the same, rendered by the demo
 ```
+
+`processor.py` is the clearest case. Part 1 runs it as a consumer; Part 2 never
+starts one, but `scan.py` calls its `redact` and `merge_spans` directly, and a
+test asserts `result.redacted == processor.redact(text, findings)`. That test is
+the reason the demo is evidence rather than decoration — if the two ever
+disagreed, the demo would be showing something the pipeline does not do.

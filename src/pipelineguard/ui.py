@@ -2,7 +2,12 @@
 
 Run from the repo root so Streamlit finds .streamlit/config.toml:
 
-    HF_HUB_OFFLINE=1 python -m streamlit run src/pipelineguard/ui.py
+    HF_HUB_OFFLINE=1 python -m streamlit run src/pipelineguard/ui.py \
+        --server.address localhost
+
+`--server.address localhost` is not decoration: Streamlit otherwise binds every
+interface and prints a LAN-reachable URL. It lives in the command rather than in
+.streamlit/config.toml because a hosted build reads that file too.
 
 Local only, by design. docs/decisions.md section 1 rules out a hosted service
 that accepts uploads: taking third-party documents would make this project a
@@ -37,14 +42,41 @@ from pipelineguard.config import settings  # noqa: E402
 from pipelineguard.detectors.tier1_rules import RulesDetector  # noqa: E402
 from pipelineguard.models import Tier  # noqa: E402
 
+# Public demo build. Set on the hosted app and nowhere else; every difference
+# it makes is listed in decisions.md rather than scattered through this file.
+DEMO = os.getenv("PG_DEMO", "").strip().lower() in {"1", "true", "yes"}
+
+CONTACT_EMAIL = "affanbasra12@gmail.com"
+REPO_URL = "https://github.com/AffanBasra/PipelineGuard"
+
+# A stored run of the real report, for the demo, which has no database behind
+# it. Regenerate with scripts/make_sample_summary.py after a pipeline run.
+SAMPLE_SUMMARY = Path(__file__).resolve().parents[2] / "docs" / "sample-summary.md"
+SAMPLE_RECORDS = "5,000"
+
 # 16.2 ms/record for the shipped two-group encoder config on the reference GPU
 # (docs/tier2-detection-findings.md sections 11 and 18). 500 rows is ~8 seconds;
 # 2000 would be ~32, which reads as a hang.
-MAX_ROWS = 500
+#
+# The demo runs bf16 on a shared CPU box at ~225 ms/record (findings §27.5), and
+# detection takes a global lock, so one big scan stalls every other visitor.
+# Half the fp32 rows for the same ~11 s wait: the memory saving costs latency.
+MAX_ROWS = 50 if DEMO else 500
 
 # A dead broker is not refused, it is unanswered, so psycopg waits out its
 # default timeout -- 10s of a UI that looks broken. Fail fast and say why.
 DB_TIMEOUT_S = 5
+
+PRIVACY_NOTICE = (
+    "**Your file never leaves this page.** It is read into memory, scanned, "
+    "and dropped when the scan finishes. It is never written to disk, never "
+    "logged, and never added to the audit database. Only the redacted output "
+    "and the counts stay on screen.\n\n"
+    "This is a demonstration on shared free hosting. Please use synthetic "
+    "data. Nothing here is a compliance determination.\n\n"
+    f"Questions, or want it taken down? [{CONTACT_EMAIL}](mailto:{CONTACT_EMAIL}) "
+    f"· [source on GitHub]({REPO_URL})"
+)
 
 RULE_TYPES = ["CNIC", "IBAN_PK", "PHONE_PK", "EMAIL"]
 ENCODER_TYPES = ["PERSON_NAME", "ADDRESS"]
@@ -215,7 +247,8 @@ def load_tier1() -> RulesDetector:
 
 
 @st.cache_resource(show_spinner=False)
-def encoder_slot(model: str, revision: str, device: str) -> dict:
+def encoder_slot(model: str, revision: str, device: str,
+                 variant: str | None) -> dict:
     """One mutable holder shared by every session and by the loader thread.
 
     cache_resource rather than a module global: Streamlit re-executes this file
@@ -226,7 +259,8 @@ def encoder_slot(model: str, revision: str, device: str) -> dict:
             "lock": threading.Lock()}
 
 
-def start_encoder(slot: dict, model: str, revision: str, device: str) -> None:
+def start_encoder(slot: dict, model: str, revision: str, device: str,
+                  variant: str | None) -> None:
     """Kick off the ~20 s load off the main thread, so Tier 1 stays usable.
 
     The worker must never touch `st`. Streamlit binds a script context to the
@@ -245,7 +279,7 @@ def start_encoder(slot: dict, model: str, revision: str, device: str) -> None:
             detector = Tier2Detector(model, threshold=settings.tier2_threshold,
                                      device=device,
                                      batch_size=settings.tier2_batch_size,
-                                     revision=revision)
+                                     revision=revision, variant=variant)
             detector.load()
             slot["detector"] = detector
             slot["state"] = "ready"
@@ -264,7 +298,7 @@ def encoder_heartbeat() -> None:
     once the app rerun below sees a settled state.
     """
     slot = encoder_slot(settings.tier2_model, settings.tier2_model_revision,
-                        settings.tier2_device)
+                        settings.tier2_device, settings.tier2_variant)
     if slot["state"] != "loading":
         st.rerun(scope="app")
 
@@ -356,7 +390,7 @@ with st.sidebar:
     tier1 = load_tier1()
     tier2 = None
     slot = encoder_slot(settings.tier2_model, settings.tier2_model_revision,
-                        settings.tier2_device)
+                        settings.tier2_device, settings.tier2_variant)
 
     use_tier2 = st.toggle(
         "Tier 2 encoder", value=True,
@@ -366,7 +400,8 @@ with st.sidebar:
     )
     if use_tier2:
         start_encoder(slot, settings.tier2_model,
-                      settings.tier2_model_revision, settings.tier2_device)
+                      settings.tier2_model_revision, settings.tier2_device,
+                      settings.tier2_variant)
     encoder_ready = use_tier2 and slot["state"] == "ready"
     if encoder_ready:
         tier2 = slot["detector"]
@@ -384,20 +419,34 @@ with st.sidebar:
             if encoder_ready:
                 selected.add(entity_type)
 
-    threshold = st.slider(
-        "Confidence threshold", min_value=0.10, max_value=0.95,
-        value=float(settings.tier2_threshold), step=0.05,
-        disabled=not encoder_ready,
-        help="Model and threshold are a pair. 0.55 is the value measured "
-             "against this checkpoint; another checkpoint would need its own.",
-    )
-    extend = st.checkbox(
-        "Widen and bridge address spans", value=True,
-        disabled=not encoder_ready,
-        help="Walks outward over a leading house or plot number and a trailing "
-             "city, then joins address spans separated by a gap. Turn it off to "
-             "see the raw model span.",
-    )
+    if DEMO:
+        # Dropped on the demo build, and not merely hidden: `tier2_settings`
+        # only takes its global lock when a setting is overridden, so leaving
+        # the threshold alone lets visitors' scans run without queueing behind
+        # each other.
+        threshold = None
+        st.caption(f"Confidence threshold fixed at {settings.tier2_threshold} "
+                   "— the value measured against this checkpoint.")
+    else:
+        threshold = st.slider(
+            "Confidence threshold", min_value=0.10, max_value=0.95,
+            value=float(settings.tier2_threshold), step=0.05,
+            disabled=not encoder_ready,
+            help="Model and threshold are a pair. 0.55 is the value measured "
+                 "against this checkpoint; another checkpoint would need its own.",
+        )
+    if DEMO:
+        # Same reason as the threshold above: any override takes the lock. The
+        # detector already defaults to True, which is the shipped behaviour.
+        extend = None
+    else:
+        extend = st.checkbox(
+            "Widen and bridge address spans", value=True,
+            disabled=not encoder_ready,
+            help="Walks outward over a leading house or plot number and a "
+                 "trailing city, then joins address spans separated by a gap. "
+                 "Turn it off to see the raw model span.",
+        )
 
     if use_tier2:
         if slot["state"] == "ready":
@@ -417,6 +466,7 @@ with st.sidebar:
             offline = os.getenv("HF_HUB_OFFLINE", "").strip().lower() in {"1", "true"}
             st.write(f"**Checkpoint** `{tier2.model_id}`")
             st.write(f"**Revision** `{(tier2.resolved_revision() or 'main')[:12]}`")
+            st.write(f"**Precision** `{tier2.variant or 'fp32'}`")
             st.write(f"**Device** `{tier2.device}`")
             st.write(f"**Offline** `{offline}`")
             try:
@@ -435,7 +485,14 @@ with st.sidebar:
                            f"expected {settings.tier2_base_revision[:12]}.")
 
     st.divider()
+    # "This machine" is the visitor's laptop locally and a rented container on
+    # the demo, and only one of those is a privacy claim the visitor can check.
+    # decisions.md section 1 accepts that boundary; it must not be blurred here.
     st.caption(
+        "Read in memory on the server, scanned, and dropped when the scan "
+        "finishes. Nothing is written to disk, logged, or added to the audit "
+        "database — but the server is shared free hosting we do not own."
+        if DEMO else
         "Runs entirely on this machine. Nothing you type or upload leaves it, "
         "and nothing is written to the audit database from here."
     )
@@ -489,9 +546,13 @@ if not st.session_state.get("pg_started"):
         right.caption("Rules are ready now. The encoder is still loading; "
                       "start anyway and it will switch on by itself.")
 
-    st.caption(
-        "Runs entirely on this machine. Nothing you type or upload leaves it."
-    )
+    if DEMO:
+        st.write("")
+        st.info(PRIVACY_NOTICE, icon=":material/lock:")
+    else:
+        st.caption(
+            "Runs entirely on this machine. Nothing you type or upload leaves it."
+        )
     st.stop()
 
 
@@ -554,10 +615,17 @@ if section == "Playground":
 
 elif section == "Batch scan":
     st.subheader("Scan a file")
-    st.caption(
-        f"Up to {MAX_ROWS:,} rows. The encoder runs at about 16 ms per row on "
-        "the reference GPU, so a full batch takes roughly 8 seconds."
-    )
+    if DEMO:
+        st.caption(
+            f"Up to {MAX_ROWS:,} rows. On this shared machine the encoder runs "
+            "at about 225 ms per row, so a full batch takes roughly 11 seconds."
+        )
+        st.info(PRIVACY_NOTICE, icon=":material/lock:")
+    else:
+        st.caption(
+            f"Up to {MAX_ROWS:,} rows. The encoder runs at about 16 ms per row "
+            "on the reference GPU, so a full batch takes roughly 8 seconds."
+        )
     upload = st.file_uploader("CSV or TXT", type=["csv", "txt"])
 
     column = None
@@ -605,7 +673,11 @@ elif section == "Batch scan":
                 tier2_used=tier2 is not None,
                 threshold=threshold if tier2 else None,
                 entity_types=sorted(active_types) if active_types else None)
-            st.session_state["batch"] = (results, data, markdown, upload.name)
+            # The scanned rows are dropped here, not held for the session.
+            # Everything below reads counts and redacted output, both already
+            # computed, so nothing needs the original again.
+            st.session_state["batch"] = ([r.without_text() for r in results],
+                                         data, markdown, upload.name)
 
     if "batch" in st.session_state:
         results, data, markdown, name = st.session_state["batch"]
@@ -647,6 +719,12 @@ elif section == "Batch scan":
             )
 
         stem = name.rsplit(".", 1)[0]
+        st.caption(
+            "Two documents from the same scan. The redaction report is the "
+            "technical artefact and lists every row. The executive summary is "
+            "the governance view of the same figures, written for a reader who "
+            "needs the numbers first and the statute last."
+        )
         left, right = st.columns(2)
         left.download_button("Download Redaction Report (Markdown)", markdown,
                              file_name=f"{stem}-redaction-report.md",
@@ -658,6 +736,58 @@ elif section == "Batch scan":
                                   mime="application/pdf", width="stretch")
         except ImportError:
             right.info("PDF export needs `pip install '.[ui]'`.")
+
+        summary = report.render_summary(data)
+        left, right = st.columns(2)
+        left.download_button("Download Executive Summary (Markdown)", summary,
+                             file_name=f"{stem}-executive-summary.md",
+                             mime="text/markdown", width="stretch")
+        try:
+            right.download_button(
+                "Download Executive Summary (PDF)",
+                batch_report.markdown_to_pdf(
+                    summary, title="Data Governance Summary",
+                    orientation="portrait"),
+                file_name=f"{stem}-executive-summary.pdf",
+                mime="application/pdf", width="stretch")
+        except ImportError:
+            right.info("PDF export needs `pip install '.[ui]'`.")
+
+elif section == "Governance report" and DEMO:
+    # No broker and no database on the demo, so there is no live audit trail to
+    # read. Showing a stored run is honest; a Connect button that always fails
+    # would teach a visitor nothing.
+    st.subheader("Example governance report")
+    st.caption(
+        "Normally this reads the Postgres audit trail the running pipeline "
+        "writes. The demo has no pipeline behind it, so this is a stored run "
+        f"over {SAMPLE_RECORDS} synthetic records — real output, not a mockup."
+    )
+    st.info("This is not your scan. For a report on the file you uploaded, "
+            "use **Batch scan**.", icon=":material/info:")
+    sample = SAMPLE_SUMMARY.read_text(encoding="utf-8") if SAMPLE_SUMMARY.exists() else ""
+    if not sample:
+        st.warning("The stored example is missing from this build.")
+    else:
+        # Stamped before it is handed to the download buttons, not only on the
+        # page: a file that leaves the browser must carry its own provenance,
+        # because whoever opens it later cannot see this caption.
+        stamped = report.stamp_example(sample)
+        left, right = st.columns(2)
+        left.download_button("Download example (Markdown)", stamped,
+                             file_name="governance-summary-example.md",
+                             mime="text/markdown", width="stretch")
+        try:
+            right.download_button(
+                "Download example (PDF)",
+                batch_report.markdown_to_pdf(
+                    stamped, title="Data Governance Summary (example)",
+                    orientation="portrait"),
+                file_name="governance-summary-example.pdf",
+                mime="application/pdf", width="stretch")
+        except ImportError:
+            right.info("PDF export needs `pip install '.[ui]'`.")
+        st.markdown(stamped.replace(report.PAGE_BREAK, "---"))
 
 elif section == "Governance report":
     st.subheader("Governance report from the audit trail")

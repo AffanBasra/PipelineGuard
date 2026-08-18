@@ -2688,6 +2688,58 @@ cache, not once per project.
 - **The backbone commit was read off a warm cache**, not chosen. It is whatever
   `main` served on 2026-08-12. Recording it makes it stable, not correct.
 
+### 25.6 The pin never worked; a stale ref was doing the job
+
+The first Docker image built from a cold cache could not load the encoder at
+all:
+
+```
+OSError: We couldn't connect to 'https://huggingface.co' to load the files,
+and couldn't find them in the cached files.
+```
+
+raised from `AutoConfig.from_pretrained(config.model_name)` — the exact call
+§25.1 identified, in the exact offline state §25.3 calls PINNED.
+
+**Cause.** `snapshot_download(repo, revision=<sha>)` writes the snapshot and
+nothing else. It does not write `refs/main`, because it was never asked about
+`main`. GLiNER requests the backbone with no revision, which means `main`, and
+a name is resolved through that ref before anything looks at snapshots. No ref,
+no resolution, and offline there is nowhere else to ask.
+
+**Why nothing caught it.** Every cache the prefetch had ever run against was
+already warm from an earlier unpinned download, so `refs/main` was there before
+the prefetch ran:
+
+| cache | `refs/main` | snapshots | load |
+|---|---|---|---|
+| developer `HF_HOME` | `8ccc9b6f3619` | `8ccc9b6f3619` | works |
+| compose `models` volume, reused | present | `8ccc9b6f3619` | works |
+| demo image, built cold | **absent — no `refs/` at all** | `8ccc9b6f3619` | **fails** |
+
+§25.4's zero-request measurements are still true. They were taken on caches
+that happened to carry the ref, so they measured the right thing about the
+wrong population.
+
+**Proof it is the only cause.** Writing that one 40-byte file into the running
+container, changing nothing else, loaded the model and returned findings.
+
+**Fix.** `prefetch_pinned` writes `refs/main` pointing at the pinned commit.
+That is not a weakening of the pin: the commit is fetched by hash first, the
+ref is written second, and the process goes offline third, so nothing can
+refresh it and whatever `main` means upstream is irrelevant.
+
+**Correction to §25.3.** "The cache holds exactly the pinned commit" was the
+wrong test for the prefetch: it passed, and the build shipped an unloadable
+cache. Reachable by hash is not the same as resolvable by name, and only the
+second is what GLiNER does. The prefetch now exits non-zero unless `refs/main`
+reads back as the pinned commit, which is what makes
+`RUN python -m pipelineguard.prefetch` a build gate rather than a download step.
+
+`_log_base_pin` keeps the snapshot-only test, and is left alone deliberately.
+It runs *after* a load has already succeeded, so resolution is a fact by then
+and the same condition is sound in that position.
+
 ---
 
 ## 26. The encoder was reading text a rule already owned
@@ -2814,3 +2866,176 @@ addresses into separate fields; real remittance narration does not.
   entity-type accuracy is the product.
 - **`_MAX_BRIDGE` is still 32 characters and still unaware of context.** Two
   distinct addresses closer than that still merge into one span.
+
+---
+
+## 27. Neither checkpoint fits a 1 GB host
+
+Hugging Face paywalled Docker Spaces, so Streamlit Community Cloud became the
+candidate host for the public demo. It caps an app at roughly **1 GB of RAM**.
+The question asked was whether swapping `gliner_medium-v2.5` for
+`gliner_small-v2.5` buys enough headroom to fit.
+
+It does not, and the reason is not the checkpoint.
+
+### 27.1 Measured
+
+`scripts/probe_model_footprint.py`, run inside the demo image so the
+environment matches the target: Linux, Python 3.12, **torch 2.13.0+cpu**,
+gliner 0.2.28, CPU only. RSS via psutil, sampled on a thread at 5 ms because a
+forward pass allocates and frees inside one call. 50 generated memos per pass,
+three timed passes, median reported.
+
+| | medium-v2.5 | small-v2.5 |
+|---|---:|---:|
+| torch + gliner, no weights | 356 MB | 356 MB |
+| added by the weights | 1,424 MB | 1,100 MB |
+| **resting** | **1,780 MB** | **1,456 MB** |
+| peak during load | 2,143 MB | 1,819 MB |
+| peak during inference | 1,790 MB | 1,461 MB |
+| latency | 93.7 ms/rec | **55.3 ms/rec** |
+| headroom against 1,024 MB | **-766 MB** | **-437 MB** |
+
+The swap saves 329 MB and is still 437 MB over. It also **halves latency**,
+which is a real result -- just not one that answers this question.
+
+Coverage over the 237 locale cases from §12, scored with the same
+`char_coverage`, at four thresholds:
+
+| model | threshold | PERSON complete | ADDRESS complete |
+|---|---:|---:|---:|
+| medium | 0.55 (shipped) | 99.4% | 100.0% |
+| medium | 0.45 | 100.0% | 100.0% |
+| small | 0.55 | 98.8% | 100.0% |
+| small | 0.25 | 98.8% | 100.0% |
+
+`small` costs 0.6 points of complete PERSON redaction and nothing on ADDRESS.
+For a host that could hold it, that is a cheap trade for 1.7x the speed.
+
+### 27.2 The floor is torch, not the model
+
+**356 MB is spent before any checkpoint is chosen.** That is the interpreter
+with torch and gliner imported and no weights loaded, and no model swap moves
+it. The remaining budget for weights, the load spike, Streamlit's own runtime
+and the app is 668 MB; `small` alone wants 1,100 MB of it.
+
+Two measurement mistakes were made first and are recorded because both would
+have produced a confident wrong answer:
+
+- **The baseline was taken before torch was imported.** The project imports
+  torch lazily inside `load()`, so the entire torch import was charged to the
+  weights -- reporting a 44M-parameter backbone as 1.8 GB.
+- **Resting RSS was read immediately after `load()`**, which ends with a
+  warm-up batch. That is a high-water mark, not a resting one; Windows then
+  trimmed the working set and the later peak read *lower* than "resting",
+  producing a negative inference spike.
+
+### 27.3 Not allocator fragmentation
+
+`model_mb` at roughly twice the fp32 weight size suggested glibc arenas holding
+freed load buffers. Re-run with `MALLOC_ARENA_MAX=2`: **1,452 MB against 1,456
+MB**, inside noise. The allocation is real, so the cheap environment fix does
+not exist.
+
+### 27.4 What is left
+
+- **Rules only on the deployed demo.** Tier 1 is regex and fits trivially, but
+  Tier 2 is the half worth showing.
+- **Shrink the model.** `GLiNER.from_pretrained` accepts `dtype`, `variant`
+  (the repos ship `model.fp16.safetensors` and `model.bf16.safetensors`),
+  `low_cpu_mem_usage` and `quantize`. Unmeasured here. §7 already warns that
+  DeBERTa loses accuracy at int8 without quantization-aware training, so any of
+  these has to be scored on the same cases before it counts.
+- **A host with more memory.** The demo image already runs on one.
+
+Streamlit Community Cloud is ruled out for the encoder build on this evidence.
+It is not ruled out for a rules-only build.
+
+### 27.5 bf16 fits; int8 destroys it
+
+§27.4 listed shrinking the model as the untested option. Measured, same
+instrument, same 237 cases, `gliner_small-v2.5`:
+
+| weights loaded as | resting | peak | ms/rec | PERSON cov | ADDRESS cov |
+|---|---:|---:|---:|---:|---:|
+| fp32 (shipped) | 1,456 MB | 1,465 MB | 50.5 | 99.3% | 100.0% |
+| fp32 + `low_cpu_mem_usage` | 1,273 MB | 1,332 MB | 51.7 | 99.3% | 100.0% |
+| **bf16** | **735 MB** | **768 MB** | 141.8 | 99.3% | 100.0% |
+| fp16 | 741 MB | 752 MB | 296.1 | 99.3% | 100.0% |
+| int8 (`quantize="int8"`) | 1,569 MB | 1,574 MB | 26.1 | **7.6%** | **4.9%** |
+
+**bf16 halves the weights and changes coverage by nothing measurable.** 1,100
+MB of weights becomes 379 MB, and both entity types score identically to fp32
+to one decimal place. The cost is 2.8x latency: CPUs do fp32 natively and
+convert bf16 on the fly.
+
+**fp16 is strictly dominated** -- the same memory as bf16 for twice the latency
+again. There is no configuration in which it is the right choice here.
+
+**int8 is not a trade-off, it is a failure.** §7 warned that stock
+DeBERTa-based models lose accuracy at int8 without quantization-aware training.
+Measured: coverage collapses to 7.6% and 4.9%, and it does not even save
+memory, because torchao's dynamic path holds the fp32 weights alongside the
+quantized ones. Fast and useless.
+
+`gliner_medium-v2.5` in bf16 fits as well, at 845 MB resting and 858 MB peak,
+with its fp32 coverage intact (99.4% / 100.0%) and 225 ms/record.
+
+### 27.6 The app is not free either
+
+The footprint figures are for a bare interpreter. A deployed app carries more:
+
+| | RSS |
+|---|---:|
+| bare interpreter | 16 MB |
+| + torch + gliner | 351 MB |
+| + streamlit | 364 MB |
+| + everything `ui.py` imports | 391 MB |
+| + pandas, pyarrow, altair (first `st.dataframe`) | 449 MB |
+
+**+96 MB over the probe's baseline**, and the last 85 MB of it does not appear
+until a dataframe is first rendered -- so an app that looks fine on the welcome
+screen can die on the batch tab.
+
+Against the 1,024 MB ceiling, with the model peak from §27.5:
+
+| build | peak + app | headroom |
+|---|---:|---:|
+| small bf16 | ~864 MB | **160 MB** |
+| medium bf16 | ~954 MB | **70 MB** |
+
+Both fit on paper. 70 MB is not enough margin to bet a public demo on, so the
+medium build would need its peak measured under a real session before it could
+be trusted, not a synthetic batch of short generated memos.
+
+### 27.7 The bf16 path works end to end, and the pin survives it
+
+§27.5 measured the weights. This checks the thing that actually ships: the
+pinned prefetch, `prefetch.go_offline()`, and a bf16 load in one process, which
+is the sequence a host with no build step has to run at every cold boot.
+
+```
+fast path: ref already pinned
+offline constant: True
+offline env     : 1
+weight dtype: torch.bfloat16
+  PERSON_NAME  0.96  'Ayesha Malik'
+  ADDRESS      0.93  'CNIC 42101-1234567-8, Plot E-379, Airport Road, Quetta'
+```
+
+Three things confirmed:
+
+- **The offline flip is real.** `huggingface_hub` reads `HF_HUB_OFFLINE` into a
+  module constant at import time, so setting only the environment variable after
+  the download does nothing. `go_offline()` sets both, and
+  `constants.is_offline_mode()` returns True afterwards -- which is what every
+  network path in the library consults.
+- **The pin resolves under bf16.** Same repo, same commit, different weight file.
+  `variant="bf16"` does not change what the revision points at.
+- **The known §24.5 wart is unchanged**, not introduced by the precision change:
+  the encoder sweeps the CNIC into the ADDRESS span. Redaction is unaffected,
+  because Tier 1 claims those characters exactly and `merge_spans` unions them.
+
+Run on the development machine, whose torch carries CUDA libraries, so the
+1,211 MB RSS observed there is not comparable to §27.5's container figures. The
+dtype and the detections are what this checks; the memory numbers are §27.5's.

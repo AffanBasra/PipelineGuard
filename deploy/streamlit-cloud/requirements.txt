@@ -1,0 +1,27 @@
+# Dependencies for the public demo on Streamlit Community Cloud.
+#
+# Here rather than in the repo root because Community Cloud looks beside the
+# entrypoint first, and the root requirements.txt belongs to the processor
+# image -- which has no business carrying a web server.
+
+# CPU torch, explicitly. The default index serves the CUDA build on Linux:
+# gigabytes of driver payload for a machine with no GPU. The `+cpu` suffix
+# exists only on this index, so a build that ignores the directive fails
+# loudly instead of quietly installing 2 GB of CUDA.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.13.0+cpu
+
+gliner>=0.2.28
+
+streamlit>=1.40
+streamlit-option-menu>=0.4
+fpdf2>=2.8
+markdown-it-py>=3.0
+pillow>=10.0
+python-dotenv>=1.0
+
+# Not optional, and not a leftover. scan.py reuses the processor's merge_spans
+# and redact so the demo cannot drift from the pipeline it demonstrates, and
+# importing the processor pulls its clients in. Neither is ever connected here.
+confluent-kafka>=2.5
+psycopg[binary]>=3.2

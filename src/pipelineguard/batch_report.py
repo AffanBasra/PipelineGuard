@@ -161,6 +161,10 @@ def build_report_data(
         uncertain=uncertain,
         uncertain_total=uncertain_total,
         source=f"uploaded file `{source_name}`, scanned locally in the PipelineGuard UI",
+        # No broker, no audit table, no review topic. The renderers drop the
+        # passages that describe those rather than assert them about a scan
+        # that has none.
+        from_stream=False,
     )
 
 
