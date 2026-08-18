@@ -1,6 +1,78 @@
 # PipelineGuard
 
-A streaming PII / data-quality firewall for Kafka, with a Pakistani-locale focus.
+**A streaming PII firewall for Kafka, with a Pakistani-locale focus.**
+
+[![Live demo](https://img.shields.io/badge/live%20demo-try%20it%20now-FF4B4B?logo=streamlit&logoColor=white)](https://pipelineguard-g8rdu5ebpuxtq4bimlouyz.streamlit.app/)
+[![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
+[![Tests](https://img.shields.io/badge/tests-509%20passing-3FB950?logo=pytest&logoColor=white)](#tests)
+[![Kafka](https://img.shields.io/badge/Kafka-3.8%20KRaft-231F20?logo=apachekafka&logoColor=white)](docker-compose.yml)
+[![Postgres](https://img.shields.io/badge/Postgres-16-4169E1?logo=postgresql&logoColor=white)](db/init.sql)
+
+### ▶ [Try it in your browser](https://pipelineguard-g8rdu5ebpuxtq4bimlouyz.streamlit.app/)
+
+No install, no signup. Paste a memo and watch two detectors take it apart —
+which tier caught what, at what confidence, over which characters.
+
+[![PipelineGuard scanning a memo](docs/assets/demo-playground.png)](https://pipelineguard-g8rdu5ebpuxtq4bimlouyz.streamlit.app/)
+
+## What it does
+
+Bank transaction records arrive on a Kafka topic. Some carry personal data —
+sometimes in a declared field, sometimes buried in a free-text memo written in
+a mix of English and Roman Urdu. PipelineGuard sits in the middle of that
+stream and does three things:
+
+- **Finds the personal data, two ways.** Rules match the things that have a
+  format — CNIC, Pakistani IBAN with its mod-97 check, Pakistani phone, email.
+  An encoder model reads the free text for the things that don't: names and
+  addresses. A regex cannot find a name, which is why the second tier exists.
+- **Redacts in stream, quarantines what it is unsure of.** Downstream consumers
+  get `[CNIC]` instead of the number. A record whose rule check failed is held
+  back for a person to look at rather than guessed at.
+- **Writes an audit trail that is not itself a privacy problem.** Every decision
+  is recorded — entity type, field, character span, tier, confidence. **Never
+  the value.** The governance report is generated from that trail.
+
+## What the measurements say
+
+Numbers here are measured, not estimated, and the method and caveats for each
+are written down. Nothing in this table is a projection.
+
+| | |
+|---|---|
+| Throughput, Tier 1 at batch 512 | **1,267 rec/s** |
+| What batching is worth | **~180×** over committing per message |
+| Names Tier 1 found in free text | **0** — no rule can match a name |
+| Names Tier 2 found in the same 2,000 records | **892** |
+| Address coverage, 2,786 real OpenStreetMap addresses | **96.0%** |
+| Encoder memory, bf16 vs fp32 | **845 MB** vs 1,780 MB, coverage unchanged |
+| Test suite | **509 passing**, no broker or database needed |
+
+Four encoder checkpoints were scored before one was picked, and the one
+marketed for PII placed third — see [Model evaluation](#model-evaluation).
+Both a locale fine-tune and an LLM third tier were measured and **declined**,
+with the numbers that decided it — see [Fine-tune, or swap the
+checkpoint?](#fine-tune-or-swap-the-checkpoint).
+
+## Run it
+
+```bash
+# The pipeline — Kafka, the processor, a Postgres audit trail, a governance report
+docker compose up -d
+
+# Just the detectors — playground, batch file scan, exportable reports.
+# No broker, no database, nothing written to disk.
+streamlit run src/pipelineguard/ui.py --server.address localhost
+```
+
+Both run the same detection and redaction code; a test asserts the two agree.
+Everything around it differs, so pick one — [Part 1](#part-1--the-pipeline) is
+the pipeline, [Part 2](#part-2--the-inspection-ui-and-the-public-demo) is the
+inspection UI and the hosted demo above.
+
+---
+
+## How it works
 
 Raw events flow through a tiered detection pipeline; PII is redacted in-stream,
 uncertain records are quarantined for review, and every decision is written to
@@ -86,42 +158,46 @@ span, promoted on uncertainty.
 > [Design decisions](#design-decisions) for why not exactly-once.
 
 
-## Two ways to run this
-
-They share the detection and redaction code. Everything around it differs, so
-pick one.
-
-| You want | Run | You get |
-|---|---|---|
-| **The pipeline** — Part 1 | `docker compose up -d` | Kafka, the processor, a Postgres audit trail, a governance report. No UI. |
-| **Just the detectors** — Part 2 | `streamlit run src/pipelineguard/ui.py --server.address localhost` | Playground, batch file scan, exportable reports. **No broker, no database, nothing written to disk.** |
-
 ## Status
 
-- [x] Docker Compose stack (Kafka 3.8 KRaft, Postgres 16)
-- [x] Synthetic Pakistani bank-transaction stream + producer
-- [x] Tier 1: regex/checksum rules (CNIC, PK IBAN, PK phone, email)
-- [x] Processor: consume → detect → redact → route → audit
-- [x] Test suite (no broker or database required)
-- [x] Micro-batched processing + batch-size benchmark
-- [x] Governance report generator (Markdown, from the audit trail)
-- [x] Dockerfile + processor service, so `docker compose up` runs the pipeline
-- [x] Schema-based redaction of declared PII fields (`account_holder`)
-- [x] Tier 2: encoder NER over free text, batched, GPU-optional
-- [x] Tier 2 verified end to end against a live Kafka broker (findings §24),
-      which found a leak eleven sections of offline probing had missed
-- [x] Local inspection UI (Streamlit): playground, batch file scan exporting
-      both a redaction report and an executive summary, and the governance
-      report from the audit trail
-- [x] A separate cut-down demo build (`PG_DEMO=1`), packaged for a container
-      host — built and verified locally, not yet deployed anywhere
-- [~] Tier 2 locale fine-tune -- **measured and declined** (findings §21, §23):
-      the residual is positional, not semantic, and span rules closed most of it
-      -- four times running, most recently for +2.6 points
-- [ ] Flagging records whose redaction left nothing
-- [ ] End-to-end latency measurement (current figures are detection-only)
-- [~] Tier 3: LLM escalation -- **measured and declined** (findings §22): 0.08%
-      of records leak, and the cheapest trigger escalates 35.6% of the stream
+### Shipped
+
+| | |
+|---|---|
+| **Infrastructure** | Docker Compose stack — Kafka 3.8 KRaft, Postgres 16, the processor as a service |
+| **Stream** | Synthetic Pakistani bank transactions + producer, ~40% carrying no memo |
+| **Tier 1** | Regex and checksum rules — CNIC, PK IBAN (mod-97), PK phone, email |
+| **Tier 2** | Encoder NER over free text, batched, GPU-optional, pinned to one commit |
+| **Processor** | consume → detect → redact → route → audit, micro-batched, audit before emit |
+| **Schema redaction** | Declared PII fields (`account_holder`) masked whole from the schema |
+| **Governance report** | Generated from the audit trail; technical and executive views |
+| **Inspection UI** | Streamlit — playground, batch file scan, live audit-trail report |
+| **Public demo** | Deployed on Streamlit Community Cloud, bf16 on CPU inside a 1 GB ceiling |
+| **Tests** | 509 passing, 13 skipped; no broker or database required |
+
+Two of these are worth calling out because they were only true after something
+went wrong. **Tier 2 was verified against a live broker** (findings §24), which
+found a leak that eleven sections of offline probing had missed. And **the
+model pin is enforced at boot** by prefetching the exact commits then forbidding
+the network — the demo host has no build step, so it had to happen in-process.
+
+### Measured, and deliberately not built
+
+Each of these was evaluated far enough to produce numbers, then declined. The
+numbers are the point; the decision is downstream of them.
+
+| | Why not | Where |
+|---|---|---|
+| **Tier 2 locale fine-tune** | The residual is positional, not semantic. Four times a missed address was blamed on the model and four times a span rule reached it — most recently for +2.6 points, where 0.3 would have ended the argument | §17, §18, §21, §23 |
+| **Tier 3 LLM escalation** | 0.08% of records leak, and the cheapest trigger that catches them escalates 35.6% of the stream | §22 |
+| **int8 quantisation** | Not a trade-off, a failure: coverage collapses to 7.6% / 4.9% and it does not even save memory | §27.5 |
+| **Single-pass label groups** | Halves encoder cost, drops PERSON coverage to 90.9% — the labels compete for the same spans | §11.5 |
+
+### Open
+
+- [ ] Flagging records whose redaction left nothing — the mitigation for
+      over-redaction destroying a memo whole
+- [ ] End-to-end latency measurement; every figure here is detection-only
 - [ ] Support-chat free-text topic
 - [ ] Airflow batch-scan mode
 
@@ -328,7 +404,7 @@ It prints the redacted output, every finding with its tier and confidence, and
 how the overlapping spans merge. Without `--tier2` you get the rules only, which
 match formats — a name or address in free text needs the encoder.
 
-### Which checkpoint, and why
+## Model evaluation
 
 Four encoders were scored on the same cases before one was picked. Character
 coverage — the fraction of a gold span's characters the model claims — not
@@ -366,7 +442,88 @@ costs 0.6 points of complete PERSON redaction and nothing on ADDRESS, for 1.7×
 the speed and 324 MB less memory. Not shipped in the pipeline, which has the
 memory; kept as the fallback if the demo host cannot hold `medium`.
 
-### Weight precision — fp32, bf16, fp16, int8
+
+## Fine-tune, or swap the checkpoint?
+
+The obvious move, once ADDRESS coverage stalled, was to fine-tune on Pakistani
+addresses. It was proposed four times and declined four times. This section is
+the reasoning, because the decision is only defensible if the argument for the
+other side is written down too.
+
+**The case for fine-tuning was real.** ADDRESS sat twenty points below PERSON on
+an entity type that is equally identifying. The residual sat in the identifying
+part — the models nearly always found the city and missed the house number, so
+a partly-redacted address *looked* redacted and was not. A corpus existed:
+91,675 real addresses with independent provenance. And a Pakistani-locale
+address model is the one thing here that cannot be had by picking a better
+checkpoint.
+
+**What decided it against was measurement, repeated.**
+
+> Every time an address failure was attributed to the model and then measured,
+> it turned out to be somewhere a rule could reach. §17 found separators. §18
+> found the house number. §21 found the component behind the structural word.
+> §23 found the hole between two spans. **Four for four.**
+
+The stopping condition was written in advance to be falsifiable: if a further
+span rule gained under 0.3 points, the easy ground was gone and the rest was
+genuinely the model. It did not fire — the next rule gained **2.6 points**, and
+moved the ADDRESS bar from 93.3% to 96.0%. A fine-tune now has to clear a
+materially higher number to win.
+
+### The trade-offs, on both axes
+
+A fine-tune is an ML decision with data-engineering consequences, and the
+consequences are what actually killed it.
+
+| | Fine-tune | Checkpoint swap + span rules (**shipped**) |
+|---|---|---|
+| **Coverage** | Unknown until trained | 34 points of ADDRESS separated best candidate from worst — all four measured before committing to one |
+| **Cost to get there** | A rented GPU, 208M parameters | 11% more compute, zero training |
+| **Evaluation** | Corpus is 83% Karachi — a model trained on it learns Karachi conventions and is then scored on them | Held out by construction; the swap was scored on 91,663 addresses across eight cities |
+| **Reproducibility** | A weights artifact to store, version and ship | One commit SHA, pinned and verifiable offline |
+| **Failure mode** | Silent. A regression shows up as slightly worse coverage on text nobody is looking at | Loud. A span rule is a function with a unit test |
+| **Who can change it** | Whoever can run training | Anyone who can read a regex |
+| **Precision** | Unmeasured — and precision is where the last three reversals came from | Measured at each model's own threshold |
+| **Reversibility** | Retrain to undo | Change one environment variable |
+
+Three of those rows are data-engineering rows, not ML rows, and they are the
+ones that settled it. **A pinned checkpoint is an artifact the pipeline can
+verify** — `prefetch` warms the exact commits, the process then goes offline,
+and `verify_tier2_pin.py` checks both halves. A fine-tuned checkpoint is an
+artifact somebody has to host, version and trust. That is a supply chain where
+there was none.
+
+**The same reasoning killed Tier 3.** An LLM escalation tier was costed the same
+way: 0.08% of records leak, the cheapest trigger that reaches them escalates
+35.6% of the stream, and the leaking population is 0.25% of records. Paying a
+per-token cost on a third of the traffic to fix a quarter of a percent is not a
+trade — see findings §22.
+
+**And the same reasoning ran the other way for batching.** Where measurement
+showed the architecture *was* the bottleneck, the complexity was bought without
+hesitation: micro-batching is worth ~180× and detection turned out to be ~15% of
+per-record time. The rule is not "prefer the simple thing". It is **measure
+where the cost actually is, then spend there** — which pointed at the plumbing
+for throughput and at span rules for coverage, and at a training loop for
+neither.
+
+### What would reopen it
+
+Written down so this can be revisited on evidence rather than mood:
+
+1. **The residual stops being positional** — a further span rule gains under
+   0.3 points.
+2. **Addresses enter the pipeline as a real declared field**, rather than only
+   appearing inside free text.
+3. **A genuinely held-out evaluation set exists** — ideally a city the model
+   never trained on, not a random split of a corpus that is 83% one city.
+
+Full reasoning and the numbers behind every line above:
+[findings §16, §21, §22, §23](docs/tier2-detection-findings.md).
+
+
+## Weight precision — fp32, bf16, fp16, int8
 
 The checkpoint ships fp32, fp16 and bf16 weights in the same commit, so the
 precision is a deployment choice rather than a different model — the pin still
@@ -586,20 +743,12 @@ Flagging fully-saturated redactions is the open mitigation.
 
 ## The public demo
 
-<!-- TODO, needs a human: the Space does not exist yet and no recording has been
-     made. Once it is live, put its URL on the line below, drop a screen
-     recording at docs/demo.gif, and uncomment the image.
+**[pipelineguard-g8rdu5ebpuxtq4bimlouyz.streamlit.app](https://pipelineguard-g8rdu5ebpuxtq4bimlouyz.streamlit.app/)**
+— live on **Streamlit Community Cloud**.
 
-     **[Try it](https://huggingface.co/spaces/<user>/<space>)**
-
-     ![PipelineGuard scanning a memo](docs/demo.gif)
--->
-
-A cut-down build, targeting **Streamlit Community Cloud**. **It is built and
-verified locally, and not deployed anywhere yet** — see the comment above for
-what is still missing. It is a different build, not the same one exposed:
-`PG_DEMO=1` changes five things, and they are the difference between "local
-tool" and "thing strangers can reach":
+It is a different build, not the same one exposed: `PG_DEMO=1` changes five
+things, and they are the difference between "local tool" and "thing strangers
+can reach":
 
 | | local | demo |
 |---|---|---|
@@ -631,8 +780,9 @@ the original cannot survive it.
 ### Where it runs, and why there
 
 Hugging Face was the plan. Its Docker and Gradio SDKs now require a paid PRO
-account, so the free path there is gone and **Streamlit Community Cloud** is the
-target. Full instructions: [`deploy/streamlit-cloud/README.md`](deploy/streamlit-cloud/README.md).
+account, so the free path there is gone and **Streamlit Community Cloud** is
+where it runs. Full instructions:
+[`deploy/streamlit-cloud/README.md`](deploy/streamlit-cloud/README.md).
 
 ```
 Repository       AffanBasra/PipelineGuard
@@ -646,11 +796,15 @@ That host costs two things.
 The bf16 weights in the same commit fit at 845 MB resting, with coverage
 unchanged — see [Weight precision](#weight-precision--fp32-bf16-fp16-int8).
 Add ~96 MB for Streamlit, pandas and Arrow and the total is ~950 MB against
-~1,024. **That is 70 MB of headroom and it is thin**; the untested case is one
-long pasted document rather than the short memos the probe measured. If it
-starts hitting resource limits the fallback is `gliner_small-v2.5` in bf16,
-which leaves 160 MB — a different checkpoint, so its threshold has to be
-re-swept before it can be trusted.
+~1,024. **That is 70 MB of headroom and it is thin.**
+
+It survived the two heaviest things a visitor can do, checked against the live
+app after deploy: a full 50-row batch (10–12 s, no restart) and a paste long
+enough to hit the 1,000-character cut. Cold boot — clone, install, prefetch,
+load — took 59 s. That is evidence the ceiling holds for this workload, not
+proof it holds for every one. If it does start hitting resource limits the
+fallback is `gliner_small-v2.5` in bf16, which leaves 160 MB — a different
+checkpoint, so its threshold has to be re-swept before it can be trusted.
 
 **No build step.** Community Cloud installs a requirements file and runs one
 script, so the pin cannot be warmed at build time. GLiNER resolves its backbone
@@ -895,6 +1049,7 @@ a copy of it.
 [2] .streamlit/config.toml           UI theme, and the localhost bind that keeps it local
 [1] docs/sample-report.md            a generated report, committed as an example
 [=] docs/sample-summary.md           the executive view of the same, rendered by the demo
+[2] docs/assets/demo-playground.png  the screenshot at the top, taken from the live demo
 ```
 
 `processor.py` is the clearest case. Part 1 runs it as a consumer; Part 2 never
