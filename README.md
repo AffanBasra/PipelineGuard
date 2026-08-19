@@ -412,6 +412,8 @@ coverage — the fraction of a gold span's characters the model claims — not
 classic recall, because a half-redacted address is a leak and precision/recall
 scores it as a hit.
 
+![Character coverage of four encoder checkpoints — a general-purpose model leads on both PERSON and ADDRESS, and the two trained for PII place second and third](docs/assets/model-comparison.png)
+
 | model | licence | PERSON | ADDRESS |
 |---|---|---:|---:|
 | [**gliner-community/gliner_medium-v2.5**](https://huggingface.co/gliner-community/gliner_medium-v2.5) | Apache-2.0 | **100.0%** | **86.5%** |
@@ -1059,6 +1061,7 @@ a copy of it.
 [1] docs/sample-report.md            a generated report, committed as an example
 [=] docs/sample-summary.md           the executive view of the same, rendered by the demo
 [2] docs/assets/demo-playground.png  the screenshot at the top, taken from the live demo
+[=] docs/assets/model-comparison.png the chart in Model evaluation, same numbers as its table
 ```
 
 `processor.py` is the clearest case. Part 1 runs it as a consumer; Part 2 never
