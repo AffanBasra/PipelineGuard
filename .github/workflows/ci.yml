@@ -1,0 +1,120 @@
+name: CI
+
+# Every pull request, and every push that lands on master. A PR run happens
+# before the merge; the master run happens after, and catches anything a
+# merge combined badly.
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+
+# A second push to the same PR cancels the run still going for the first one.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: tests (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor pyproject declares, and the version the Dockerfile ships.
+        # Testing both is what makes `requires-python = ">=3.10"` a claim
+        # rather than a guess.
+        python: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install
+        # Deliberately NOT `.[tier2]`: torch is ~800 MB and no test needs it —
+        # Tier 2 is exercised through a fake model. The three extras below are
+        # pure-Python and small, and each one unskips real tests:
+        # huggingface_hub the model-pin tests, fpdf2 and markdown-it-py the
+        # report rendering tests. In production they arrive via gliner and the
+        # `ui` extra.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]" huggingface_hub fpdf2 markdown-it-py
+
+      - name: Tests
+        # Integration tests are deselected here and run in their own job, which
+        # has a database. Without -m they would skip silently and a green run
+        # would not mean what it looks like it means.
+        run: pytest -m "not integration" -v
+
+  integration:
+    name: report SQL (real Postgres)
+    runs-on: ubuntu-latest
+
+    # The report's logic *is* its SQL, so a fake cursor would test the renderer
+    # formatting its own fixtures. These are the only tests that touch the
+    # queries; without this job they skip everywhere and cover nothing.
+    services:
+      postgres:
+        # The same image docker-compose.yml runs. Testing the queries against a
+        # different Postgres than the stack uses would weaken the point.
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: pipelineguard
+          POSTGRES_PASSWORD: pipelineguard
+          POSTGRES_DB: pipelineguard
+        ports:
+          # 5433 on the host, matching docker-compose.yml and the default DSN.
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U pipelineguard"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Load the audit schema
+        run: psql "$POSTGRES_DSN" -v ON_ERROR_STOP=1 -f db/init.sql
+        env:
+          POSTGRES_DSN: postgresql://pipelineguard:pipelineguard@localhost:5433/pipelineguard
+
+      - name: Integration tests
+        # `shell: bash` is load-bearing, not decoration: it sets pipefail, and
+        # without it the pipe into tee returns tee's exit code and a failing
+        # suite reports green.
+        shell: bash
+        run: pytest -m integration -v | tee result.txt
+
+      - name: Fail if they skipped instead of running
+        # These tests skip themselves when no database answers, so a green run
+        # above does not prove they executed. A silent skip is the exact
+        # failure mode this job exists to prevent.
+        shell: bash
+        run: |
+          if grep -qE "[0-9]+ skipped" result.txt; then
+            echo "::error::Integration tests skipped — Postgres was not reachable."
+            exit 1
+          fi
+          grep -qE "[0-9]+ passed" result.txt || {
+            echo "::error::No integration tests ran at all."
+            exit 1
+          }

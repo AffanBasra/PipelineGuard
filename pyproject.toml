@@ -1,5 +1,6 @@
 [build-system]
-requires = ["setuptools>=68"]
+# 77+ for the PEP 639 `license` string form used below.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,6 +8,8 @@ name = "pipelineguard"
 version = "0.2.0"
 description = "Streaming PII/data-quality firewall for Kafka, with a Pakistani-locale focus"
 requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = [
     "confluent-kafka>=2.5",
     "psycopg[binary]>=3.2",
